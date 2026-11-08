@@ -4,10 +4,12 @@ pub mod about;
 pub mod dashboard;
 pub mod dns;
 pub(crate) mod gate;
+pub mod geodata;
 pub mod inbounds;
 pub(crate) mod json;
 pub mod logs;
 pub(crate) mod nav;
+pub mod outbound_settings;
 pub(crate) mod popup;
 pub mod profile_preview;
 pub(crate) mod request;
@@ -176,7 +178,7 @@ pub struct UiCtx<'a> {
 /// be skipped by a screen wiring its own copy. A reply-carrying command is
 /// still built by the screen with its own reply channel; only the send comes
 /// through here.
-pub(crate) struct FrameHooks<'a> {
+pub struct FrameHooks<'a> {
     requests: &'a mut FrameRequests,
     cmd: &'a tokio::sync::mpsc::UnboundedSender<CoreCmd>,
     model_generation: &'a mut u64,
@@ -539,16 +541,17 @@ impl<'a> ServersCtx<'a> {
         let probe_url = self.settings.ping_test_probe_url().to_owned();
         let lang = self.settings.language;
         // The probe carries the TUN adapter's own name so its resolution can
-        // exclude that adapter, and — when "Use outbound interface" is on —
-        // the TUN screen's outbound interface, so its dials bypass the
-        // capture. Whether the TUN is actually up is the runtime's decision
-        // (its backend's transport ownership), so the request does not
-        // re-derive it from the mode setting: one decision, taken where the
-        // live backend is known.
-        let tun_outbound_interface = self
-            .settings
-            .latency_test_bind_interface
-            .then(|| self.settings.tun.auto_outbounds_interface.clone());
+        // exclude that adapter, and — when the stored path is Bind NIC and the
+        // tunnel actually owns the capture — the TUN screen's outbound
+        // interface, so its dials bypass the capture. The effective path is
+        // Native whenever Bind NIC cannot bind (TUN mode off or the core not
+        // running), so the stored preference never leaks a meaningless bind
+        // into the probe.
+        let tun_active = self.settings.mode == crate::model::Mode::Tun && self.core_running;
+        let path =
+            sys::outbound_path::effective_probe_path(self.settings.latency_test_path, tun_active);
+        let tun_outbound_interface =
+            sys::outbound_path::probe_interface_setting(path, &self.settings.tun);
         let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
         let sent = self.hooks.send(CoreCmd::ProbeLatency {
             profiles,
@@ -2380,14 +2383,18 @@ mod tests {
         }
     }
 
-    /// The probe carries the outbound interface only while the switch is on;
-    /// the runtime decides whether the TUN is actually there.
+    /// The probe carries the outbound interface only while the stored path is
+    /// Bind NIC and the tunnel is live; the effective path decides, exactly as
+    /// the Settings control displays it.
     #[test]
-    fn request_latency_probe_follows_the_outbound_interface_switch() {
+    fn request_latency_probe_follows_the_effective_outbound_path() {
         let mut rig = UiTestRig::default();
+        rig.settings.mode = crate::model::Mode::Tun;
+        rig.phase = CorePhase::Running;
         let profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(profile.clone());
 
+        // A live Bind NIC preference binds the TUN screen's outbound adapter.
         rig.ctx()
             .servers()
             .request_latency_probe_for(profile.clone())
@@ -2402,7 +2409,50 @@ mod tests {
             panic!("expected ProbeLatency, got a different command");
         }
 
-        rig.settings.latency_test_bind_interface = false;
+        // Native sends no bind: the tunnel captures the probe.
+        rig.settings.latency_test_path = crate::model::settings::ProbePath::Native;
+        rig.ctx()
+            .servers()
+            .request_latency_probe_for(profile.clone())
+            .expect("probe request");
+        if let CoreCmd::ProbeLatency {
+            tun_outbound_interface,
+            ..
+        } = rig._cmd_rx.try_recv().expect("probe command")
+        {
+            assert_eq!(
+                tun_outbound_interface, None,
+                "Native follows the OS stack, so the probe carries no bind"
+            );
+        } else {
+            panic!("expected ProbeLatency, got a different command");
+        }
+
+        // With TUN off, a stored Bind NIC preference keeps its value but the
+        // effective path is Native, so no meaningless bind is sent.
+        rig.settings.latency_test_path = crate::model::settings::ProbePath::BindNic;
+        rig.settings.mode = crate::model::Mode::Off;
+        rig.ctx()
+            .servers()
+            .request_latency_probe_for(profile.clone())
+            .expect("probe request");
+        if let CoreCmd::ProbeLatency {
+            tun_outbound_interface,
+            ..
+        } = rig._cmd_rx.try_recv().expect("probe command")
+        {
+            assert_eq!(
+                tun_outbound_interface, None,
+                "Bind NIC cannot bind without a tunnel"
+            );
+        } else {
+            panic!("expected ProbeLatency, got a different command");
+        }
+
+        // TUN mode requested but the core is not running yet: the live gate
+        // still reads as no tunnel, so the probe carries no bind.
+        rig.settings.mode = crate::model::Mode::Tun;
+        rig.phase = CorePhase::Stopped;
         rig.ctx()
             .servers()
             .request_latency_probe_for(profile)
@@ -2414,7 +2464,7 @@ mod tests {
         {
             assert_eq!(
                 tun_outbound_interface, None,
-                "the switch off sends the probe through the tunnel"
+                "a stopped core owns no tunnel, so Bind NIC binds nothing"
             );
         } else {
             panic!("expected ProbeLatency, got a different command");

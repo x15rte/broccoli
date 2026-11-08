@@ -107,8 +107,8 @@ impl SpawnConfig {
 
 /// One runtime's lifecycle state.
 pub(super) struct Lifecycle {
-    /// Owns the live backend slot (direct child or helper pipe), its event
-    /// channel, and the derived alive/tun-ownership flags.
+    /// Owns the live direct child, the app-lifetime helper attachment and its
+    /// event channel, and the derived alive/tun-ownership flags.
     pub(super) backend: BackendState,
     /// Stop/restart/silence policy for the in-flight expected exit.
     pub(super) exit_policy: ExitPolicy,
@@ -196,6 +196,13 @@ impl Lifecycle {
     /// is what the owning-PID check compares against. Other phases are
     /// informational; an unknown (0) PID never records.
     pub(super) fn on_helper_state(&mut self, phase: ChildPhase, pid: u32) {
+        // The pipe outlives its cores: a report belongs to this session only
+        // while the attached helper owns the live child. An idle helper
+        // retained beside a direct core must never overwrite that core's PID
+        // or arm its readiness clock.
+        if !self.backend.helper_owns_child() {
+            return;
+        }
         if matches!(phase, ChildPhase::Starting | ChildPhase::Running) {
             self.backend.set_child_pid(pid);
         }
@@ -207,16 +214,17 @@ impl Lifecycle {
     }
 
     /// Begin the final shutdown: drop every pending transition, close the
-    /// exit policy, and open the stop window. The answer says whether a live
-    /// backend still needs the runtime's stop sequence — with nothing live
-    /// the shutdown is already over, and the caller has nothing left to stop.
+    /// exit policy, and open the stop window. The answer says whether the
+    /// runtime still holds something to release — a live backend or the
+    /// app-lifetime helper, including an idle one — and with neither the
+    /// shutdown is already over, so the caller has nothing left to stop.
     pub(super) fn begin_shutdown(&mut self) -> bool {
         self.pending_restart = None;
         self.pending_transition.clear();
         self.core_update.clear();
         self.gate_backend_alive = false;
         self.exit_policy.finish();
-        if self.backend.as_backend().is_none() {
+        if !self.backend.holds_backend() {
             self.backend.force_release();
             return false;
         }

@@ -33,6 +33,7 @@ use self::cancel::Cancel;
 use self::events::{AppLogSink, EventStream};
 use self::lifecycle::Lifecycle;
 use self::readiness::Poll;
+use self::state::BackendSignal;
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
@@ -795,11 +796,6 @@ pub fn spawn_runtime(evt: SyncSender<CoreEvt>, repaint: egui::Context) -> Runtim
         worker: Some(worker),
         worker_done: Some(done_rx),
     }
-}
-
-enum Backend {
-    Direct(Box<supervisor::Child>),
-    Pipe(helper::HelperPipe),
 }
 
 /// Verified source for the single core-update operation.
@@ -1637,87 +1633,68 @@ impl Runtime {
                     // `None` means the sender is gone with the runtime
                     // itself; the select loop is shutting down regardless.
                 }
-                status = async {
-                    match self.lifecycle.backend.slot.as_mut() {
-                        Some(Backend::Direct(child)) => Some(child.wait().await),
-                        _ => unreachable!(),
-                    }
-                }, if matches!(self.lifecycle.backend.slot, Some(Backend::Direct(_))) => {
-                    // A resolved `wait` means the child is reaped and its
-                    // pipes are at EOF, which is exactly when
-                    // `Child::drain_output` may join the pumps: do it before
-                    // the exit handler composes diagnostics from the output.
-                    let code = match status {
-                        Some(Ok(exit)) => {
-                            if let Some(child) = self.lifecycle.backend.child_mut() {
-                                // Bounded: a grandchild may hold a pipe open,
-                                // and this loop must still reach the exit
-                                // handler. A timeout leaves the remaining
-                                // pumps detached; their handles are dropped
-                                // with the backend.
-                                let _ = tokio::time::timeout(
-                                    OUTPUT_DRAIN_WINDOW,
-                                    child.drain_output(),
-                                )
-                                .await;
-                            }
-                            exit.code()
+                // One arm for the whole backend: the direct child and the
+                // helper stream are polled through a single borrow of the
+                // state (two arms would need two simultaneous mutable
+                // borrows). The state's own select keeps the `wait` and
+                // `recv` futures disjoint.
+                signal = self.lifecycle.backend.next_signal(),
+                    if self.lifecycle.backend.is_direct() || self.lifecycle.backend.has_helper() =>
+                {
+                    match signal {
+                        BackendSignal::Direct(status) => {
+                            // A resolved `wait` means the child is reaped and
+                            // its pipes are at EOF, which is exactly when
+                            // `Child::drain_output` may join the pumps: do it
+                            // before the exit handler composes diagnostics
+                            // from the output.
+                            let code = match status {
+                                Ok(exit) => {
+                                    if let Some(child) = self.lifecycle.backend.child_mut() {
+                                        // Bounded: a grandchild may hold a
+                                        // pipe open, and this loop must still
+                                        // reach the exit handler. A timeout
+                                        // leaves the remaining pumps
+                                        // detached; their handles are dropped
+                                        // with the backend.
+                                        let _ = tokio::time::timeout(
+                                            OUTPUT_DRAIN_WINDOW,
+                                            child.drain_output(),
+                                        )
+                                        .await;
+                                    }
+                                    exit.code()
+                                }
+                                Err(_) => None,
+                            };
+                            self.on_core_exit(code).await;
                         }
-                        _ => None,
-                    };
-                    self.on_core_exit(code).await;
-                }
-                ev = async {
-                    match self.lifecycle.backend.events.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => unreachable!(),
-                    }
-                }, if self.lifecycle.backend.events.is_some() => {
-                    match ev {
-                        Some(helper::HelperEvent::Log(record)) => self.emit_helper_log(record),
-                        Some(helper::HelperEvent::Exit(code)) => {
-                            self.on_core_exit(Some(code)).await;
-                        }
-                        Some(helper::HelperEvent::State { state, pid }) => {
-                            self.lifecycle.on_helper_state(state, pid);
-                        }
-                        Some(helper::HelperEvent::Cleaned {
-                            dns_adapters,
-                            adapters_removed,
-                        }) => self.finish_cleanup(dns_adapters, adapters_removed),
-                        None => {
-                            // Pipe EOF is watchdog ownership release, but it is
-                            // not an Xray Exit acknowledgement. Never launch a
-                            // rollback/restart against possibly occupied ports.
-                            // Capture both backend facts beside this read:
-                            // `force_release` clears them, and the DNS flush
-                            // below must know this helper owned the TUN.
-                            let was_tun = self.lifecycle.backend.is_tun_owned();
-                            let active = self.lifecycle.backend.is_alive() || self.lifecycle.exit_policy.stopping();
-                            self.lifecycle.backend.force_release();
-                            self.app_log(Diag::new(Key::RtLogHelperDisconnected));
-                            // A cleanup waiting on this helper lost its
-                            // terminal with the pipe: report and release,
-                            // never leave the busy window held.
-                            if self.cleanup.is_some() {
-                                self.fail_cleanup(
-                                    DiagError::new(Diag::new(Key::RtLogCleanUpFailed)).caused_by(
-                                        DiagError::new(Diag::new(Key::RtLogHelperDisconnected)),
-                                    ),
-                                );
+                        BackendSignal::Helper(event) => match event {
+                            Some(helper::HelperEvent::Log(record)) => {
+                                self.emit_helper_log(record);
                             }
-                            if was_tun {
-                                // The helper died while owning the TUN; the
-                                // adapter is gone too, so the next boot must
-                                // not serve answers cached before the switch.
-                                // This is the caller's flush by design — see
-                                // `on_unconfirmed_backend_loss`.
-                                self.flush_dns_cache();
+                            // The pipe outlives its cores: an Exit belongs to
+                            // this session only while the helper owns the
+                            // live child.
+                            Some(helper::HelperEvent::Exit(code))
+                                if self.lifecycle.backend.helper_owns_child() =>
+                            {
+                                self.on_core_exit(Some(code)).await;
                             }
-                            if active {
-                                self.on_unconfirmed_backend_loss();
+                            Some(helper::HelperEvent::Exit(_)) => {}
+                            Some(helper::HelperEvent::State { state, pid }) => {
+                                self.lifecycle.on_helper_state(state, pid);
                             }
-                        }
+                            Some(helper::HelperEvent::Cleaned {
+                                dns_adapters,
+                                adapters_removed,
+                            }) => self.finish_cleanup(dns_adapters, adapters_removed),
+                            // Pipe EOF is watchdog ownership release, but it
+                            // is not an Xray Exit acknowledgement. Never
+                            // launch a rollback/restart against possibly
+                            // occupied ports.
+                            None => self.on_helper_transport_loss(),
+                        },
                     }
                 }
                 ev = async {
@@ -1864,7 +1841,8 @@ impl Runtime {
                     self.stop_backend().await;
                 } else {
                     self.lifecycle.exit_policy.finish();
-                    self.lifecycle.backend.force_release();
+                    // An idle attached helper is app-lifetime: a Stop with no
+                    // live core leaves it connected for the next start.
                     if !matches!(self.lifecycle.phase, CorePhase::Stopped) {
                         let was_running = matches!(self.lifecycle.phase, CorePhase::Running);
                         self.set_phase(CorePhase::Stopped);
@@ -2772,9 +2750,9 @@ impl Runtime {
             return;
         }
 
-        // A stopped helper is still an elevated process. Close its authenticated
-        // pipe before replacing the backend with a direct child.
-        self.lifecycle.backend.release_pipe();
+        // A retained helper stays attached and idle beside the direct child.
+        // It is app-lifetime, so only shutdown or a lost transport closes its
+        // pipe; the next TUN start reuses it without a new UAC prompt.
         // Every source above promoted its artefact to the active path, so the
         // child the runtime spawns is exactly the configuration this start
         // produced. The release-pin verify runs on the blocking pool; the
@@ -2921,20 +2899,29 @@ impl Runtime {
         self.events.repaint_now();
     }
 
+    /// Run this start on the attached helper pipe: the app-lifetime helper
+    /// takes the new configuration through the one start sequence
+    /// ([`Self::start_helper_pipe`]), exactly as a fresh connect does, with no
+    /// elevation prompt. Returns false when no helper is attached, so the
+    /// caller launches one.
+    fn start_over_attached_helper(&mut self) -> bool {
+        let Some(pipe) = self.lifecycle.backend.helper() else {
+            return false;
+        };
+        let result = self.start_helper_pipe(pipe);
+        match result {
+            Ok(()) => self.publish_tun_start(),
+            Err(error) => self.settle_error(error),
+        }
+        true
+    }
+
     fn start_via_helper(&mut self) {
         // The helper owns the child that runs this start's configuration, so
         // the output window opens here for both the restart and the fresh
         // launch.
         self.begin_start_output_window();
-        // A restart over the live pipe: the attached helper takes the new
-        // configuration through the one start sequence ([`start_helper_pipe`]),
-        // exactly as a fresh connect does.
-        if let Some(Backend::Pipe(pipe)) = self.lifecycle.backend.as_backend() {
-            let result = self.start_helper_pipe(pipe);
-            match result {
-                Ok(()) => self.publish_tun_start(),
-                Err(error) => self.settle_error(error),
-            }
+        if self.start_over_attached_helper() {
             return;
         }
 
@@ -2993,7 +2980,7 @@ impl Runtime {
     /// elevation for the devnode removal and the captured DNS servers, and the
     /// GUI has no path to it besides the helper.
     fn command_cleanup(&mut self, adapter_name: String) {
-        if let Some(Backend::Pipe(pipe)) = self.lifecycle.backend.as_backend() {
+        if let Some(pipe) = self.lifecycle.backend.helper() {
             if let Err(error) = pipe.cleanup(&adapter_name) {
                 self.fail_cleanup(
                     DiagError::new(Diag::new(Key::RtLogCleanUpFailed)).caused_by(error),
@@ -3157,8 +3144,8 @@ impl Runtime {
     async fn wait_backend_exit(&mut self) -> bool {
         if let Some(child) = self.lifecycle.backend.child_mut() {
             child.wait().await.is_ok()
-        } else if self.lifecycle.backend.is_pipe()
-            && let Some(events) = self.lifecycle.backend.events_mut()
+        } else if self.lifecycle.backend.helper_owns_child()
+            && let Some(events) = self.lifecycle.backend.helper_events_mut()
         {
             while let Some(event) = events.recv().await {
                 if matches!(event, helper::HelperEvent::Exit(_)) {
@@ -3176,7 +3163,8 @@ impl Runtime {
         // next start arms its own from the config that core runs.
         self.lifecycle.dns_in_pending.clear();
         // Ownership, not the requested next mode, controls cleanup. This call
-        // always precedes Direct::start_kill, helper Stop, or backend drop.
+        // always precedes the direct child's kill, helper Stop, or backend
+        // drop.
         let tun = self.lifecycle.backend.is_tun_owned();
         let gracefully_closed = self.cleanup_tun().await;
         // PnP wedge prevention (2026-08-28, replayed 2026-09-09): a
@@ -3198,16 +3186,19 @@ impl Runtime {
                 Err(_) => self.app_log(Diag::new(Key::RtLogTunCoreAlive)),
             }
         }
-        match self.lifecycle.backend.as_backend_mut() {
-            Some(Backend::Direct(child)) => child.start_kill(),
-            Some(Backend::Pipe(pipe)) => {
-                if let Err(error) = pipe.stop() {
-                    self.app_log(
-                        DiagError::new(Diag::new(Key::RtLogHelperStopFailed)).caused_by(error),
-                    );
-                }
+        if let Some(child) = self.lifecycle.backend.child_mut() {
+            child.start_kill();
+        } else if self.lifecycle.backend.helper_owns_child()
+            && let Some(pipe) = self.lifecycle.backend.helper()
+        {
+            // The helper's Stop keeps its own meaning: kill the xray child and
+            // release network state. The helper process and its pipe stay
+            // attached for the next start.
+            if let Err(error) = pipe.stop() {
+                self.app_log(
+                    DiagError::new(Diag::new(Key::RtLogHelperStopFailed)).caused_by(error),
+                );
             }
-            None => {}
         }
     }
 
@@ -3228,9 +3219,10 @@ impl Runtime {
         // normally returns instantly.
         let window = self.stop_window();
         let _ = tokio::time::timeout(window, self.wait_backend_exit()).await;
-        // Dropping Direct closes the kill-on-close job. Dropping Pipe closes
-        // the watchdog channel; the helper performs its own bounded TUN close
-        // before terminating its job.
+        // Dropping the direct child closes the kill-on-close job. Dropping the
+        // helper's pipe closes the watchdog channel — including an idle helper
+        // retained across Stop/apply/TUN off — so the helper exits and no
+        // elevated orphan survives the process.
         self.lifecycle.backend.force_release();
         self.lifecycle.exit_policy.finish();
     }
@@ -3255,6 +3247,49 @@ impl Runtime {
         }
     }
 
+    /// The attached helper's transport ended (pipe EOF, or its reader saw the
+    /// pipe die) without an Exit acknowledgement.
+    ///
+    /// The helper is app-lifetime, so its death is never routine: the pipe is
+    /// released, and a helper that owned this session is settled through the
+    /// same unconfirmed-loss path as before. A retained idle helper — TUN off
+    /// or a plain Stop — is only released, so the running direct core keeps
+    /// running and the next TUN start launches a fresh helper (a new UAC),
+    /// which is the deliberate recovery.
+    ///
+    /// The resolver-cache flush happens here because it depends on TUN
+    /// ownership, which the release clears.
+    fn on_helper_transport_loss(&mut self) {
+        let was_tun = self.lifecycle.backend.is_tun_owned();
+        let drove_session = self.lifecycle.backend.helper_owns_child();
+        self.lifecycle.backend.release_helper();
+        self.app_log(Diag::new(Key::RtLogHelperDisconnected));
+        // A cleanup waiting on this helper lost its terminal with the pipe:
+        // report and release, never leave the busy window held. A cleanup
+        // launched for its own helper carries its own event stream and is
+        // settled by that arm, not here.
+        if self
+            .cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.events.is_none())
+        {
+            self.fail_cleanup(
+                DiagError::new(Diag::new(Key::RtLogCleanUpFailed))
+                    .caused_by(DiagError::new(Diag::new(Key::RtLogHelperDisconnected))),
+            );
+        }
+        if was_tun {
+            // The helper died while owning the TUN; the adapter is gone too,
+            // so the next boot must not serve answers cached before the
+            // switch. This is the caller's flush by design — see
+            // `on_unconfirmed_backend_loss`.
+            self.flush_dns_cache();
+        }
+        if drove_session {
+            self.on_unconfirmed_backend_loss();
+        }
+    }
+
     /// Settle a backend lost without an exit acknowledgement (helper/pipe
     /// EOF): cancel a foreign in-flight operation, drain the cancelled
     /// rollbacks, and land the phase.
@@ -3262,8 +3297,9 @@ impl Runtime {
     /// The resolver-cache flush is *not* here: it depends on TUN ownership,
     /// which `force_release` below clears, so the caller — the only place
     /// that can still read `is_tun_owned()` — captures the fact before its
-    /// release and runs the flush itself (see the pipe-EOF arm). A future
-    /// caller that releases a TUN-owning backend must do the same.
+    /// release and runs the flush itself (see
+    /// [`Self::on_helper_transport_loss`]). A future caller that releases a
+    /// TUN-owning backend must do the same.
     fn on_unconfirmed_backend_loss(&mut self) {
         // Same invariant as on_core_exit: a foreign in-flight user operation
         // must not be silently dropped when the helper transport dies.
@@ -3360,7 +3396,10 @@ impl Runtime {
                         // cleanup, whose own terminal releases both.
                         self.set_phase(CorePhase::Stopped);
                     } else {
-                        self.lifecycle.backend.force_release();
+                        // The exit was confirmed above: a direct child is
+                        // already reaped, and the attached helper stays
+                        // connected (idle) for the next start. Only shutdown
+                        // or a lost transport releases its pipe.
                         self.set_phase(CorePhase::Stopped);
                         self.release_exclusive();
                     }
@@ -3524,11 +3563,12 @@ impl Runtime {
             return;
         };
 
-        // `Backend::Direct` retains deny-write/delete handles for every
-        // verified payload until its `Child` is dropped. Drop that owner only
-        // after the exit has been confirmed, before renaming the managed core
-        // directory back to its retained last-good sibling.
-        self.lifecycle.backend.force_release();
+        // A direct child retains deny-write/delete handles for every verified
+        // payload until its `Child` is dropped. Drop that owner only after the
+        // exit has been confirmed, before renaming the managed core directory
+        // back to its retained last-good sibling. The idle elevated helper
+        // holds no payload handle and stays attached.
+        self.lifecycle.backend.confirm_exit();
 
         let (output, restart) = match crate::sys::core_dl::rollback_unhealthy_update() {
             Ok(true) => (
@@ -4318,6 +4358,262 @@ mod tests {
         );
     }
 
+    /// A Stop ends the session and still kills the core through the
+    /// helper, but the authenticated pipe and the backend slot stay; the next
+    /// TUN start reuses them instead of asking for UAC again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_core_keeps_the_helper_pipe_for_the_next_start() {
+        let (mut runtime, events) = runtime_with_events();
+        let (_helper_events, sink) = attach_fake_helper(&mut runtime);
+        runtime.lifecycle.backend.mark_tun_started();
+        runtime.lifecycle.backend.set_child_pid(4242);
+        runtime.lifecycle.requested_tun_mode = true;
+        runtime.lifecycle.phase = CorePhase::Running;
+        runtime.lifecycle.exit_policy.begin_stop(Instant::now());
+
+        runtime.on_core_exit(Some(0)).await;
+
+        assert!(
+            runtime.lifecycle.backend.has_helper(),
+            "Stop must keep the elevated helper pipe and its backend slot"
+        );
+        assert!(!runtime.lifecycle.backend.is_alive());
+        assert_eq!(runtime.lifecycle.phase, CorePhase::Stopped);
+        let logs = app_log_texts(&events.try_iter().collect::<Vec<_>>());
+        assert!(
+            logs.contains(&t(Language::En, Key::RtLogDisconnected).to_string()),
+            "the stop still reports the disconnect: {logs:?}"
+        );
+
+        // The next start runs over the retained pipe: no elevation prompt, no
+        // launch wait, and the start command reaches that same pipe.
+        arm_helper_start(&mut runtime);
+        assert!(
+            runtime.start_over_attached_helper(),
+            "the retained helper must serve the next start"
+        );
+        assert!(runtime.lifecycle.backend.is_tun_owned());
+        assert_eq!(runtime.lifecycle.phase, CorePhase::Starting);
+        let logs = app_log_texts(&events.try_iter().collect::<Vec<_>>());
+        assert!(
+            !logs.contains(&t(Language::En, Key::RtLogHelperLaunchWait).to_string()),
+            "reusing the helper must never enter the launch path: {logs:?}"
+        );
+        let written = std::fs::read_to_string(&sink).expect("read the fake helper's commands");
+        assert!(
+            written.contains("\"cmd\":\"start\""),
+            "the retained pipe must receive the start command: {written}"
+        );
+    }
+
+    /// An apply restarts the core over the same helper. The
+    /// confirmed restart exit queues the replacement and keeps the pipe, so no
+    /// new elevated process is launched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restart_for_an_apply_keeps_the_helper_pipe() {
+        let (mut runtime, events) = runtime_with_events();
+        let (_helper_events, _sink) = attach_fake_helper(&mut runtime);
+        runtime.lifecycle.backend.mark_tun_started();
+        runtime.lifecycle.requested_tun_mode = true;
+        runtime.lifecycle.phase = CorePhase::Running;
+        runtime.lifecycle.exit_policy.begin_restart(Instant::now());
+
+        runtime.on_core_exit(Some(0)).await;
+
+        assert!(
+            runtime.lifecycle.backend.has_helper(),
+            "an apply restart must keep the helper pipe"
+        );
+        assert!(
+            runtime.lifecycle.pending_restart.is_some(),
+            "the replacement start is queued after the confirmed exit"
+        );
+
+        arm_helper_start(&mut runtime);
+        assert!(
+            runtime.start_over_attached_helper(),
+            "the queued replacement must reuse the same helper"
+        );
+        assert!(runtime.lifecycle.backend.is_tun_owned());
+        let logs = app_log_texts(&events.try_iter().collect::<Vec<_>>());
+        assert!(
+            !logs.contains(&t(Language::En, Key::RtLogHelperLaunchWait).to_string()),
+            "the apply replacement must not launch a new helper: {logs:?}"
+        );
+    }
+
+    /// Switching TUN off starts a direct core while the idle helper
+    /// stays attached beside it, so re-enabling TUN can reuse it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn turning_tun_off_and_starting_a_direct_core_keeps_the_helper_pipe() {
+        Box::pin(with_appdata_async(async {
+            let profile = ServerProfile {
+                id: "0123456789abcdef".into(),
+                name: "Direct edge".into(),
+                outbound: OutboundModel::new(Protocol::Freedom),
+                ..ServerProfile::new("Direct edge", OutboundModel::new(Protocol::Freedom))
+            };
+            let servers = crate::model::ServersFile {
+                profiles: vec![profile.clone()],
+                active: Some(profile.id),
+                ..crate::model::ServersFile::default()
+            };
+            servers.save().expect("save the server list");
+            crate::model::Settings::default()
+                .save()
+                .expect("save the settings");
+
+            let (mut runtime, events) = runtime_with_events();
+            let (_helper_events, _sink) = attach_fake_helper(&mut runtime);
+            runtime.lifecycle.requested_tun_mode = false;
+            runtime.lifecycle.phase = CorePhase::Stopped;
+
+            runtime.start_backend().await;
+
+            assert!(
+                runtime.lifecycle.backend.has_helper(),
+                "a direct start must leave the idle helper attached"
+            );
+            assert!(!runtime.lifecycle.backend.is_tun_owned());
+            // The spawn attempt is what proves the direct branch ran; the
+            // redirected AppData has no installed core, so it fails loudly.
+            let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
+                panic!(
+                    "the direct start must reach the spawn and report its failure, got {:?}",
+                    runtime.lifecycle.phase
+                );
+            };
+            assert!(
+                error
+                    .message
+                    .text(Language::En)
+                    .contains(&t(Language::En, Key::RtPhaseCoreSpawnFailed).to_string()),
+                "the direct start must report the spawn failure: {:?}",
+                error.message
+            );
+            let logs = app_log_texts(&events.try_iter().collect::<Vec<_>>());
+            assert!(
+                !logs.contains(&t(Language::En, Key::RtLogHelperLaunchWait).to_string()),
+                "a direct start must not launch the elevated helper: {logs:?}"
+            );
+        }))
+        .await;
+    }
+
+    /// App exit releases the idle helper pipe, so no elevated
+    /// process outlives the app.
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_shutdown_releases_an_idle_helper() {
+        let (mut runtime, _events) = runtime_with_events();
+        let (_helper_events, _sink) = attach_fake_helper(&mut runtime);
+        assert!(
+            runtime.lifecycle.backend.has_helper(),
+            "the fixture must start with an attached helper"
+        );
+
+        runtime.shutdown_backend().await;
+
+        assert!(
+            !runtime.lifecycle.backend.has_helper(),
+            "app exit must release the idle helper pipe"
+        );
+        assert!(!runtime.lifecycle.backend.is_direct());
+    }
+
+    /// A lost helper transport is still a loss. It is surfaced,
+    /// the pipe is released, and the next TUN start must launch a fresh
+    /// helper.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lost_helper_transport_is_surfaced_and_releases_the_pipe() {
+        let (mut runtime, events) = runtime_with_events();
+        let (_helper_events, _sink) = attach_fake_helper(&mut runtime);
+        runtime.lifecycle.backend.mark_tun_started();
+        runtime.lifecycle.requested_tun_mode = true;
+        runtime.lifecycle.phase = CorePhase::Running;
+
+        runtime.on_helper_transport_loss();
+
+        assert!(
+            !runtime.lifecycle.backend.has_helper(),
+            "a lost transport must release the helper pipe"
+        );
+        let super::CorePhase::Error(error) = &runtime.lifecycle.phase else {
+            panic!(
+                "a lost helper that owned the session must surface, got {:?}",
+                runtime.lifecycle.phase
+            );
+        };
+        assert_eq!(
+            phase_message(error).key(),
+            Key::RtPhaseHelperExitUnconfirmed
+        );
+        let logs = app_log_texts(&events.try_iter().collect::<Vec<_>>());
+        assert!(
+            logs.contains(&t(Language::En, Key::RtLogHelperDisconnected).to_string()),
+            "the loss must be visible in the log: {logs:?}"
+        );
+        assert!(
+            !runtime.start_over_attached_helper(),
+            "with the pipe released, the next TUN start launches a fresh helper"
+        );
+    }
+
+    /// The run loop owns the production wiring: a helper stream that closes
+    /// must reach the same release-and-surface path the unit above pins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_run_loop_settles_a_helper_whose_event_stream_closes() {
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) =
+            std::sync::mpsc::sync_channel(super::EVT_CHANNEL_CAPACITY);
+        let mut runtime = Runtime::new(command_receiver, event_sender, egui::Context::default());
+        let (helper_events, _sink) = attach_fake_helper(&mut runtime);
+        runtime.lifecycle.backend.mark_tun_started();
+        // Starting keeps the ready arm's unarmed no-op and the stats arm off,
+        // so the only work the loop has is the helper stream.
+        runtime.lifecycle.phase = CorePhase::Starting;
+        let run = tokio::spawn(runtime.run());
+
+        // The helper process dies: the only sender of its event stream is
+        // gone, so the run loop's recv resolves to `None`.
+        drop(helper_events);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let emitted: Vec<_> = event_receiver.try_iter().collect();
+        let logs = app_log_texts(&emitted);
+        assert!(
+            logs.contains(&t(Language::En, Key::RtLogHelperDisconnected).to_string()),
+            "the loop must log the lost helper: {logs:?}"
+        );
+        assert!(
+            emitted.iter().any(|event| matches!(
+                event,
+                CoreEvt::State {
+                    phase: CorePhase::Error(error),
+                    ..
+                } if phase_message(error).key() == Key::RtPhaseHelperExitUnconfirmed
+            )),
+            "the loop must surface the unconfirmed helper exit: {emitted:?}"
+        );
+
+        let _ = command_sender.send(CoreCmd::Shutdown);
+        run.await
+            .expect("the run loop must complete after shutdown");
+    }
+
+    /// An idle helper — one retained across a Stop or TUN off — is released
+    /// by a lost transport without turning into a session error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lost_idle_helper_is_released_without_surfacing_a_session_error() {
+        let (mut runtime, _events) = runtime_with_events();
+        let (_helper_events, _sink) = attach_fake_helper(&mut runtime);
+        runtime.lifecycle.phase = CorePhase::Stopped;
+
+        runtime.on_helper_transport_loss();
+
+        assert!(!runtime.lifecycle.backend.has_helper());
+        assert_eq!(runtime.lifecycle.phase, CorePhase::Stopped);
+    }
+
     /// Deliver any busy-window bookends the registry sink queued during a
     /// direct `handle_cmd`/state call into the GUI event channel — exactly
     /// what the select loop's bookend arm does on its next pass in the real
@@ -4392,6 +4688,41 @@ mod tests {
 
     fn runtime() -> Runtime {
         runtime_with_events().0
+    }
+
+    /// Install a fake authenticated helper on `runtime`: no OS pipe, no
+    /// reader thread, no elevation. Returns the helper-side event sender
+    /// (dropping it simulates a dead transport) and the scratch file the fake
+    /// pipe writes its commands to.
+    fn attach_fake_helper(
+        runtime: &mut Runtime,
+    ) -> (
+        tokio::sync::mpsc::Sender<super::helper::HelperEvent>,
+        std::path::PathBuf,
+    ) {
+        static NEXT_SINK: AtomicU64 = AtomicU64::new(0);
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let path = std::env::temp_dir().join(format!(
+            "broccoli-helper-fake-{}-{}.log",
+            std::process::id(),
+            NEXT_SINK.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sink = std::fs::File::create(&path).expect("create the fake helper command sink");
+        runtime
+            .lifecycle
+            .backend
+            .attach_tun(super::helper::HelperPipe::fake(sink), receiver);
+        (sender, path)
+    }
+
+    /// Give the runtime a runnable helper start: the captured configuration a
+    /// TUN start stages and a valid control-plane port.
+    fn arm_helper_start(runtime: &mut Runtime) {
+        runtime.api_port = 12_345;
+        runtime
+            .lifecycle
+            .spawn_config
+            .capture(b"{\"api\":{}}".to_vec(), true);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8352,7 +8683,8 @@ mod tests {
             .arm_rollback(rollback_reason());
         // The direct child owns deny-write/delete payload handles. The
         // rollback path must release that backend before it touches core/.
-        assert!(runtime.lifecycle.backend.as_backend().is_none());
+        assert!(!runtime.lifecycle.backend.is_direct());
+        assert!(!runtime.lifecycle.backend.has_helper());
         assert!(runtime.lifecycle.core_update.is_candidate_pending());
         assert!(runtime.lifecycle.core_update.rollback_pending().is_some());
         assert!(

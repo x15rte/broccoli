@@ -2,8 +2,10 @@
 //!
 //! User-triggered only — no timer, no refresh on launch. One attempt per
 //! fetch: 15 s total, 10 s connect, 16 MiB body, redirects capped at 10. The
-//! request optionally binds the physical uplink the latency probe resolves;
-//! otherwise it follows the OS stack (so TUN intercepts it while up).
+//! request takes the resolved outbound carrier: Bind NIC binds the physical
+//! uplink the latency probe resolves, Native follows the OS stack (so TUN
+//! intercepts it while up), and SOCKS5 dials the configured proxy. The fetch
+//! never substitutes one carrier for another.
 
 use std::time::Duration;
 
@@ -15,6 +17,27 @@ pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The redirect hop cap.
 pub const MAX_REDIRECTS: usize = 10;
+
+/// The carrier one fetch uses. The caller resolves it from the effective
+/// outbound path ([`crate::sys::outbound_path`]) before starting the worker;
+/// the fetch itself never falls back to another carrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchTransport {
+    /// Follow the OS stack; with TUN up the tunnel captures the request.
+    Native,
+    /// Bind the request's sockets to this source address (Bind NIC).
+    Bind(std::net::IpAddr),
+    /// Dial through a SOCKS5 proxy. The target's host name is resolved by the
+    /// proxy (`socks5h`), so the fetch leaks no lookup to the OS stack, and
+    /// the connection to the proxy itself takes no extra bind — the user's
+    /// routing owns that leg.
+    Socks5 {
+        host: String,
+        port: u16,
+        username: Option<String>,
+        password: Option<String>,
+    },
+}
 
 /// The provider headers this client reads.
 #[derive(Debug, Clone, Default)]
@@ -42,6 +65,9 @@ pub enum FetchError {
     Url(String),
     /// The client could not be built.
     Client(String),
+    /// The SOCKS5 carrier is unusable: a required field is missing, or the
+    /// proxy could not be configured. Never falls back to the OS stack.
+    Socks5(String),
     /// The request failed before a response arrived.
     Request(String),
     /// The response status was not 2xx.
@@ -57,6 +83,7 @@ impl std::fmt::Display for FetchError {
         match self {
             Self::Url(detail) => write!(f, "invalid URL: {detail}"),
             Self::Client(detail) => write!(f, "client setup failed: {detail}"),
+            Self::Socks5(detail) => write!(f, "socks5 proxy unusable: {detail}"),
             Self::Request(detail) => write!(f, "request failed: {detail}"),
             Self::Status(status) => write!(f, "HTTP status {status}"),
             Self::TooLarge => write!(f, "body exceeds {MAX_BODY_BYTES} bytes"),
@@ -65,35 +92,46 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-/// Fetch `url`. `user_agent` empty means no `User-Agent` header;
-/// `bind_address` is the uplink adapter's source address the sockets bind to,
-/// or `None` for the OS stack.
+/// Fetch `url` over `transport`. `user_agent` empty means no `User-Agent`
+/// header.
 pub fn fetch(
     url: &str,
     user_agent: &str,
-    bind_address: Option<std::net::IpAddr>,
+    transport: FetchTransport,
 ) -> Result<FetchOutcome, FetchError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| FetchError::Client(error.to_string()))?;
-    runtime.block_on(fetch_async(url, user_agent, bind_address))
+    runtime.block_on(fetch_async(url, user_agent, transport))
 }
 
 async fn fetch_async(
     url: &str,
     user_agent: &str,
-    bind_address: Option<std::net::IpAddr>,
+    transport: FetchTransport,
 ) -> Result<FetchOutcome, FetchError> {
     let (parsed, basic) = request_target(url)?;
 
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(TOTAL_TIMEOUT);
-    if let Some(address) = bind_address {
-        builder = builder.local_address(address);
-    }
+    let builder = match transport {
+        FetchTransport::Native => builder,
+        FetchTransport::Bind(address) => builder.local_address(address),
+        FetchTransport::Socks5 {
+            host,
+            port,
+            username,
+            password,
+        } => builder.proxy(socks5_proxy(
+            &host,
+            port,
+            username.as_deref(),
+            password.as_deref(),
+        )?),
+    };
     let client = builder
         .build()
         .map_err(|error| FetchError::Client(error.to_string()))?;
@@ -146,6 +184,42 @@ async fn fetch_async(
     })
 }
 
+/// The SOCKS5 client proxy. A blank host or a zero port is refused here so a
+/// half-filled configuration never silently becomes a Native fetch, and the
+/// credentials travel through `Proxy::basic_auth` rather than the proxy URL.
+fn socks5_proxy(
+    host: &str,
+    port: u16,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<reqwest::Proxy, FetchError> {
+    let url = socks5_proxy_url(host, port)?;
+    let mut proxy =
+        reqwest::Proxy::all(url).map_err(|error| FetchError::Socks5(error.to_string()))?;
+    if let Some(username) = username.filter(|name| !name.trim().is_empty()) {
+        proxy = proxy.basic_auth(username, password.unwrap_or_default());
+    }
+    Ok(proxy)
+}
+
+/// The proxy URL `socks5_proxy` dials. `socks5h` makes the proxy resolve the
+/// target's host name, so the fetch does not leak a DNS lookup to the OS
+/// stack. An IPv6 literal is bracketed for the URL parser.
+fn socks5_proxy_url(host: &str, port: u16) -> Result<String, FetchError> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(FetchError::Socks5("host is unset".into()));
+    }
+    if port == 0 {
+        return Err(FetchError::Socks5("port is unset".into()));
+    }
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    if host.contains(':') && !bracketed {
+        return Ok(format!("socks5h://[{host}]:{port}"));
+    }
+    Ok(format!("socks5h://{host}:{port}"))
+}
+
 /// Parse the URL and lift `user:password@` out of it into Basic-auth
 /// credentials; the request URL itself carries no credentials.
 fn request_target(url: &str) -> Result<(url::Url, Option<(String, String)>), FetchError> {
@@ -194,7 +268,7 @@ mod tests {
     #[test]
     fn an_invalid_url_fails_before_any_request() {
         assert!(matches!(
-            fetch("not a url", "", None),
+            fetch("not a url", "", FetchTransport::Native),
             Err(FetchError::Url(_))
         ));
     }
@@ -207,5 +281,82 @@ mod tests {
         let (url, basic) = request_target("https://example.com/feed").expect("url");
         assert_eq!(url.as_str(), "https://example.com/feed");
         assert!(basic.is_none());
+    }
+
+    #[test]
+    fn socks5_proxy_url_names_the_host_and_port() {
+        assert_eq!(
+            socks5_proxy_url("proxy.example", 1080).expect("url"),
+            "socks5h://proxy.example:1080",
+            "the proxy resolves the target name, so the OS stack sees no lookup"
+        );
+        assert_eq!(
+            socks5_proxy_url("  proxy.example  ", 1080).expect("url"),
+            "socks5h://proxy.example:1080",
+            "the host is trimmed"
+        );
+        assert_eq!(
+            socks5_proxy_url("::1", 1080).expect("url"),
+            "socks5h://[::1]:1080",
+            "an IPv6 literal is bracketed for the URL parser"
+        );
+        assert_eq!(
+            socks5_proxy_url("[::1]", 1080).expect("url"),
+            "socks5h://[::1]:1080",
+            "an already bracketed literal is not bracketed twice"
+        );
+        let url = socks5_proxy_url("proxy.example", 1080).expect("url");
+        assert!(
+            !url.contains('@'),
+            "the proxy URL must carry no credentials: {url}"
+        );
+    }
+
+    #[test]
+    fn missing_socks5_fields_fail_before_any_request() {
+        for host in ["", "   "] {
+            let error = fetch(
+                "https://example.com/feed",
+                "",
+                FetchTransport::Socks5 {
+                    host: host.into(),
+                    port: 1080,
+                    username: None,
+                    password: None,
+                },
+            )
+            .expect_err("a blank host must fail loudly");
+            assert!(
+                matches!(&error, FetchError::Socks5(detail) if detail.contains("host")),
+                "{error:?}"
+            );
+        }
+
+        let error = fetch(
+            "https://example.com/feed",
+            "",
+            FetchTransport::Socks5 {
+                host: "proxy.example".into(),
+                port: 0,
+                username: None,
+                password: None,
+            },
+        )
+        .expect_err("an unset port must fail loudly");
+        assert!(
+            matches!(&error, FetchError::Socks5(detail) if detail.contains("port")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_builds_with_and_without_credentials() {
+        socks5_proxy("proxy.example", 1080, None, None).expect("credential-free proxy");
+        socks5_proxy("proxy.example", 1080, Some("alice"), Some("s3cr3t"))
+            .expect("proxy with auth");
+        socks5_proxy("proxy.example", 1080, Some("alice"), None)
+            .expect("username without password");
+        socks5_proxy("proxy.example", 1080, Some("   "), Some("s3cr3t"))
+            .expect("a blank username is treated as absent");
     }
 }

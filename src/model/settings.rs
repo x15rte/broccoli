@@ -21,6 +21,124 @@ pub enum Mode {
     Tun,
 }
 
+/// The latency probe's outbound path. `BindNic` binds the TUN screen's
+/// outbound interface (the same selection and resolver the tunnel uses), so
+/// the probe's dials bypass the capture; `Native` follows the OS stack, so the
+/// tunnel captures them and the probe measures through it. This is the OS
+/// stack, not Xray's direct route.
+///
+/// Serializes camelCase ("bindNic" | "native"). The retired
+/// `latencyTestBindInterface` boolean also loads here (true → BindNic,
+/// false → Native), so an older settings.json keeps its effective behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProbePath {
+    #[default]
+    BindNic,
+    Native,
+}
+
+impl<'de> Deserialize<'de> for ProbePath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProbePathVisitor;
+
+        impl serde::de::Visitor<'_> for ProbePathVisitor {
+            type Value = ProbePath;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("\"bindNic\", \"native\", or a legacy boolean")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "bindNic" => Ok(ProbePath::BindNic),
+                    "native" => Ok(ProbePath::Native),
+                    other => Err(E::unknown_variant(other, &["bindNic", "native"])),
+                }
+            }
+
+            // The retired `latencyTestBindInterface` boolean: true bound the
+            // physical uplink, which is Bind NIC here.
+            fn visit_bool<E: serde::de::Error>(self, bind: bool) -> Result<Self::Value, E> {
+                Ok(if bind {
+                    ProbePath::BindNic
+                } else {
+                    ProbePath::Native
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ProbePathVisitor)
+    }
+}
+
+/// A subscription refresh's outbound path. `BindNic` and `Native` mean what
+/// they mean for the probe; `Socks5` dials through the configured SOCKS5
+/// proxy and adds no bind of its own, so the user's routing owns the
+/// connection to that proxy.
+///
+/// Serializes camelCase ("bindNic" | "native" | "socks5"). The retired
+/// `subscriptionDirectFetch` boolean also loads here (true → BindNic,
+/// false → Native).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RefreshPath {
+    #[default]
+    BindNic,
+    Native,
+    Socks5,
+}
+
+impl<'de> Deserialize<'de> for RefreshPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RefreshPathVisitor;
+
+        impl serde::de::Visitor<'_> for RefreshPathVisitor {
+            type Value = RefreshPath;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("\"bindNic\", \"native\", \"socks5\", or a legacy boolean")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "bindNic" => Ok(RefreshPath::BindNic),
+                    "native" => Ok(RefreshPath::Native),
+                    "socks5" => Ok(RefreshPath::Socks5),
+                    other => Err(E::unknown_variant(other, &["bindNic", "native", "socks5"])),
+                }
+            }
+
+            // The retired `subscriptionDirectFetch` boolean: true bound the
+            // physical uplink, which is Bind NIC here. SOCKS5 did not exist.
+            fn visit_bool<E: serde::de::Error>(self, bind: bool) -> Result<Self::Value, E> {
+                Ok(if bind {
+                    RefreshPath::BindNic
+                } else {
+                    RefreshPath::Native
+                })
+            }
+        }
+
+        deserializer.deserialize_any(RefreshPathVisitor)
+    }
+}
+
+/// The SOCKS5 carrier a subscription refresh can dial through. `port` 0 means
+/// the field is unset; a blank host or a zero port fails the fetch loudly
+/// rather than falling back to the OS stack. Credentials are optional and a
+/// blank username is treated as absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Socks5Cfg {
+    pub host: String,
+    pub port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
 /// UI locale. Serializes camelCase ("en"). Unknown or absent tags resolve to
 /// English (the fallback locale) so a foreign or hand-edited value in
 /// settings.json can never corrupt the state file.
@@ -401,15 +519,19 @@ pub struct Settings {
     /// written even when empty: the default belongs to a setting the file
     /// never had, not to one the user cleared.
     pub subscription_user_agent: String,
-    /// Bind subscription fetches to the physical uplink instead of following
-    /// the OS stack (which TUN intercepts).
-    #[serde(skip_serializing_if = "skip_false")]
-    pub subscription_direct_fetch: bool,
-    /// Bind the latency test's dials to the TUN screen's outbound interface
-    /// while the tunnel runs, so its traffic bypasses the capture. Off lets
-    /// the tunnel capture them; the probe then measures through the tunnel.
-    #[serde(skip_serializing_if = "skip_true")]
-    pub latency_test_bind_interface: bool,
+    /// The global outbound path subscription fetches take. Always written:
+    /// the new form replaced the retired `subscriptionDirectFetch` boolean,
+    /// which still loads here (true → Bind NIC, false → Native).
+    #[serde(default, alias = "subscriptionDirectFetch")]
+    pub subscription_path: RefreshPath,
+    /// The global SOCKS5 fields a `Socks5` refresh path dials through; a
+    /// group's override replaces them together with the path.
+    pub subscription_socks5: Socks5Cfg,
+    /// The latency test's outbound path. Always written: the new form replaced
+    /// the retired `latencyTestBindInterface` boolean, which still loads here
+    /// (true → Bind NIC, false → Native).
+    #[serde(default, alias = "latencyTestBindInterface")]
+    pub latency_test_path: ProbePath,
     /// when Some, the generator returns the parsed text VERBATIM
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_override: Option<String>,
@@ -443,8 +565,9 @@ impl Default for Settings {
             geodata: GeodataCfg::default(),
             probe_url: String::new(),
             subscription_user_agent: default_subscription_user_agent(),
-            subscription_direct_fetch: false,
-            latency_test_bind_interface: true,
+            subscription_path: RefreshPath::BindNic,
+            subscription_socks5: Socks5Cfg::default(),
+            latency_test_path: ProbePath::BindNic,
             raw_override: None,
             extra: Map::new(),
         }
@@ -1102,5 +1225,113 @@ mod tests {
         settings.probe_url.clear();
         settings.routing.observatory.probe_url.clear();
         assert_eq!(settings.ping_test_probe_url(), "");
+    }
+
+    #[test]
+    fn both_outbound_paths_default_to_bind_nic() {
+        let settings = Settings::default();
+        assert_eq!(settings.latency_test_path, ProbePath::BindNic);
+        assert_eq!(settings.subscription_path, RefreshPath::BindNic);
+        assert_eq!(settings.subscription_socks5, Socks5Cfg::default());
+
+        let absent: Settings = serde_json::from_value(json!({ "mode": "off" })).expect("settings");
+        assert_eq!(absent.latency_test_path, ProbePath::BindNic);
+        assert_eq!(absent.subscription_path, RefreshPath::BindNic);
+    }
+
+    #[test]
+    fn retired_latency_bind_boolean_loads_as_the_probe_path() {
+        for (legacy, expected) in [(true, ProbePath::BindNic), (false, ProbePath::Native)] {
+            let settings: Settings = serde_json::from_value(json!({
+                "latencyTestBindInterface": legacy,
+            }))
+            .expect("the retired boolean must still load");
+            assert_eq!(settings.latency_test_path, expected);
+            assert!(
+                settings.extra.is_empty(),
+                "the retired key is consumed, not preserved in extra"
+            );
+
+            // Saving writes the new form and drops the retired key.
+            let wire = serde_json::to_value(&settings).expect("settings serialize");
+            assert_eq!(wire["latencyTestPath"], json!(expected));
+            assert!(wire.get("latencyTestBindInterface").is_none());
+        }
+    }
+
+    #[test]
+    fn retired_subscription_direct_boolean_loads_as_the_refresh_path() {
+        for (legacy, expected) in [(true, RefreshPath::BindNic), (false, RefreshPath::Native)] {
+            let settings: Settings = serde_json::from_value(json!({
+                "subscriptionDirectFetch": legacy,
+            }))
+            .expect("the retired boolean must still load");
+            assert_eq!(settings.subscription_path, expected);
+            assert!(
+                settings.extra.is_empty(),
+                "the retired key is consumed, not preserved in extra"
+            );
+
+            let wire = serde_json::to_value(&settings).expect("settings serialize");
+            assert_eq!(wire["subscriptionPath"], json!(expected));
+            assert!(wire.get("subscriptionDirectFetch").is_none());
+        }
+    }
+
+    #[test]
+    fn outbound_paths_round_trip_as_names() {
+        let settings = Settings {
+            latency_test_path: ProbePath::Native,
+            subscription_path: RefreshPath::Socks5,
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&settings).expect("settings serialize");
+        assert_eq!(wire["latencyTestPath"], json!("native"));
+        assert_eq!(wire["subscriptionPath"], json!("socks5"));
+
+        let loaded: Settings = serde_json::from_value(wire).expect("settings load");
+        assert_eq!(loaded.latency_test_path, ProbePath::Native);
+        assert_eq!(loaded.subscription_path, RefreshPath::Socks5);
+    }
+
+    #[test]
+    fn unknown_outbound_path_names_fail_the_load() {
+        let probe = serde_json::from_value::<Settings>(json!({
+            "latencyTestPath": "direct",
+        }));
+        let refresh = serde_json::from_value::<Settings>(json!({
+            "subscriptionPath": "direct",
+        }));
+        assert!(probe.is_err(), "an unknown path must not load silently");
+        assert!(refresh.is_err(), "an unknown path must not load silently");
+    }
+
+    #[test]
+    fn socks5_settings_round_trip_and_omit_absent_credentials() {
+        let settings = Settings {
+            subscription_path: RefreshPath::Socks5,
+            subscription_socks5: Socks5Cfg {
+                host: "proxy.example".into(),
+                port: 1080,
+                username: Some("alice".into()),
+                password: Some("s3cr3t".into()),
+            },
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&settings).expect("settings serialize");
+        assert_eq!(
+            wire["subscriptionSocks5"],
+            json!({
+                "host": "proxy.example",
+                "port": 1080,
+                "username": "alice",
+                "password": "s3cr3t",
+            })
+        );
+        let loaded: Settings = serde_json::from_value(wire).expect("settings load");
+        assert_eq!(loaded.subscription_socks5, settings.subscription_socks5);
+
+        let wire = serde_json::to_value(Socks5Cfg::default()).expect("socks serialize");
+        assert_eq!(wire, json!({ "host": "", "port": 0 }));
     }
 }

@@ -723,6 +723,10 @@ keys! {
     SniffingMetadataOnly 0,
     SniffingRouteOnly 0,
     // Routing screen.
+    RoutingTabRules 0,
+    RoutingTabRulesHint 0,
+    RoutingTabSettings 0,
+    RoutingTabSettingsHint 0,
     GeodataAddGeosite 0,
     GeodataAddGeoip 0,
     RoutingRulesSection 0,
@@ -977,8 +981,16 @@ keys! {
     SettingsResetDetail 0,
     SettingsResetConfirm 0,
     SettingsAdvanced 0,
-    SettingsPingTest 0,
-    SettingsPingTestNote 0,
+    SettingsLatencyTest 0,
+    SettingsLatencyTestNote 0,
+    SettingsOutboundPath 0,
+    SettingsPathBindNic 0,
+    SettingsPathNative 0,
+    SettingsPathSocks5 0,
+    SettingsPathNoteBindNic 0,
+    SettingsPathNoteBindNicTunOff 0,
+    SettingsPathNoteNative 0,
+    SettingsPathBindNicDisabledHint 0,
     SettingsRawOverrideActive 0,
     SettingsRawOverrideHeader 0,
     SettingsRawOverrideExplain 0,
@@ -1121,6 +1133,10 @@ keys! {
     SrvColGroup 0,
     SrvFitColumns 0,
     SrvFitColumnsHint 0,
+    SrvHeaderTable 0,
+    SrvHeaderTableHint 0,
+    SrvHeaderSettings 0,
+    SrvHeaderSettingsHint 0,
     SrvTabEmitted 0,
     SrvTabManual 0,
     SrvTabAll 0,
@@ -1161,20 +1177,49 @@ keys! {
     SrvSubscriptionExpiresIn 2,
     SrvSubscriptionUpdateHint 1,
     SrvReportTitle 0,
-    SrvReportSummary 5,
+    SrvReportSummary 6,
     SrvReportAdded 0,
     SrvReportUpdated 0,
     SrvReportRemoved 0,
     SrvReportRefused 0,
     SrvReportIgnored 0,
+    SrvReportIgnoredGroup 2,
     SrvSubscriptionFetchFailed 1,
     SrvSubscriptionEmpty 0,
     SrvSubscriptionNoUplinkAddress 1,
+    SrvSocks5HostMissing 0,
+    SrvSocks5PortMissing 0,
+    SrvMoreActions 0,
+    SrvCopy 0,
+    SrvCopied 0,
+    SrvViewProfileJson 0,
+    SrvProfileJsonUnsavedDraft 0,
+    SrvProfileJsonCopyNote 0,
+    SrvRawSubscription 0,
+    SrvSubscriptionRawTitle 1,
+    SrvSubscriptionRawWarning 0,
+    SrvSubscriptionSnapshotAt 1,
+    SrvSubscriptionSnapshotEmpty 0,
+    SrvSubscriptionTruncated 0,
+    SrvSubscriptionBodyPane 0,
+    SrvSubscriptionParsedPane 0,
+    SrvSubscriptionResizePanes 0,
+    SrvSubscriptionCounts 3,
+    SrvSubscriptionParsing 0,
     SettingsSubscriptions 0,
     SettingsSubscriptionUserAgent 0,
     SettingsSubscriptionUserAgentHint 0,
-    SettingsSubscriptionDirectFetch 0,
-    SettingsSubscriptionDirectFetchHint 0,
+    SettingsSubscriptionPathNoteSocks5 0,
+    SettingsSocks5Host 0,
+    SettingsSocks5Port 0,
+    SettingsSocks5Username 0,
+    SettingsSocks5Password 0,
+    SettingsSocks5RevealPassword 0,
+    SettingsSocks5HidePassword 0,
+    SettingsSocks5Note 0,
+    SrvOutboundOverride 0,
+    SrvOutboundUsingGlobal 1,
+    SrvOutboundCustom 1,
     SrvDuplicate 0,
     SrvDeleteEllipsis 0,
     SrvEnableSelected 0,
@@ -3855,6 +3900,14 @@ mod en {
             Key::SniffingRouteOnly => "route only (sniffed name used for routing, not dialing)",
             // Routing screen.
             Key::GeodataAddGeosite => "Add geosite…",
+            Key::RoutingTabRules => "Rules",
+            Key::RoutingTabRulesHint => {
+                "The ordered routing rules, balancers, observatory, and trial rules."
+            }
+            Key::RoutingTabSettings => "Settings",
+            Key::RoutingTabSettingsHint => {
+                "Geodata file URLs, the update schedule, provenance status, and Restore."
+            }
             Key::GeodataAddGeoip => "Add geoip…",
             Key::RoutingRulesSection => "Rules (first match wins)",
             // The section's switch and path belong to the script control's
@@ -4214,11 +4267,27 @@ mod en {
             }
             Key::SettingsResetConfirm => "Reset to default",
             Key::SettingsAdvanced => "Advanced",
-            Key::SettingsPingTest => "Ping test",
-            Key::SettingsPingTestNote => {
+            Key::SettingsLatencyTest => "Latency test",
+            Key::SettingsLatencyTestNote => {
                 "URL that the isolated Test latency one-shot probe fetches. An empty value falls \
                  back to the Observatory probe URL, then to the built-in default."
             }
+            Key::SettingsOutboundPath => "Outbound path",
+            Key::SettingsPathBindNic => "Bind NIC",
+            Key::SettingsPathNative => "Native",
+            Key::SettingsPathSocks5 => "SOCKS5",
+            Key::SettingsPathNoteBindNic => {
+                "Bind NIC uses the outbound interface from the TUN screen. The dial bypasses the \
+                 tunnel capture."
+            }
+            Key::SettingsPathNoteBindNicTunOff => {
+                "Bind NIC needs TUN mode. The stored Bind NIC preference applies again when TUN \
+                 mode is on. Native follows the OS stack now."
+            }
+            Key::SettingsPathNoteNative => {
+                "Native follows the OS stack. While TUN mode is on, the tunnel captures this path."
+            }
+            Key::SettingsPathBindNicDisabledHint => "Bind NIC needs TUN mode.",
             Key::SettingsRawOverrideActive => {
                 "⚠ RAW OVERRIDE ACTIVE. The app ignores all other settings on every screen."
             }
@@ -4413,6 +4482,12 @@ mod en {
             Key::SrvColGroup => "Group",
             Key::SrvFitColumns => "Fit columns",
             Key::SrvFitColumnsHint => "Fit each column to its content",
+            Key::SrvHeaderTable => "Table",
+            Key::SrvHeaderTableHint => "The server list, its groups, and the latency verdicts.",
+            Key::SrvHeaderSettings => "Settings",
+            Key::SrvHeaderSettingsHint => {
+                "Latency test and subscription settings for the servers on this screen."
+            }
             Key::SrvTabEmitted => "Emitted",
             Key::SrvTabManual => "Manual",
             Key::SrvTabAll => "All",
@@ -4447,7 +4522,7 @@ mod en {
             Key::SrvSubscriptionTitle => "Title",
             Key::SrvUseCustomUa => "Use a custom User-Agent",
             Key::SrvRefreshSubscription => "Refresh",
-            Key::SrvSubscriptionFetching => "Fetching subscription...",
+            Key::SrvSubscriptionFetching => "Fetching…",
             Key::SrvShowReport => "Report",
             Key::SrvQuotaUsed => "{} / {} ({}%)",
             Key::SrvQuotaUnlimited => "{} / ∞",
@@ -4455,26 +4530,66 @@ mod en {
             Key::SrvSubscriptionExpiresIn => "expires in {} days ({})",
             Key::SrvSubscriptionUpdateHint => "provider suggests every {} h",
             Key::SrvReportTitle => "Refresh report",
-            Key::SrvReportSummary => "Added {}, updated {}, removed {}, refused {}, ignored {}",
+            Key::SrvReportSummary => {
+                "Added {}, unchanged {}, updated {}, removed {}, refused {}, ignored {}"
+            }
             Key::SrvReportAdded => "added",
             Key::SrvReportUpdated => "updated",
             Key::SrvReportRemoved => "removed",
             Key::SrvReportRefused => "refused",
             Key::SrvReportIgnored => "ignored",
+            Key::SrvReportIgnoredGroup => "ignored {} ({} entries)",
             Key::SrvSubscriptionFetchFailed => "subscription fetch failed: {}",
             Key::SrvSubscriptionEmpty => {
                 "the subscription returned no usable servers, so the previous servers stay"
             }
             Key::SrvSubscriptionNoUplinkAddress => "the uplink adapter {} has no usable address",
+            Key::SrvSocks5HostMissing => "the SOCKS5 host is empty",
+            Key::SrvSocks5PortMissing => "the SOCKS5 port is not set",
+            Key::SrvMoreActions => "More",
+            Key::SrvCopy => "Copy",
+            Key::SrvCopied => "Copied.",
+            Key::SrvViewProfileJson => "View profile JSON",
+            Key::SrvProfileJsonUnsavedDraft => "Unsaved draft",
+            Key::SrvProfileJsonCopyNote => {
+                "Copy copies the text you see. Masked values stay masked."
+            }
+            Key::SrvRawSubscription => "Raw",
+            Key::SrvSubscriptionRawTitle => "{} raw view",
+            Key::SrvSubscriptionRawWarning => {
+                "This is raw provider content. It may contain credentials."
+            }
+            Key::SrvSubscriptionSnapshotAt => "Snapshot: {}",
+            Key::SrvSubscriptionSnapshotEmpty => {
+                "No snapshot is stored. Refresh the subscription to capture the raw body."
+            }
+            Key::SrvSubscriptionTruncated => {
+                "The snapshot was cut at 1 MiB. The parsed entries also come from the truncated body."
+            }
+            Key::SrvSubscriptionBodyPane => "Decoded body",
+            Key::SrvSubscriptionParsedPane => "Parsed entries",
+            Key::SrvSubscriptionResizePanes => "Resize panes",
+            Key::SrvSubscriptionCounts => "{} entries, {} refused, {} ignored",
+            Key::SrvSubscriptionParsing => "Parsing the stored snapshot…",
             Key::SettingsSubscriptions => "Subscriptions",
             Key::SettingsSubscriptionUserAgent => "Subscription User-Agent",
             Key::SettingsSubscriptionUserAgentHint => {
                 "Sent when a subscription uses the global agent. An empty value omits the header"
             }
-            Key::SettingsSubscriptionDirectFetch => "Direct for subscription fetch",
-            Key::SettingsSubscriptionDirectFetchHint => {
-                "Bind the physical uplink instead of following the OS stack, which TUN intercepts"
+            Key::SettingsSubscriptionPathNoteSocks5 => {
+                "SOCKS5 sends the fetch through the configured proxy. The connection to the proxy \
+                 takes no extra bind."
             }
+            Key::SettingsSocks5Host => "SOCKS5 host",
+            Key::SettingsSocks5Port => "SOCKS5 port",
+            Key::SettingsSocks5Username => "SOCKS5 username (optional)",
+            Key::SettingsSocks5Password => "SOCKS5 password (optional)",
+            Key::SettingsSocks5RevealPassword => "Reveal password",
+            Key::SettingsSocks5HidePassword => "Hide password",
+            Key::SettingsSocks5Note => "These fields apply while the outbound path is SOCKS5.",
+            Key::SrvOutboundOverride => "Override outbound path",
+            Key::SrvOutboundUsingGlobal => "Using global: {}",
+            Key::SrvOutboundCustom => "Custom: {}",
             Key::SrvDuplicate => "Duplicate",
             Key::SrvDeleteEllipsis => "Delete…",
             Key::SrvEnableSelected => "Enable",
@@ -6104,7 +6219,9 @@ mod en {
             Key::LinkUnsupportedTypeHttp => {
                 "Xray core removed the type=http/h2/h3 transport. Use xhttp."
             }
-            Key::LinkUnsupportedTypeQuic => "Xray core removed the type=quic transport.",
+            Key::LinkUnsupportedTypeQuic => {
+                "Xray core removed the type=quic transport. Use XHTTP stream-one H3."
+            }
             Key::LinkUnsupportedXtls => "Xray core removed XTLS. Use reality or tls.",
             Key::LinkUnsupportedTrojanEncryption => "Trojan share links have no encryption field.",
             Key::LinkUnsupportedFlow => "The flow parameter is defined only for VLESS links.",
@@ -6153,7 +6270,9 @@ mod en {
             Key::LinkUnsupportedVmessNetHttp => {
                 "Xray core removed the vmess net=http/h2/h3 transport. Use xhttp."
             }
-            Key::LinkUnsupportedVmessNetQuic => "Xray core removed the vmess net=quic transport.",
+            Key::LinkUnsupportedVmessNetQuic => {
+                "Xray core removed the vmess net=quic transport. Use XHTTP stream-one H3."
+            }
             Key::LinkUnsupportedSsPlugin => {
                 "Xray core share profiles do not support SIP002 plugins."
             }
@@ -7585,6 +7704,19 @@ mod tests {
                 language,
                 Language::En,
                 "tag {tag:?} must fall back to English"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_quic_transports_name_the_h3_replacement() {
+        for key in [
+            Key::LinkUnsupportedTypeQuic,
+            Key::LinkUnsupportedVmessNetQuic,
+        ] {
+            assert!(
+                t(Language::En, key).contains("XHTTP stream-one H3"),
+                "the removed QUIC transport must name its replacement: {key:?}"
             );
         }
     }

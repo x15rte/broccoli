@@ -11,6 +11,7 @@ pub mod exit_bound;
 pub mod geodata;
 pub mod net_table;
 pub mod netif;
+pub mod outbound_path;
 pub mod paths;
 pub mod security;
 pub mod selfupd;

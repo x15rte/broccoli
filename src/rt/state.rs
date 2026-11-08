@@ -7,10 +7,11 @@
 //! stopping > candidate > core-candidate > exit-23 > backoff) in its handlers.
 //!
 //! State-machine invariants (previously scattered as Runtime field comments):
-//! - [`BackendState`] derives `alive`/`tun_owned` from its slot plus the
-//!   started bit: a direct child is always alive; a Tun backend has an idle
-//!   connected-but-not-started state. `tun_owned` describes the *current*
-//!   live backend, never the requested next mode; it is cleared only after
+//! - [`BackendState`] keeps the elevated helper's pipe as an app-lifetime
+//!   attachment, separate from the live direct child, so an idle helper can
+//!   coexist with a direct core and is released only at shutdown or on
+//!   transport loss. `alive`/`tun_owned` describe the *current* live backend,
+//!   never the requested next mode; `tun_owned` is cleared only after
 //!   exit/forced ownership release so every intentional kill attempts
 //!   RemoveInbound first.
 //! - [`PendingCandidate`] declares its two per-kind differences in
@@ -30,7 +31,6 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::Backend;
 use super::CoreTransport;
 use super::helper;
 use super::policy::{ExitIntent, TUN_BIND_RACE_RETRIES, rollback_armable, spend_retry_attempt};
@@ -418,18 +418,53 @@ impl ExitPolicy {
     }
 }
 
-/// Owns the live backend slot (direct child or helper pipe), its event
-/// channel, and the derived alive/tun-ownership flags.
+/// The attached elevated helper: its authenticated pipe and the event stream
+/// the pipe's reader thread feeds.
 ///
-/// Invariants: `alive`/`tun_owned` are derived from the slot variant plus the
-/// started bit — a `Direct` backend is always alive; a `Pipe` backend has an
-/// idle connected-but-not-started state. `tun_owned` describes the *current*
-/// live backend, never the requested next mode, and is cleared only after
-/// exit/forced ownership release so every intentional kill attempts
-/// RemoveInbound first.
+/// `events` is declared first so releasing the link drops the receiver before
+/// the pipe: a reader thread blocked on a bounded lifecycle send then sees the
+/// closed channel and exits at once, and the pipe's drop joins it without
+/// waiting out the send window.
+struct HelperLink {
+    events: mpsc::Receiver<helper::HelperEvent>,
+    pipe: helper::HelperPipe,
+}
+
+/// One signal from the live backend, awaited through a single borrow of
+/// [`BackendState`].
+///
+/// The run loop polls this instead of one select arm per backend kind: two
+/// arms would each hold a mutable borrow of the same state at once, which the
+/// borrow checker forbids even though the arms touch different fields. The
+/// state itself polls its disjoint fields (the direct child, the helper's
+/// event stream) in one future.
+pub(super) enum BackendSignal {
+    /// The direct child's `wait` resolved.
+    Direct(std::io::Result<std::process::ExitStatus>),
+    /// The helper stream yielded one event, or closed (`None`).
+    Helper(Option<helper::HelperEvent>),
+}
+
+/// Owns the live direct child, the attached elevated helper, and the derived
+/// alive/tun-ownership flags.
+///
+/// The helper attachment is app-lifetime, independent of the core session:
+/// a Stop, an apply and a TUN switch-off keep the pipe, so the next TUN start
+/// reuses the same elevated process instead of asking for UAC again. Only app
+/// shutdown or a lost transport releases it. The direct child is the live
+/// backend when the core runs without the helper, so a direct core and an idle
+/// helper can coexist.
+///
+/// Invariants: `alive` describes the live backend a start owns — a direct
+/// child is alive by construction; a helper start is alive from the moment the
+/// pipe accepts its Start. `tun_owned` describes the *current* live backend,
+/// never the requested next mode, and is cleared only after exit/forced
+/// ownership release so every intentional kill attempts RemoveInbound first.
 pub(super) struct BackendState {
-    pub(super) slot: Option<Backend>,
-    pub(super) events: Option<mpsc::Receiver<helper::HelperEvent>>,
+    /// The live direct child; the helper's xray child is the helper's own.
+    direct: Option<Box<supervisor::Child>>,
+    /// The attached elevated helper, idle or driving a child.
+    helper: Option<HelperLink>,
     alive: bool,
     tun_owned: bool,
     /// PID of the spawned xray child this backend owns (direct spawn, or the
@@ -442,8 +477,8 @@ pub(super) struct BackendState {
 impl BackendState {
     pub(super) fn new() -> Self {
         Self {
-            slot: None,
-            events: None,
+            direct: None,
+            helper: None,
             alive: false,
             tun_owned: false,
             child_pid: None,
@@ -454,8 +489,8 @@ impl BackendState {
     #[cfg(test)]
     pub(super) fn for_test(alive: bool, tun_owned: bool) -> Self {
         Self {
-            slot: None,
-            events: None,
+            direct: None,
+            helper: None,
             alive,
             tun_owned,
             child_pid: None,
@@ -478,40 +513,64 @@ impl BackendState {
         CoreTransport::from_backend_tun_owned(self.tun_owned)
     }
 
-    /// A direct child is in the slot.
+    /// A direct child is the live backend.
     pub(super) fn is_direct(&self) -> bool {
-        matches!(self.slot, Some(Backend::Direct(_)))
+        self.direct.is_some()
     }
 
-    /// An idle or started helper pipe is in the slot.
-    pub(super) fn is_pipe(&self) -> bool {
-        matches!(self.slot, Some(Backend::Pipe(_)))
+    /// An authenticated helper is attached, idle or driving a child.
+    pub(super) fn has_helper(&self) -> bool {
+        self.helper.is_some()
     }
 
-    pub(super) fn as_backend(&self) -> Option<&Backend> {
-        self.slot.as_ref()
+    /// The attached helper owns the live child: the one state in which a
+    /// helper event belongs to this session. An idle helper — including one
+    /// retained beside a running direct core — owns nothing, and a direct
+    /// child is never reported on by the helper.
+    pub(super) fn helper_owns_child(&self) -> bool {
+        self.direct.is_none() && (self.alive || self.tun_owned)
     }
 
-    pub(super) fn as_backend_mut(&mut self) -> Option<&mut Backend> {
-        self.slot.as_mut()
+    /// The attached helper's pipe, for commands (start/stop/cleanup).
+    pub(super) fn helper(&self) -> Option<&helper::HelperPipe> {
+        self.helper.as_ref().map(|link| &link.pipe)
     }
 
     pub(super) fn child_mut(&mut self) -> Option<&mut supervisor::Child> {
-        match self.slot.as_mut() {
-            Some(Backend::Direct(child)) => Some(child.as_mut()),
-            _ => None,
+        self.direct.as_deref_mut()
+    }
+
+    pub(super) fn helper_events_mut(&mut self) -> Option<&mut mpsc::Receiver<helper::HelperEvent>> {
+        self.helper.as_mut().map(|link| &mut link.events)
+    }
+
+    /// Await the next live-backend signal, borrowing this state exactly once.
+    ///
+    /// Both signals are polled here rather than as two select arms because the
+    /// arms would hold two simultaneous mutable borrows of the same state. The
+    /// direct child's `wait` and the helper's `recv` are cancel-safe, so being
+    /// dropped when the other side wins is lossless. The helper stream is
+    /// polled whenever it is attached — including an idle helper beside a
+    /// direct core — so its transport loss is still observed.
+    pub(super) async fn next_signal(&mut self) -> BackendSignal {
+        let direct = self.direct.as_deref_mut();
+        let helper = self.helper.as_mut();
+        match (direct, helper) {
+            (Some(child), Some(link)) => tokio::select! {
+                status = child.wait() => BackendSignal::Direct(status),
+                event = link.events.recv() => BackendSignal::Helper(event),
+            },
+            (Some(child), None) => BackendSignal::Direct(child.wait().await),
+            (None, Some(link)) => BackendSignal::Helper(link.events.recv().await),
+            (None, None) => unreachable!("the backend arm is armed only with a live backend"),
         }
     }
 
-    pub(super) fn events_mut(&mut self) -> Option<&mut mpsc::Receiver<helper::HelperEvent>> {
-        self.events.as_mut()
-    }
-
-    /// A direct spawn succeeded: the child is alive by construction.
+    /// A direct spawn succeeded: the child is alive by construction. The
+    /// helper attachment, when one exists, is left untouched and idle.
     pub(super) fn spawn_direct(&mut self, child: Box<supervisor::Child>) {
         self.child_pid = Some(child.pid());
-        self.slot = Some(Backend::Direct(child));
-        self.events = None;
+        self.direct = Some(child);
         self.alive = true;
         self.tun_owned = false;
     }
@@ -527,14 +586,15 @@ impl BackendState {
     }
 
     /// An authenticated helper pipe connected; the xray child is not started
-    /// yet, so this is the idle connected-but-not-started state.
+    /// yet, so this is the idle connected-but-not-started state. This is the
+    /// one point that replaces the attachment (a lost transport's link is
+    /// already released when a fresh helper is launched).
     pub(super) fn attach_tun(
         &mut self,
         pipe: helper::HelperPipe,
         events: mpsc::Receiver<helper::HelperEvent>,
     ) {
-        self.slot = Some(Backend::Pipe(pipe));
-        self.events = Some(events);
+        self.helper = Some(HelperLink { pipe, events });
         self.alive = false;
         self.tun_owned = false;
     }
@@ -548,31 +608,40 @@ impl BackendState {
         }
     }
 
-    /// The backend's own exit was confirmed. A direct child is reaped (dropped
-    /// to close its job handle); a Tun backend returns to the idle
-    /// connected-but-not-started state with the pipe retained for reuse.
+    /// The live backend's own exit was confirmed. A direct child is reaped
+    /// (dropped to close its job handle); the helper attachment survives as the
+    /// idle connected-but-not-started state.
     pub(super) fn confirm_exit(&mut self) {
         self.alive = false;
         self.tun_owned = false;
         self.child_pid = None;
-        if matches!(self.slot, Some(Backend::Direct(_))) {
-            self.slot = None; // reaps the child, closes the job handle
+        // Reaps a direct child and closes its job handle; `None` when the
+        // helper owned the core.
+        self.direct = None;
+    }
+
+    /// Release the helper attachment. The helper is app-lifetime, so the
+    /// callers are exactly shutdown and a lost transport; an idle helper
+    /// beside a live direct core keeps that core.
+    pub(super) fn release_helper(&mut self) {
+        self.helper = None;
+        if self.direct.is_none() {
+            self.alive = false;
+            self.tun_owned = false;
+            self.child_pid = None;
         }
     }
 
-    /// A stopped helper is still an elevated process. Close its authenticated
-    /// pipe before replacing the backend with a direct child.
-    pub(super) fn release_pipe(&mut self) {
-        if matches!(self.slot, Some(Backend::Pipe(_))) {
-            self.slot = None;
-            self.events = None;
-        }
+    /// Anything the shutdown must release: a live direct child or the
+    /// retained helper.
+    pub(super) fn holds_backend(&self) -> bool {
+        self.direct.is_some() || self.helper.is_some()
     }
 
     /// Drop the backend and every handle it owns; clears all derived flags.
     pub(super) fn force_release(&mut self) {
-        self.slot = None;
-        self.events = None;
+        self.direct = None;
+        self.helper = None;
         self.alive = false;
         self.tun_owned = false;
         self.child_pid = None;
@@ -859,7 +928,7 @@ mod tests {
     #[test]
     fn backend_confirm_exit_maps_tun_alive_to_idle() {
         // Tun-alive proxy: confirm_exit must clear the ownership flags while
-        // retaining the (untestable here) pipe slot for reuse.
+        // retaining the (untestable here) helper attachment for reuse.
         let mut backend = BackendState::for_test(true, true);
         assert!(backend.is_alive());
         assert!(backend.is_tun_owned());
@@ -873,7 +942,7 @@ mod tests {
     #[test]
     fn backend_confirm_exit_maps_direct_to_empty() {
         // Direct-alive proxy: confirm_exit must clear the alive flags and
-        // leave the slot empty (a real `supervisor::Child` has no unit-test
+        // leave no direct child (a real `supervisor::Child` has no unit-test
         // constructor, so the reap itself is exercised by the runtime suite).
         let mut backend = BackendState::for_test(true, false);
         assert!(backend.is_alive());
@@ -881,7 +950,7 @@ mod tests {
         backend.confirm_exit();
         assert!(!backend.is_alive());
         assert!(!backend.is_tun_owned());
-        assert!(backend.as_backend().is_none());
+        assert!(!backend.is_direct());
     }
 
     #[test]

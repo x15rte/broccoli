@@ -4128,6 +4128,22 @@ impl HelperPipe {
         self.events.take().expect("helper events already taken")
     }
 
+    /// Test-only stand-in for a connected helper: no OS pipe and no reader
+    /// thread. Commands go to `sink` (a scratch file the test may read back);
+    /// the caller owns the event channel and passes it beside this pipe to
+    /// `BackendState::attach_tun`, exactly as a real `take_events` result is
+    /// passed. This is what lets the runtime's retention and reuse rules be
+    /// exercised without elevation.
+    #[cfg(test)]
+    pub(super) fn fake(sink: File) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(sink)),
+            events: None,
+            reader_cancel: Arc::new(AtomicBool::new(false)),
+            reader: None,
+        }
+    }
+
     /// Send the authenticated `start` command for `config_bytes` — the exact
     /// config content the GUI validated in the same operation. The elevated
     /// helper stages precisely these bytes;

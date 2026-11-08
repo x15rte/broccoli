@@ -64,8 +64,8 @@ pub mod body;
 pub mod convert;
 
 pub use body::{
-    BodyEntry, BodyParse, BodyRefusal, IgnoredSection, content_key, decode_whole_body,
-    identity_key, origin_for, parse_body, parse_body_cancellable,
+    BodyEntry, BodyParse, BodyRefusal, CompatibilityParameter, IgnoredSection, content_key,
+    decode_whole_body, identity_key, origin_for, parse_body, parse_body_cancellable,
 };
 
 use base64::Engine as _;
@@ -158,7 +158,7 @@ pub struct ParsedLink {
     /// that have no effective Xray field, in link order. The profile already
     /// carries every model default they would have overridden; see
     /// [`IGNORED_PARAMS`].
-    pub ignored: Vec<String>,
+    pub ignored: Vec<CompatibilityParameter>,
 }
 
 impl Deref for ParsedLink {
@@ -182,10 +182,15 @@ fn ignored_value_is_reported(value: &str) -> bool {
     !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no")
 }
 
-/// Record `key` once, in link order.
-fn record_ignored(ignored: &mut Vec<String>, key: &str) {
-    if !ignored.iter().any(|seen| seen == key) {
-        ignored.push(key.to_string());
+/// Record `key` with the value it carried once, in link order. The raw source
+/// line is filled in by [`parse_link`] from the link it read.
+fn record_ignored(ignored: &mut Vec<CompatibilityParameter>, key: &str, value: &str) {
+    if !ignored.iter().any(|seen| seen.name == key) {
+        ignored.push(CompatibilityParameter {
+            name: key.to_string(),
+            value: value.to_string(),
+            raw: String::new(),
+        });
     }
 }
 
@@ -293,10 +298,10 @@ fn is_ignored_param(key: &str) -> bool {
 
 /// Drop `key` when it is a compatibility parameter with a reporting value,
 /// returning whether it was consumed.
-fn drop_ignored_param(ignored: &mut Vec<String>, key: &str, value: &str) -> bool {
+fn drop_ignored_param(ignored: &mut Vec<CompatibilityParameter>, key: &str, value: &str) -> bool {
     if is_ignored_param(key) {
         if ignored_value_is_reported(value) {
-            record_ignored(ignored, key);
+            record_ignored(ignored, key, value);
         }
         true
     } else {
@@ -764,7 +769,7 @@ fn split_alpn(v: Option<&str>) -> Vec<String> {
 fn validate_url_query(
     q: &Query,
     proto: Protocol,
-    ignored: &mut Vec<String>,
+    ignored: &mut Vec<CompatibilityParameter>,
 ) -> Result<(), LinkError> {
     let transport = match q.get("type") {
         Some("") => return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("type"))),
@@ -839,7 +844,7 @@ fn validate_url_query(
             // a value that carries something is reported as dropped.
             "pcs" | "vcn" => {
                 if security != "tls" && !value.is_empty() && ignored_value_is_reported(value) {
-                    record_ignored(ignored, key);
+                    record_ignored(ignored, key, value);
                 }
                 true
             }
@@ -853,7 +858,7 @@ fn validate_url_query(
                     && !value.is_empty()
                     && ignored_value_is_reported(value)
                 {
-                    record_ignored(ignored, key);
+                    record_ignored(ignored, key, value);
                 }
                 true
             }
@@ -1901,7 +1906,7 @@ fn apply_finalmask(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError>
 struct Shareable {
     scheme: &'static str,
     protocol: Protocol,
-    parse: fn(&str, &mut Vec<String>) -> Result<ServerProfile, LinkError>,
+    parse: fn(&str, &mut Vec<CompatibilityParameter>) -> Result<ServerProfile, LinkError>,
 }
 
 /// The share grammar's supported set, one row per shareable protocol: the
@@ -2009,7 +2014,10 @@ const IMPORT_ONLY: &[Shareable] = &[
 
 /// #716 names the VMess URL form when the body carries a userinfo, and the
 /// obsolete whole-body Base64-JSON form otherwise.
-fn parse_vmess_body(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+fn parse_vmess_body(
+    body: &str,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<ServerProfile, LinkError> {
     if body.contains('@') {
         parse_url_style(body, Protocol::Vmess, ignored)
     } else {
@@ -2032,7 +2040,7 @@ fn unsupported_protocol(protocol: Protocol) -> LinkError {
 fn parse_url_style(
     body: &str,
     proto: Protocol,
-    ignored: &mut Vec<String>,
+    ignored: &mut Vec<CompatibilityParameter>,
 ) -> Result<ServerProfile, LinkError> {
     let scheme = proto.as_str();
     let (auth, query, frag) = split_link(body);
@@ -2180,7 +2188,10 @@ fn trojan_link(p: &ServerProfile, s: &TrojanSettings) -> Result<String, LinkErro
 
 // ---------- VMess legacy Base64-JSON import ----------
 
-fn parse_legacy_vmess(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+fn parse_legacy_vmess(
+    body: &str,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<ServerProfile, LinkError> {
     let raw = b64_decode_any(body).ok_or_else(|| malformed(Diag::new(Key::LinkVmessBase64)))?;
     let v: Value = serde_json::from_slice(&raw)
         .map_err(|e| malformed(Diag::new(Key::LinkVmessJson).arg(excerpt(&e.to_string()))))?;
@@ -2296,16 +2307,16 @@ fn parse_legacy_vmess(body: &str, ignored: &mut Vec<String>) -> Result<ServerPro
         }
     } else {
         if !vcn.is_empty() {
-            record_ignored(ignored, "vcn");
+            record_ignored(ignored, "vcn", &vcn);
         }
         if !pcs.is_empty() {
-            record_ignored(ignored, "pcs");
+            record_ignored(ignored, "pcs", &pcs);
         }
     }
     if let Some(insecure) = o.get("insecure").and_then(Value::as_str)
         && ignored_value_is_reported(insecure)
     {
-        record_ignored(ignored, "insecure");
+        record_ignored(ignored, "insecure", insecure);
     }
 
     let net = get("net");
@@ -2512,7 +2523,10 @@ fn vmess_link(profile: &ServerProfile, settings: &VmessSettings) -> Result<Strin
 
 // ---------- ss (SIP002) ----------
 
-fn parse_ss(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+fn parse_ss(
+    body: &str,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<ServerProfile, LinkError> {
     let (rest, frag0) = match body.find('#') {
         Some(i) => (&body[..i], &body[i + 1..]),
         None => (body, ""),
@@ -2624,7 +2638,7 @@ fn ss_link(p: &ServerProfile, s: &ShadowsocksSettings) -> Result<String, LinkErr
 fn validate_scheme_query(
     q: &Query,
     own: &[&str],
-    ignored: &mut Vec<String>,
+    ignored: &mut Vec<CompatibilityParameter>,
 ) -> Result<(), LinkError> {
     for (key, value) in &q.pairs {
         if own.contains(&key.as_str()) {
@@ -2695,7 +2709,10 @@ fn link_credentials(userinfo: &str) -> Result<(String, String), LinkError> {
 /// `socks5://` / `socks://` — the two client userinfo spellings: a base64
 /// `user:pass` with no query, or a plain `user:pass`. Xray's SOCKS outbound
 /// speaks SOCKS5 only, so `socks4`/`socks4a` are refused by their own rows.
-fn parse_socks(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+fn parse_socks(
+    body: &str,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<ServerProfile, LinkError> {
     const SCHEME: &str = "socks";
     let (auth, query, frag) = split_link(body);
     let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
@@ -2752,7 +2769,7 @@ fn http_headers(raw: &str) -> Result<Map<String, Value>, LinkError> {
 fn parse_http(
     body: &str,
     scheme_tls: bool,
-    ignored: &mut Vec<String>,
+    ignored: &mut Vec<CompatibilityParameter>,
 ) -> Result<ServerProfile, LinkError> {
     const SCHEME: &str = "http";
     let (auth, query, frag) = split_link(body);
@@ -2798,9 +2815,9 @@ fn parse_http(
             }
         }
     }
-    if q.get_ne("path").is_some() {
+    if let Some(path) = q.get_ne("path") {
         // Xray's HTTP outbound has no request path.
-        record_ignored(ignored, "path");
+        record_ignored(ignored, "path", path);
     }
     let headers = match q.get_ne("headers") {
         Some(raw) => http_headers(raw)?,
@@ -2840,7 +2857,10 @@ fn fix_address(value: &str) -> String {
 /// `private_key` parameter with `-`-joined `local_address` values, or the
 /// private key in the userinfo with comma-joined `address` / `ip` values.
 /// Exactly one peer is modeled.
-fn parse_wireguard(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+fn parse_wireguard(
+    body: &str,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<ServerProfile, LinkError> {
     const SCHEME: &str = "wireguard";
     let (auth, query, frag) = split_link(body);
     let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
@@ -3190,7 +3210,10 @@ fn hysteria_finalmask(
 /// `hysteria2://` / `hy2://` — Hysteria 2 over Xray's `hysteria` outbound and
 /// transport. Auth is the userinfo and TLS is always on; the link's
 /// obfuscation and hopping fields map onto `finalmask`.
-fn parse_hysteria2(body: &str, ignored: &mut Vec<String>) -> Result<ServerProfile, LinkError> {
+fn parse_hysteria2(
+    body: &str,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<ServerProfile, LinkError> {
     const SCHEME: &str = "hysteria2";
     let (auth, query, frag) = split_link(body);
     let (userinfo, hp) = split_authority(auth, SCHEME, false)?;
@@ -4003,6 +4026,13 @@ pub fn parse_link(s: &str) -> Result<ParsedLink, LinkError> {
             ));
         }
     };
+    // One bounded copy of the source line per dropped parameter: the report
+    // points at the entry without letting repeated parameters multiply an
+    // unbounded link.
+    let raw: String = s.chars().take(crate::links::body::MAX_RAW_CHARS).collect();
+    for parameter in &mut ignored {
+        parameter.raw.clone_from(&raw);
+    }
     validate_profile(&profile)?;
     Ok(ParsedLink { profile, ignored })
 }
@@ -4175,6 +4205,15 @@ mod tests {
         URL_SAFE_NO_PAD.encode([7_u8; 32])
     }
 
+    /// The dropped parameters' names, in link order.
+    fn ignored_names(parsed: &ParsedLink) -> Vec<&str> {
+        parsed
+            .ignored
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect()
+    }
+
     fn reality_mldsa65_verify() -> String {
         URL_SAFE_NO_PAD.encode([9_u8; 1952])
     }
@@ -4221,10 +4260,17 @@ mod tests {
         );
         let parsed = parse_link(&link).expect("the QUIC leftovers must not refuse the node");
         assert_eq!(parsed.outbound.stream.security, Security::Reality);
+        let quic = parsed
+            .ignored
+            .iter()
+            .find(|parameter| parameter.name == "quicSecurity")
+            .expect("the value nobody reads is reported");
+        assert_eq!(quic.value, "none", "the reported value is the one spelled");
+        assert_eq!(quic.key(), "quicSecurity=none");
         assert!(
-            parsed.ignored.contains(&"quicSecurity".to_string()),
-            "the value nobody reads is reported, got {:?}",
-            parsed.ignored
+            quic.raw.contains("quicSecurity=none"),
+            "the raw source line points at the entry, got {:?}",
+            quic.raw
         );
     }
 
@@ -4249,7 +4295,8 @@ mod tests {
 
         let valued = link.replace("pcs=&", "pcs=abcd&");
         let parsed = parse_link(&valued).expect("a valued pin must not refuse the node");
-        assert_eq!(parsed.ignored, vec!["pcs".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["pcs"]);
+        assert_eq!(parsed.ignored[0].value, "abcd");
     }
 
     /// The editor's REALITY fingerprint option list is trimmed; the share
@@ -5461,7 +5508,7 @@ mod tests {
         // default, and reports the drop.
         let parsed = parse_link("trojan://pw@ai.example.com:443?allowInsecure=1&sni=x.com#AI")
             .expect("an insecure request must not refuse the link");
-        assert_eq!(parsed.ignored, vec!["allowInsecure".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["allowInsecure"]);
         let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
         assert_eq!(tls.server_name, "x.com");
         assert!(tls.pinned_peer_cert_sha256.is_empty());
@@ -5722,7 +5769,7 @@ mod tests {
 
         // `uot` has no Xray field; the link still imports and reports it.
         let parsed = parse_link("socks5://h.example.com:1080?uot=1#S").unwrap();
-        assert_eq!(parsed.ignored, vec!["uot".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["uot"]);
     }
 
     #[test]
@@ -5731,7 +5778,7 @@ mod tests {
             "https://bob:hunter2@proxy.example.com?headers=X-A,1,X-B,2&path=%2Ftunnel#H",
         )
         .unwrap();
-        assert_eq!(parsed.ignored, vec!["path".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["path"]);
         assert_eq!(parsed.outbound.stream.security, Security::Tls);
         let ProtocolSettings::Http(settings) = &parsed.outbound.settings else {
             panic!("expected an http profile");
@@ -5770,10 +5817,7 @@ mod tests {
             "wg://198.51.100.9:2408?private_key={secret}&local_address=10.0.0.2%2F32-2001%3Adb8%3A%3A2%2F128&public_key={public}&reserved=15-62-190&persistent_keepalive_interval=25&use_system_interface=true&jc=4#WG"
         );
         let parsed = parse_link(&parameter_form).unwrap();
-        assert_eq!(
-            parsed.ignored,
-            vec!["use_system_interface".to_string(), "jc".to_string()]
-        );
+        assert_eq!(ignored_names(&parsed), ["use_system_interface", "jc"]);
         let ProtocolSettings::Wireguard(settings) = &parsed.outbound.settings else {
             panic!("expected a wireguard profile");
         };
@@ -5856,7 +5900,7 @@ mod tests {
             "hysteria2://letmein@hop.example.com:20000-30000?security=tls&sni=hop.example.com&allowInsecure=true#Node",
         )
         .unwrap();
-        assert_eq!(parsed.ignored, vec!["allowInsecure".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["allowInsecure"]);
         let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
             panic!("expected a hysteria profile");
         };
@@ -6008,10 +6052,7 @@ mod tests {
             "vless://{UUID}@h.example.com:443?encryption=none&security=tls&sni=h.example.com&mux=true&packetEncoding=xudp#M"
         ))
         .unwrap();
-        assert_eq!(
-            parsed.ignored,
-            vec!["mux".to_string(), "packetEncoding".to_string()]
-        );
+        assert_eq!(ignored_names(&parsed), ["mux", "packetEncoding"]);
         assert!(parsed.outbound.mux.is_empty());
 
         // A switch spelling its off value is the default already: silent.
@@ -6026,7 +6067,7 @@ mod tests {
             "vless://{UUID}@h.example.com:443?encryption=none&security=tls&sni=h.example.com&mux#M"
         ))
         .unwrap();
-        assert_eq!(parsed.ignored, vec!["mux".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["mux"]);
 
         // A parameter the grammar does not know still refuses the link.
         expect_unsupported(&format!(
@@ -6043,7 +6084,7 @@ mod tests {
             "sni": "v.example.com", "insecure": "1", "vcn": "v.example.com", "pcs": pin
         }));
         let parsed = parse_link(&link).unwrap();
-        assert_eq!(parsed.ignored, vec!["insecure".to_string()]);
+        assert_eq!(ignored_names(&parsed), ["insecure"]);
         let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
         assert_eq!(tls.verify_peer_cert_by_name, "v.example.com");
         assert_eq!(tls.pinned_peer_cert_sha256, pin);

@@ -189,9 +189,17 @@ fn credentials_render_masked_and_the_reveal_is_transient() {
     // A reveal never outlives the visit: another screen and back masks again.
     // The editor window floats over the main window and can cover the nav
     // rail, so navigation goes through the accessibility action, which
-    // reaches the button wherever the window sits.
-    h.get_by_role_and_label(Role::Button, Screen::Settings.label(Language::En))
-        .click_accesskit();
+    // reaches the button wherever the window sits. The nav rail and the
+    // Servers header switch both say "Settings": the nav entry is the
+    // left-hand one.
+    let nav_settings = h
+        .query_all_by(|node| {
+            node.role() == Role::Button
+                && node.label().as_deref() == Some(Screen::Settings.label(Language::En))
+        })
+        .min_by(|a, b| a.rect().center().x.total_cmp(&b.rect().center().x))
+        .expect("the nav rail must offer Settings");
+    nav_settings.click_accesskit();
     h.run();
     h.get_by_role_and_label(Role::Button, Screen::Servers.label(Language::En))
         .click_accesskit();

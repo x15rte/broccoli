@@ -1,5 +1,7 @@
 //! Routing screen: ordered first-match rules, balancers,
 //! domainStrategy, observatory + burstObservatory, and the TestRoute dialog.
+//! A fixed `Rules | Settings` switch in the header mounts the Geodata
+//! settings on the Settings side.
 
 use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, safety_message, t, t_fmt};
@@ -15,6 +17,7 @@ use crate::model::{
 use crate::rt::{BalancerInfoView, CoreCmd, CorePhase, RuntimeStateView, TrialRuleAddOutcome};
 use crate::sys::geodata::{GeodataCatalog, GeodataError, GeodataSnapshot};
 use crate::ui::gate::{Rung, verdict};
+use crate::ui::geodata::GeodataSection;
 use crate::ui::popup;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::status_colors_of;
@@ -23,6 +26,21 @@ use egui::{DragValue, RichText, Ui};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, VecDeque};
 use tokio::sync::oneshot;
+
+/// Stable id of the in-screen body scroll area. The header switch renders
+/// outside it, so this is the only part of the screen a wheel or a
+/// `scroll_to_me` moves.
+const ROUTING_BODY_SCROLL_ID: &str = "routing-body";
+
+/// The Routing screen's fixed header pair: the routing rules, or the geodata
+/// settings that serve them. Transient — it defaults to `Rules` and is not
+/// draggable, pinnable, or deletable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RoutingTab {
+    #[default]
+    Rules,
+    Settings,
+}
 
 /// Transient string buffers for the leastload sub-form of one balancer
 /// (DurationMs fields are edited as Go duration strings, committed on parse).
@@ -561,6 +579,10 @@ fn split_lines(text: &str) -> Vec<String> {
 
 #[derive(Default)]
 pub struct RoutingScreen {
+    /// The fixed header switch: Rules or Settings (see [`RoutingTab`]).
+    tab: RoutingTab,
+    /// The Geodata settings component mounted on the Settings side.
+    geodata: GeodataSection,
     /// Index of the rule with the inline editor open.
     edit_rule: Option<usize>,
     /// Index of the balancer with the inline editor open.
@@ -647,6 +669,18 @@ impl RoutingScreen {
 }
 
 impl RoutingScreen {
+    /// Entering the screen resets its fixed header switch to the rules, as
+    /// the switch is a transient view of the screen rather than a route.
+    pub(crate) fn enter(&mut self) {
+        self.tab = RoutingTab::Rules;
+    }
+
+    /// Render the screen. The `Rules | Settings` switch is the fixed header:
+    /// it renders once at the top and only the body below it scrolls in its
+    /// own area, so the switch stays in view at any scroll offset. The app
+    /// shell therefore hands Routing its central panel without the outer
+    /// [`egui::ScrollArea`] the other content screens get — this screen owns
+    /// the header/body split.
     pub fn show(&mut self, ui: &mut Ui, ctx: &mut RoutingCtx) {
         let lang = ctx.settings.language;
         self.poll_geodata_load(lang);
@@ -657,6 +691,44 @@ impl RoutingScreen {
         if matches!(self.geodata_load_state, GeodataLoadState::Idle) {
             self.start_geodata_load(lang, ui.ctx().clone());
         }
+
+        self.header(ui, lang);
+        egui::ScrollArea::vertical()
+            .id_salt(ROUTING_BODY_SCROLL_ID)
+            .auto_shrink([false, true])
+            .show(ui, |ui| self.body(ui, ctx, lang));
+    }
+
+    /// The fixed switch sits at the right of the header line, not in a
+    /// full-width band: Rules keeps the routing rules, Settings mounts
+    /// the geodata settings that serve them. It is drawn outside the body
+    /// scroll so it never leaves view.
+    fn header(&mut self, ui: &mut Ui, lang: Language) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.selectable_value(
+                    &mut self.tab,
+                    RoutingTab::Settings,
+                    t(lang, Key::RoutingTabSettings),
+                )
+                .on_hover_text(t(lang, Key::RoutingTabSettingsHint));
+                ui.selectable_value(
+                    &mut self.tab,
+                    RoutingTab::Rules,
+                    t(lang, Key::RoutingTabRules),
+                )
+                .on_hover_text(t(lang, Key::RoutingTabRulesHint));
+            });
+        });
+    }
+
+    /// The scrolling body: whichever side the fixed header switch selects.
+    fn body(&mut self, ui: &mut Ui, ctx: &mut RoutingCtx, lang: Language) {
+        if self.tab == RoutingTab::Settings {
+            self.geodata.show(ui, &mut *ctx.settings, &mut ctx.hooks);
+            return;
+        }
+
         let mut changed = false;
 
         // Derived UI data (tag vectors + rule-row text) is generation-gated:
@@ -7457,5 +7529,288 @@ mod routing_inbound_selector_tests {
                 .is_empty(),
             "clicking a selected row must remove its tag"
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_settings_tab_tests {
+    use super::{RoutingScreen, RoutingTab, Rule};
+    use crate::i18n::{Key, t};
+    use crate::model::settings::Language;
+    use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect};
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
+    use egui_kittest::kittest::Queryable as _;
+
+    /// The header switch opens on Rules, sits right-aligned, is keyboard
+    /// reachable, and mounts the extracted Geodata settings on the Settings
+    /// side without leaving the routing rules behind.
+    #[test]
+    fn routing_header_switch_defaults_to_rules_and_mounts_geodata_settings() {
+        // The Settings side computes provenance from the managed core; a
+        // redirect keeps the fixture off the real installation.
+        let _appdata_guard = APPDATA_ENV_LOCK.blocking_lock();
+        let temporary = tempfile::tempdir().expect("temporary AppData root");
+        let _appdata = AppDataRedirect::to(temporary.path());
+        let mut harness = screen_harness_at(
+            egui::vec2(900.0, 700.0),
+            UiTestRig::default(),
+            RoutingScreen::default(),
+        );
+        harness.run();
+
+        assert_eq!(
+            harness.state().0.tab,
+            RoutingTab::Rules,
+            "the screen must open on Rules"
+        );
+        let lang = Language::En;
+        let rules_label = t(lang, Key::RoutingTabRules);
+        let settings_label = t(lang, Key::RoutingTabSettings);
+        let (rules_rect, settings_rect) = {
+            let rules = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, rules_label)
+                .rect();
+            let settings = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+                .rect();
+            (rules, settings)
+        };
+        let viewport = harness.ctx.input(|input| input.viewport_rect());
+        assert!(
+            settings_rect.right() > viewport.right() - 40.0,
+            "the switch must sit at the header's right edge \
+             (settings right {} vs viewport right {})",
+            settings_rect.right(),
+            viewport.right()
+        );
+        assert!(
+            rules_rect.left() < settings_rect.left(),
+            "the segments must read Rules | Settings"
+        );
+        // Both segments take keyboard focus.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+            .focus();
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+                .is_focused(),
+            "the Settings segment must take keyboard focus"
+        );
+
+        // The Rules side keeps the routing rules and mounts no geodata.
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::RoutingRulesSection))
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsGeodata))
+                .is_none()
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.tab, RoutingTab::Settings);
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsGeodata))
+                .is_some(),
+            "the Settings side must mount the Geodata section"
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsGeodataCronLabel))
+                .is_some(),
+            "the moved cron control must render from Routing"
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::RoutingRulesSection))
+                .is_none(),
+            "the rules must leave while Settings is selected"
+        );
+
+        // Editing a geodata field from the Routing mount keeps the same
+        // commit and dirty pipeline.
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("geoip URL field")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("geoip URL field keeps focus")
+            .type_text("https://example.com/geoip.dat");
+        harness.run_steps(4);
+        assert_eq!(
+            harness.state().1.settings.geodata.geoip_url.as_deref(),
+            Some("https://example.com/geoip.dat"),
+            "the Routing mount must commit a valid geodata URL"
+        );
+        assert!(
+            harness.state().1.requests.dirty,
+            "a geodata edit from Routing must mark the settings dirty"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, rules_label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.tab, RoutingTab::Rules);
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::RoutingRulesSection))
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsGeodata))
+                .is_none()
+        );
+    }
+
+    /// Provenance and Restore run from the Routing mount, with the same
+    /// background worker and feedback line the Settings mount had.
+    #[test]
+    fn routing_settings_tab_runs_provenance_and_restore_feedback() {
+        let _appdata_guard = APPDATA_ENV_LOCK.blocking_lock();
+        let temporary = tempfile::tempdir().expect("temporary AppData root");
+        let _appdata = AppDataRedirect::to(temporary.path());
+        let core = temporary.path().join("broccoli").join("core");
+        std::fs::create_dir_all(&core).expect("create fixture core dir");
+        std::fs::write(core.join("geoip.dat"), b"drifted geoip bytes")
+            .expect("write drifted geoip");
+        std::fs::write(core.join("geosite.dat"), b"drifted geosite bytes")
+            .expect("write drifted geosite");
+
+        let lang = Language::En;
+        let mut harness = screen_harness_at(
+            egui::vec2(900.0, 700.0),
+            UiTestRig::default(),
+            RoutingScreen::default(),
+        );
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::RoutingTabSettings),
+            )
+            .click();
+        harness.run();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if harness.query_by_label_contains("User-managed").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Routing mount must compute provenance off the UI thread"
+            );
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // The fixture has no pristine pair: Restore fails loudly from the
+        // Routing mount exactly as it did from Settings.
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SettingsGeodataRestore),
+            )
+            .click();
+        harness.run();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if harness.query_by_label_contains("Restore failed:").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Routing mount must surface the restore worker's feedback"
+            );
+            harness.run();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The switch is the screen's fixed header: wheeling the rules body to a
+    /// later scroll position moves the content up but leaves the switch at
+    /// the top of the viewport, unmoved and still on screen.
+    #[test]
+    fn routing_header_switch_stays_fixed_while_the_body_scrolls() {
+        // The screen starts its geodata catalog load on the first frame; a
+        // redirect keeps the fixture off the real installation.
+        let _appdata_guard = APPDATA_ENV_LOCK.blocking_lock();
+        let temporary = tempfile::tempdir().expect("temporary AppData root");
+        let _appdata = AppDataRedirect::to(temporary.path());
+        let mut rig = UiTestRig::default();
+        // Enough rules that the body overflows the viewport and scrolls.
+        rig.settings.routing.rules = (0..40)
+            .map(|index| Rule {
+                rule_tag: format!("rule-{index}"),
+                outbound_tag: "direct".into(),
+                domain: vec![format!("domain:rule-{index}.example")],
+                ..Rule::default()
+            })
+            .collect();
+        let mut harness =
+            screen_harness_at(egui::vec2(900.0, 600.0), rig, RoutingScreen::default());
+        harness.run();
+
+        let lang = Language::En;
+        let switch_label = t(lang, Key::RoutingTabSettings);
+        let switch_before = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, switch_label)
+            .rect();
+        let section_label = t(lang, Key::RoutingRulesSection);
+        let section_before = harness.get_by_label(section_label).rect().top();
+
+        // Wheel over the body, well below the header.
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(450.0, 420.0)));
+        for _ in 0..8 {
+            harness.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.run_steps(20);
+
+        let section_after = harness.get_by_label(section_label).rect().top();
+        assert!(
+            section_after < section_before - 100.0,
+            "the wheel must scroll the body: rules section top {section_before} -> \
+             {section_after}"
+        );
+
+        let switch_after = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, switch_label)
+            .rect();
+        assert!(
+            (switch_after.min - switch_before.min).length() < 0.5,
+            "the fixed header switch must not move with the body \
+             ({switch_before:?} -> {switch_after:?})"
+        );
+        let viewport = harness.ctx.input(|input| input.viewport_rect());
+        assert!(
+            viewport.contains_rect(switch_after),
+            "the switch must stay on screen after the body scrolls \
+             ({switch_after:?} within {viewport:?})"
+        );
+        assert_eq!(harness.state().0.tab, RoutingTab::Rules);
     }
 }

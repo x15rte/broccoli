@@ -1,5 +1,7 @@
 //! Servers screen: one full-width, virtualized table of profiles under a
-//! toolbar, with the tabbed full-coverage outbound editor in a pop-up window.
+//! toolbar, with the tabbed full-coverage outbound editor in a pop-up window,
+//! and two read-only raw views — one profile's persisted JSON and one
+//! subscription's decoded body with the parser's entries.
 //! Covers all 12 protocols, all 7 transports, TLS/REALITY, mux, and the
 //! advanced envelope (sendThrough / targetStrategy / finalmask / sockopt).
 
@@ -34,9 +36,9 @@ use crate::model::validation::{
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
-    HttpCamouflageResponse, Int32Range, Network, OutboundModel, ProbeOutcome, ProbeSource,
-    ProbeVerdict, Protocol, ProtocolSettings, RawHeader, Security, ServerProfile, ServersFile,
-    Settings, Sniffing, SockoptModel, StreamModel, WsSettings,
+    HttpCamouflageResponse, Int32Range, Mode, Network, OutboundModel, ProbeOutcome, ProbeSource,
+    ProbeVerdict, Protocol, ProtocolSettings, RawHeader, RefreshPath, Security, ServerProfile,
+    ServersFile, Settings, Sniffing, SockoptModel, Socks5Cfg, StreamModel, WsSettings,
 };
 use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
@@ -45,6 +47,7 @@ use crate::rt::{
 use crate::tls_ping::{ca_pins_from_probe_output, leaf_pin_from_probe_output};
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::inbounds::sniffing_editor;
+use crate::ui::outbound_settings::OutboundSettingsSection;
 use crate::ui::popup;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::{StatusColors, status_colors_of};
@@ -1902,6 +1905,8 @@ enum ListAction {
     SetSelectionEnabled(bool),
     /// Open the editor window on one profile.
     Edit(String),
+    /// Open the read-only JSON view of one committed profile.
+    ViewProfileJson(String),
     /// Append a copy of one profile beside it, in the same group.
     Duplicate(String),
     /// Share every selected row (one link per row on the clipboard).
@@ -2006,6 +2011,16 @@ enum ServerTab {
     Group(String),
 }
 
+/// Which side of the Servers screen the fixed header switch shows. Transient:
+/// entering the screen starts on `Table`, and neither side is draggable,
+/// pinnable, or deletable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ServersSide {
+    #[default]
+    Table,
+    Settings,
+}
+
 /// The label on one tab: a default tab's static translation, or a group
 /// tab's stored title borrowed from the model (falling back to the reserved
 /// `Manual` title when the record is gone). Never allocates.
@@ -2070,6 +2085,10 @@ struct TabRowsCache {
     seeds: std::rc::Rc<[usize]>,
     /// `seeds_before[i]`: how many seed rows precede display index `i`.
     seeds_before: std::rc::Rc<[usize]>,
+    /// Whether display index `i` can move inside its own group block. Only
+    /// the Emitted tab's rows can, and a row whose group block holds no other
+    /// movable row cannot.
+    drag_movable: std::rc::Rc<[bool]>,
 }
 
 /// The tab bar's entries for one model generation. The list moves only when
@@ -2175,8 +2194,133 @@ impl SubscriptionCard {
     }
 }
 
+/// The report window on screen: the report, its title, and the ignored rows
+/// grouped once when the window opened. The counts keep their exact meaning
+/// while the row list is bounded.
+struct ReportView {
+    title: String,
+    report: crate::model::servers::RefreshReport,
+    ignored: Vec<crate::model::servers::IgnoredGroup>,
+}
+
+impl ReportView {
+    fn new(title: String, report: crate::model::servers::RefreshReport) -> Self {
+        let ignored = crate::model::servers::group_ignored_rows(&report.rows);
+        Self {
+            title,
+            report,
+            ignored,
+        }
+    }
+}
+
+/// Where a profile JSON view reads its document. A committed profile is read
+/// from the model on every model generation; an editor draft is read from
+/// the live draft while it is open and frozen when it closes.
+enum ProfileJsonSource {
+    Committed(String),
+    Draft(String),
+}
+
+/// One read-only profile JSON window. The memoized text is rebuilt only when
+/// the source generation, the reveal state or the language moves, so an idle
+/// frame paints the stored galley.
+struct ProfileJsonView {
+    title: String,
+    source: ProfileJsonSource,
+    snapshot: ServerProfile,
+    text: String,
+    revision: widgets::TextRevision,
+    layout: widgets::TextLayoutMemo,
+    /// `(model generation, draft generation, revealed, hide server
+    /// information, language)` of the text currently stored.
+    memo: Option<(u64, u64, bool, bool, Language)>,
+    revealed: bool,
+    copied: bool,
+    /// The add draft has no committed identity, so its title stays
+    /// `Unsaved draft` instead of following the profile's tag.
+    unsaved: bool,
+}
+
+impl ProfileJsonView {
+    fn new(
+        title: String,
+        source: ProfileJsonSource,
+        profile: &ServerProfile,
+        unsaved: bool,
+    ) -> Self {
+        Self {
+            title,
+            source,
+            snapshot: profile.clone(),
+            text: String::new(),
+            revision: widgets::TextRevision::default(),
+            layout: widgets::TextLayoutMemo::default(),
+            memo: None,
+            revealed: false,
+            copied: false,
+            unsaved,
+        }
+    }
+
+    /// Rebuild the stored text when an input moved. `profile` is the live
+    /// source; `key` is the generation tuple the text depends on.
+    fn refresh(&mut self, profile: &ServerProfile, key: (u64, u64, bool, bool, Language)) {
+        if self.memo == Some(key) {
+            return;
+        }
+        self.snapshot = profile.clone();
+        if !self.unsaved {
+            self.title = self.snapshot.tag();
+        }
+        self.text = profile_json_text(&self.snapshot, self.revealed, key.3, key.4);
+        self.revision.bump();
+        self.memo = Some(key);
+    }
+}
+
+/// One subscription raw view: the group it shows, the parser's output from
+/// the last refresh, or the off-thread parse of the persisted snapshot.
+struct SubscriptionView {
+    group: String,
+    parse: Option<std::rc::Rc<links::BodyParse>>,
+    /// The snapshot revision `parse` came from. The revision, not the display
+    /// second, identifies a capture: two refreshes inside one second stay
+    /// distinct.
+    parse_revision: Option<u64>,
+    /// The snapshot revision a parse request was started for, so one open
+    /// window asks the worker once per snapshot.
+    requested_revision: Option<u64>,
+    parse_error: Option<String>,
+    /// The user's horizontal split ratio (body pane / whole split), kept for
+    /// as long as this window is open.
+    split_ratio: f32,
+    body_copied: bool,
+    parsed_copied: bool,
+    /// Memoized layout and revision of the decoded-body pane.
+    body_layout: widgets::TextLayoutMemo,
+    body_revision: widgets::TextRevision,
+    /// `(snapshot revision, body length)` the body pane's layout was built
+    /// from.
+    body_key: Option<(u64, usize)>,
+}
+
+/// One delivered subscription parse: the group, the snapshot revision it came
+/// from, and the parser's whole result.
+struct SubscriptionParseResult {
+    group: String,
+    revision: u64,
+    parsed: links::BodyParse,
+}
+
 #[derive(Default)]
 pub struct ServersScreen {
+    /// The fixed header switch: the server table or the settings that serve
+    /// it. Opening the screen starts on `Table`.
+    side: ServersSide,
+    /// The shared latency-test and subscription settings surface, mounted on
+    /// the Settings side. It owns its own drafts and reveal state.
+    outbound_settings: OutboundSettingsSection,
     selected: Option<String>,
     /// The rows selected in the current tab, by profile id. Scoped to the tab
     /// and to what the search shows: a row that leaves the visible set leaves
@@ -2207,6 +2351,10 @@ pub struct ServersScreen {
     /// the model generation, the language or the traffic unit moves (see
     /// [`SubscriptionCard`]).
     subscription_card: Option<SubscriptionCard>,
+    /// Whether the selected group tab's label cannot fit the tab strip on one
+    /// line. The card repeats the title only then; a readable tab already
+    /// names the group.
+    subscription_tab_truncated: bool,
     /// The model generation the selection was last pruned against: a stale
     /// selection id can only come from a model change.
     selection_generation: Option<u64>,
@@ -2280,9 +2428,24 @@ pub struct ServersScreen {
     import_parsed_source: Option<String>,
     import_refusals: Vec<(String, String)>,
     import_ignored: usize,
-    import_ignored_names: Vec<String>,
-    /// The report window on screen: its title and one refresh report.
-    report_view: Option<(String, crate::model::servers::RefreshReport)>,
+    /// The structured ignored rows of the last import parse: their
+    /// `parameter=value` key and bounded raw source travel into the report.
+    import_ignored_rows: Vec<crate::model::servers::ReportRow>,
+    /// The report window on screen: its title, one refresh report, and the
+    /// ignored rows grouped when it opened.
+    report_view: Option<ReportView>,
+    /// The open profile JSON windows, one per profile id.
+    profile_views: std::collections::BTreeMap<String, ProfileJsonView>,
+    /// The open subscription raw view, if any.
+    subscription_view: Option<SubscriptionView>,
+    /// The last successful refresh's parse, kept for the session so the raw
+    /// viewer opens without re-parsing. Keyed by the group and the snapshot
+    /// revision the parse came from.
+    last_subscription_parse: Option<(String, u64, std::rc::Rc<links::BodyParse>)>,
+    /// The in-flight off-thread parse of a persisted subscription snapshot.
+    subscription_parse: Request<SubscriptionParseResult>,
+    /// The group whose snapshot the in-flight parse belongs to.
+    subscription_parse_group: Option<String>,
     /// Formatted preview of `import_parsed` (see [`ImportPreview`]), built on
     /// the first frame that shows it and reused until the parse result or the
     /// language moves.
@@ -2354,8 +2517,9 @@ struct ImportParseResult {
     /// Refused items with their raw text, for the report.
     refused: Vec<(String, String)>,
     ignored: usize,
-    /// The ignored sections/parameters, named for the report rows.
-    ignored_names: Vec<String>,
+    /// The ignored sections/parameters, each already shaped as a report row
+    /// with its grouping key and bounded raw source.
+    ignored_rows: Vec<crate::model::servers::ReportRow>,
 }
 
 /// The New group dialog's fields: a kind choice, then the fields that kind
@@ -2370,6 +2534,21 @@ struct GroupDraft {
     url: String,
     custom_user_agent: bool,
     user_agent: String,
+    /// Whether the group replaces the global refresh outbound path and its
+    /// SOCKS5 fields with its own block, the same way a custom User-Agent
+    /// replaces the global one.
+    outbound_custom: bool,
+    /// The custom refresh path, meaningful only while `outbound_custom` is
+    /// set. TUN-off shows Native as the effective value without rewriting it.
+    outbound_path: RefreshPath,
+    /// The custom SOCKS5 carrier's fields. The credentials are editable text
+    /// drafts local to the dialog: a blank one is the absent value.
+    socks5_host: String,
+    socks5_port: u16,
+    socks5_username: String,
+    socks5_password: String,
+    /// The dialog's own password reveal, masked again every time it opens.
+    reveal_password: bool,
 }
 
 impl GroupDraft {
@@ -2389,7 +2568,47 @@ impl GroupDraft {
             user_agent: subscription
                 .map(|subscription| subscription.user_agent.clone())
                 .unwrap_or_default(),
+            outbound_custom: subscription.is_some_and(|subscription| subscription.outbound_custom),
+            outbound_path: subscription
+                .map(|subscription| subscription.outbound_path)
+                .unwrap_or_default(),
+            socks5_host: subscription
+                .map(|subscription| subscription.socks5.host.clone())
+                .unwrap_or_default(),
+            socks5_port: subscription
+                .map(|subscription| subscription.socks5.port)
+                .unwrap_or_default(),
+            socks5_username: subscription
+                .and_then(|subscription| subscription.socks5.username.clone())
+                .unwrap_or_default(),
+            socks5_password: subscription
+                .and_then(|subscription| subscription.socks5.password.clone())
+                .unwrap_or_default(),
+            reveal_password: false,
         }
+    }
+}
+
+/// The SOCKS5 block a dialog draft writes. A blank optional credential is the
+/// absent value, the shape the model stores; address and port are written
+/// verbatim and the refresh resolves them loudly at fetch time.
+fn draft_socks5(host: &str, port: u16, username: &str, password: &str) -> Socks5Cfg {
+    let optional = |text: &str| (!text.trim().is_empty()).then(|| text.to_owned());
+    Socks5Cfg {
+        host: host.to_owned(),
+        port,
+        username: optional(username),
+        password: optional(password),
+    }
+}
+
+/// The display name of a refresh path, for the override's effective-path
+/// line.
+fn refresh_path_label(path: RefreshPath, lang: Language) -> &'static str {
+    match path {
+        RefreshPath::BindNic => t(lang, Key::SettingsPathBindNic),
+        RefreshPath::Native => t(lang, Key::SettingsPathNative),
+        RefreshPath::Socks5 => t(lang, Key::SettingsPathSocks5),
     }
 }
 
@@ -2430,12 +2649,19 @@ fn group_picker(
 }
 
 /// One fetch worker's terminal result.
+#[derive(Debug)]
 struct SubscriptionFetchResult {
     group_id: String,
     outcome: Result<crate::sys::subscription::FetchOutcome, crate::sys::subscription::FetchError>,
 }
 
 impl ServersScreen {
+    /// Entering the screen resets its fixed header switch to the table, as
+    /// the switch is a transient view of the screen rather than a route.
+    pub(crate) fn enter(&mut self) {
+        self.side = ServersSide::Table;
+    }
+
     fn invalidate_import_preview(&mut self) {
         self.import_parsed.clear();
         self.import_parsed_source = None;
@@ -2463,17 +2689,23 @@ impl ServersScreen {
                 Ok(parsed) => {
                     ok += 1;
                     let protocol = parsed.outbound.protocol.as_str();
-                    if parsed.ignored.is_empty() {
+                    let joined: Vec<String> = parsed
+                        .ignored
+                        .iter()
+                        .map(links::CompatibilityParameter::key)
+                        .collect();
+                    if joined.is_empty() {
                         ImportPreviewRow {
                             text: t_fmt(lang, Key::SrvImportOkMark, &[&parsed.name, &protocol]),
                             kind: ImportPreviewKind::Ok,
                         }
                     } else {
+                        let joined = joined.join(", ");
                         ImportPreviewRow {
                             text: t_fmt(
                                 lang,
                                 Key::SrvImportIgnoredMark,
-                                &[&parsed.name, &protocol, &parsed.ignored.join(", ")],
+                                &[&parsed.name, &protocol, &joined],
                             ),
                             kind: ImportPreviewKind::Warn,
                         }
@@ -2523,11 +2755,10 @@ impl ServersScreen {
                 .map(|refusal| (refusal.raw.clone(), refusal.error.clone()))
                 .collect();
             let ignored = body.ignored.len();
-            let ignored_names: Vec<String> = body
-                .ignored
-                .iter()
-                .map(|section| section.name.clone())
-                .collect();
+            let mut ignored_rows = Vec::new();
+            for section in &body.ignored {
+                crate::model::servers::push_report_row(&mut ignored_rows, section.report_row());
+            }
             let mut parsed: Vec<Result<links::ParsedLink, String>> =
                 std::mem::take(&mut body.entries)
                     .into_iter()
@@ -2544,7 +2775,7 @@ impl ServersScreen {
                 parsed,
                 refused,
                 ignored,
-                ignored_names,
+                ignored_rows,
             })
         }) {
             Ok(job) => self.import_parse_job = job,
@@ -2577,7 +2808,7 @@ impl ServersScreen {
         self.import_parsed = result.parsed;
         self.import_refusals = result.refused;
         self.import_ignored = result.ignored;
-        self.import_ignored_names = result.ignored_names;
+        self.import_ignored_rows = result.ignored_rows;
         self.import_parsed_source = Some(result.source);
         // The formatted preview belongs to the previous result.
         self.import_preview = None;
@@ -2592,7 +2823,9 @@ impl ServersScreen {
 
     /// Start one subscription refresh. The group's stored User-Agent wins
     /// when set; otherwise the global one is sent (an empty global value
-    /// omits the header).
+    /// omits the header). The group's effective outbound path (its override,
+    /// or the global setting when it has none) resolves through the same
+    /// carrier the latency probe uses.
     fn start_subscription_fetch(
         &mut self,
         lang: Language,
@@ -2600,6 +2833,12 @@ impl ServersScreen {
         uictx: &mut ServersCtx<'_>,
         group_id: String,
     ) {
+        // One fetch at a time: the card disables Refresh while a fetch is in
+        // flight, and this guard keeps a second caller from replacing the
+        // worker that owns the report the user may still Cancel into.
+        if self.subscription_fetch.is_pending() {
+            return;
+        }
         let Some(group) = uictx
             .servers
             .groups
@@ -2613,10 +2852,26 @@ impl ServersScreen {
         };
         let url = subscription.url.clone();
         let user_agent = subscription.effective_user_agent(&uictx.settings.subscription_user_agent);
-        let bind = match subscription_bind_address(lang, uictx.settings, uictx.core_running) {
-            Ok(bind) => bind,
+        // The override replaces the path and the SOCKS5 block as one unit; the
+        // global values are the fallback when the group has none. The
+        // effective path then reads the live tunnel ownership: Bind NIC
+        // carries the adapter only while the tunnel actually owns the
+        // capture, and a path that cannot produce its carrier fails loudly
+        // instead of falling back to the OS stack.
+        let path = subscription.effective_refresh_path(uictx.settings.subscription_path);
+        let socks5 = subscription.effective_socks5(&uictx.settings.subscription_socks5);
+        let tun_active = uictx.settings.mode == Mode::Tun && uictx.core_running;
+        let interfaces = crate::sys::netif::list_all();
+        let transport = match crate::sys::outbound_path::refresh_transport(
+            path,
+            socks5,
+            &uictx.settings.tun,
+            tun_active,
+            &interfaces,
+        ) {
+            Ok(transport) => transport,
             Err(error) => {
-                self.set_status(StatusLine::err(error));
+                self.set_status(StatusLine::err(refresh_path_error(lang, error)));
                 return;
             }
         };
@@ -2625,16 +2880,27 @@ impl ServersScreen {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
-            let outcome = crate::sys::subscription::fetch(&url, &user_agent, bind);
+            let outcome = crate::sys::subscription::fetch(&url, &user_agent, transport);
             Some(SubscriptionFetchResult { group_id, outcome })
         }) {
             Ok(job) => self.subscription_fetch = job,
-            Err(error) => self.set_status(StatusLine::err(t_fmt(
-                lang,
-                Key::SrvSubscriptionFetchFailed,
-                &[&error.to_string()],
-            ))),
+            Err(error) => {
+                self.subscription_fetch_group = None;
+                self.set_status(StatusLine::err(t_fmt(
+                    lang,
+                    Key::SrvSubscriptionFetchFailed,
+                    &[&error.to_string()],
+                )));
+            }
         }
+    }
+
+    /// Stop the in-flight refresh without applying a terminal: the receiver
+    /// is dropped, the worker's stop flag flips, and the previous report
+    /// stays exactly where it was.
+    fn cancel_subscription_fetch(&mut self) {
+        self.subscription_fetch.cancel();
+        self.subscription_fetch_group = None;
     }
 
     /// Drain one finished fetch: reconcile the group, store the metadata and
@@ -2681,6 +2947,7 @@ impl ServersScreen {
                     crate::model::servers::ReportRow {
                         kind: crate::model::servers::ReportKind::Refused,
                         name: error.to_string(),
+                        key: String::new(),
                         raw: error.to_string(),
                     },
                 );
@@ -2688,7 +2955,7 @@ impl ServersScreen {
                 if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
                     subscription.report = Some(report.clone());
                 }
-                self.report_view = Some((title, report));
+                self.report_view = Some(ReportView::new(title, report));
                 self.set_status(StatusLine::err(message));
                 uictx.hooks.mark_dirty();
             }
@@ -2702,39 +2969,28 @@ impl ServersScreen {
                         ..Default::default()
                     };
                     let mut rows = Vec::new();
-                    for refusal in &parsed.refused {
-                        crate::model::servers::push_report_row(
-                            &mut rows,
-                            crate::model::servers::ReportRow {
-                                kind: crate::model::servers::ReportKind::Refused,
-                                name: refusal.error.clone(),
-                                raw: refusal.raw.clone(),
-                            },
-                        );
-                    }
-                    for ignored in &parsed.ignored {
-                        crate::model::servers::push_report_row(
-                            &mut rows,
-                            crate::model::servers::ReportRow {
-                                kind: crate::model::servers::ReportKind::Ignored,
-                                name: ignored.name.clone(),
-                                raw: String::new(),
-                            },
-                        );
-                    }
+                    parsed.push_diagnostic_rows(&mut rows);
                     if parsed.refused.is_empty() {
                         crate::model::servers::push_report_row(
                             &mut rows,
                             crate::model::servers::ReportRow {
                                 kind: crate::model::servers::ReportKind::Refused,
                                 name: t(lang, Key::SrvSubscriptionEmpty).to_owned(),
+                                key: String::new(),
                                 raw: String::new(),
                             },
                         );
                     }
                     report.rows = rows;
                     let title = uictx.servers.groups[index].title.clone();
+                    let mut revision = None;
                     if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
+                        subscription
+                            .store_snapshot(&links::body::decode_whole_body(&outcome.body), at);
+                        revision = subscription
+                            .snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.revision);
                         subscription.last_fetch = Some(crate::model::servers::FetchResult {
                             at,
                             ok: false,
@@ -2743,7 +2999,11 @@ impl ServersScreen {
                         });
                         subscription.report = Some(report.clone());
                     }
-                    self.report_view = Some((title, report));
+                    self.report_view = Some(ReportView::new(title, report));
+                    if let Some(revision) = revision {
+                        self.last_subscription_parse =
+                            Some((result.group_id.clone(), revision, std::rc::Rc::new(parsed)));
+                    }
                     self.set_status(StatusLine::err(t(lang, Key::SrvSubscriptionEmpty)));
                     uictx.hooks.mark_dirty();
                     return;
@@ -2764,26 +3024,7 @@ impl ServersScreen {
                 );
                 report.refused = parsed.refused.len();
                 report.ignored = parsed.ignored.len();
-                for refusal in &parsed.refused {
-                    crate::model::servers::push_report_row(
-                        &mut report.rows,
-                        crate::model::servers::ReportRow {
-                            kind: crate::model::servers::ReportKind::Refused,
-                            name: refusal.error.clone(),
-                            raw: refusal.raw.clone(),
-                        },
-                    );
-                }
-                for ignored in &parsed.ignored {
-                    crate::model::servers::push_report_row(
-                        &mut report.rows,
-                        crate::model::servers::ReportRow {
-                            kind: crate::model::servers::ReportKind::Ignored,
-                            name: ignored.name.clone(),
-                            raw: String::new(),
-                        },
-                    );
-                }
+                parsed.push_diagnostic_rows(&mut report.rows);
                 let pick = |header: &str, key: &str| -> String {
                     if header.trim().is_empty() {
                         parsed.comments.get(key).cloned().unwrap_or_default()
@@ -2832,6 +3073,7 @@ impl ServersScreen {
                 }
                 let report_view = report.clone();
                 let report_title = uictx.servers.groups[index].title.clone();
+                let mut revision = None;
                 if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
                     subscription.last_fetch = Some(crate::model::servers::FetchResult {
                         at,
@@ -2841,10 +3083,147 @@ impl ServersScreen {
                     });
                     subscription.metadata = metadata;
                     subscription.report = Some(report);
+                    subscription.store_snapshot(&links::body::decode_whole_body(&outcome.body), at);
+                    revision = subscription
+                        .snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.revision);
                 }
-                self.report_view = Some((report_title, report_view));
+                if let Some(revision) = revision {
+                    self.last_subscription_parse =
+                        Some((result.group_id.clone(), revision, std::rc::Rc::new(parsed)));
+                }
+                self.report_view = Some(ReportView::new(report_title, report_view));
                 uictx.hooks.mark_dirty();
             }
+        }
+    }
+
+    /// Open the group's raw subscription view, or focus the open one. A
+    /// session refresh's parse is reused; otherwise the persisted snapshot is
+    /// parsed on a worker, never on the frame that opens the window.
+    fn open_subscription_view(
+        &mut self,
+        group_id: &str,
+        uictx: &ServersCtx<'_>,
+        repaint: egui::Context,
+        lang: Language,
+    ) {
+        let Some((revision, body)) = uictx.servers.groups.iter().find_map(|group| {
+            if group.id != group_id {
+                return None;
+            }
+            group.subscription.as_ref().and_then(|subscription| {
+                subscription
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| (snapshot.revision, snapshot.body.clone()))
+            })
+        }) else {
+            // No snapshot: the window still opens, on its empty state.
+            self.subscription_view = Some(SubscriptionView {
+                group: group_id.to_owned(),
+                parse: None,
+                parse_revision: None,
+                requested_revision: None,
+                parse_error: None,
+                split_ratio: 0.5,
+                body_copied: false,
+                parsed_copied: false,
+                body_layout: widgets::TextLayoutMemo::default(),
+                body_revision: widgets::TextRevision::default(),
+                body_key: None,
+            });
+            return;
+        };
+        let cached = self
+            .last_subscription_parse
+            .as_ref()
+            .filter(|(group, cached_revision, _)| group == group_id && *cached_revision == revision)
+            .map(|(_, _, parsed)| std::rc::Rc::clone(parsed));
+        self.subscription_view = Some(SubscriptionView {
+            group: group_id.to_owned(),
+            parse: cached.clone(),
+            parse_revision: cached.is_some().then_some(revision),
+            requested_revision: None,
+            parse_error: None,
+            split_ratio: 0.5,
+            body_copied: false,
+            parsed_copied: false,
+            body_layout: widgets::TextLayoutMemo::default(),
+            body_revision: widgets::TextRevision::default(),
+            body_key: None,
+        });
+        if cached.is_none() {
+            self.start_subscription_view_parse(group_id, body, revision, repaint, lang);
+        }
+    }
+
+    /// Parse one persisted snapshot off the UI thread. The delivery is cached
+    /// for the session and adopted by the open view.
+    fn start_subscription_view_parse(
+        &mut self,
+        group_id: &str,
+        body: String,
+        revision: u64,
+        repaint: egui::Context,
+        lang: Language,
+    ) {
+        self.subscription_parse_group = Some(group_id.to_owned());
+        if let Some(view) = self.subscription_view.as_mut() {
+            view.requested_revision = Some(revision);
+            view.parse_error = None;
+        }
+        let group = group_id.to_owned();
+        match Request::worker("broccoli-subscription-parse", &repaint, move |_stop| {
+            let parsed = links::parse_body(&body);
+            Some(SubscriptionParseResult {
+                group,
+                revision,
+                parsed,
+            })
+        }) {
+            Ok(job) => self.subscription_parse = job,
+            Err(error) => {
+                self.subscription_parse_group = None;
+                if let Some(view) = self.subscription_view.as_mut() {
+                    view.requested_revision = None;
+                    view.parse_error = Some(t_fmt(lang, Key::SrvParseWorkerFailed, &[&error]));
+                }
+            }
+        }
+    }
+
+    /// Drain one background snapshot parse. The result is cached for the
+    /// session even when the window closed while it ran.
+    fn poll_subscription_view_parse(&mut self, lang: Language) {
+        let Some(terminal) = self.subscription_parse.poll() else {
+            return;
+        };
+        self.subscription_parse_group = None;
+        let result = match terminal {
+            Terminal::Answered(result) => result,
+            Terminal::Exited => {
+                if let Some(view) = self.subscription_view.as_mut() {
+                    view.requested_revision = None;
+                    view.parse_error = Some(t(lang, Key::WorkerExitedWithoutResult).to_owned());
+                }
+                return;
+            }
+        };
+        let parsed = std::rc::Rc::new(result.parsed);
+        self.last_subscription_parse = Some((
+            result.group.clone(),
+            result.revision,
+            std::rc::Rc::clone(&parsed),
+        ));
+        if let Some(view) = self.subscription_view.as_mut()
+            && view.group == result.group
+        {
+            view.parse = Some(parsed);
+            view.parse_revision = Some(result.revision);
+            view.requested_revision = None;
+            view.parse_error = None;
         }
     }
 
@@ -3093,8 +3472,8 @@ impl ServersScreen {
                 }
                 let refusals = std::mem::take(&mut self.import_refusals);
                 let ignored = std::mem::take(&mut self.import_ignored);
-                let ignored_names = std::mem::take(&mut self.import_ignored_names);
-                if !added_names.is_empty() || !refusals.is_empty() || !ignored_names.is_empty() {
+                let ignored_rows = std::mem::take(&mut self.import_ignored_rows);
+                if !added_names.is_empty() || !refusals.is_empty() || !ignored_rows.is_empty() {
                     let mut report = crate::model::servers::RefreshReport {
                         at: unix_now(),
                         added: added_names.len(),
@@ -3108,6 +3487,7 @@ impl ServersScreen {
                             crate::model::servers::ReportRow {
                                 kind: crate::model::servers::ReportKind::Added,
                                 name,
+                                key: String::new(),
                                 raw: String::new(),
                             },
                         );
@@ -3118,21 +3498,18 @@ impl ServersScreen {
                             crate::model::servers::ReportRow {
                                 kind: crate::model::servers::ReportKind::Refused,
                                 name: error,
+                                key: String::new(),
                                 raw,
                             },
                         );
                     }
-                    for name in ignored_names {
-                        crate::model::servers::push_report_row(
-                            &mut report.rows,
-                            crate::model::servers::ReportRow {
-                                kind: crate::model::servers::ReportKind::Ignored,
-                                name,
-                                raw: String::new(),
-                            },
-                        );
+                    for row in ignored_rows {
+                        crate::model::servers::push_report_row(&mut report.rows, row);
                     }
-                    self.report_view = Some((t(lang, Key::SrvReportTitle).to_string(), report));
+                    self.report_view = Some(ReportView::new(
+                        t(lang, Key::SrvReportTitle).to_string(),
+                        report,
+                    ));
                 }
                 self.invalidate_import_preview();
                 self.profile_validation_report = report;
@@ -3536,6 +3913,7 @@ impl ServersScreen {
         self.poll_profile_validation(lang, ctx);
         self.poll_import_parse(lang);
         self.poll_subscription_fetch(lang, ctx);
+        self.poll_subscription_view_parse(lang);
         self.poll_xray_tool(lang);
         self.consume_latency_probe_result(ctx);
         // Keep the focus, the multi-selection and the open editor pointing at
@@ -3596,8 +3974,72 @@ impl ServersScreen {
             self.select_tab(ServerTab::Emitted);
         }
 
-        egui::CentralPanel::default().show(ui, |ui| self.show_table(ui, ctx));
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.show_header(ui, ctx);
+            match self.side {
+                ServersSide::Table => self.show_table(ui, ctx),
+                ServersSide::Settings => {
+                    // The Settings screen's shell owns the scroll; the
+                    // Servers screen's table does, so the mounted section
+                    // scrolls here.
+                    let tun_active = ctx.settings.mode == Mode::Tun && ctx.core_running;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            self.outbound_settings.show(
+                                ui,
+                                &mut *ctx.settings,
+                                &mut ctx.hooks,
+                                tun_active,
+                            );
+                        });
+                }
+            }
+        });
         self.show_dialogs(ui.ctx(), ctx);
+    }
+
+    /// The screen's header line: its title, the fixed `Table | Settings`
+    /// switch at the right, and the list's reveal control when Hide server
+    /// information masks the endpoints. The switch lives in this row rather
+    /// than a band of its own, so the table keeps its vertical room.
+    fn show_header(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
+        let lang = ctx.settings.language;
+        ui.add_space(4.0);
+        let mut reveal_changed = false;
+        ui.horizontal(|ui| {
+            ui.heading(t(lang, Key::ScreenServers));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right to left: Settings is the rightmost segment, so the
+                // pair reads `Table | Settings` like the Routing switch.
+                ui.selectable_value(
+                    &mut self.side,
+                    ServersSide::Settings,
+                    t(lang, Key::SrvHeaderSettings),
+                )
+                .on_hover_text(t(lang, Key::SrvHeaderSettingsHint));
+                ui.selectable_value(
+                    &mut self.side,
+                    ServersSide::Table,
+                    t(lang, Key::SrvHeaderTable),
+                )
+                .on_hover_text(t(lang, Key::SrvHeaderTableHint));
+                // The reveal sits in front of the list, beside its title:
+                // while Hide server information masks the endpoints, the list
+                // offers the same control the editor does, so reading an
+                // address does not require opening a profile.
+                if ctx.settings.hide_server_info {
+                    let before = self.revealed_list;
+                    widgets::reveal_toggle(ui, lang, &mut self.revealed_list);
+                    reveal_changed = before != self.revealed_list;
+                }
+            });
+        });
+        if reveal_changed {
+            // The row details memo runs on the model generation; the reveal
+            // is not part of the model, so drop the memo to repaint them.
+            self.row_details = None;
+        }
     }
 
     // ---------- tab bar ----------
@@ -3667,9 +4109,11 @@ impl ServersScreen {
         let mut pin: Option<(String, bool)> = None;
         let mut rename: Option<String> = None;
         let mut delete: Option<String> = None;
+        let mut raw: Option<String> = None;
         // One rect per tab, by tab index: the drop half looks the target up
         // in the cached list instead of cloning tabs into a second vector.
         let mut tab_rects: Vec<egui::Rect> = Vec::with_capacity(tabs.len());
+        let tab_strip_width = ui.available_width();
         ui.horizontal_wrapped(|ui| {
             for tab in tabs.iter() {
                 let selected = self.view == *tab;
@@ -3681,6 +4125,28 @@ impl ServersScreen {
                 };
                 let response = ui.add(egui::Button::new(text).frame(false));
                 tab_rects.push(response.rect);
+                if selected {
+                    // A label whose natural width exceeds the strip cannot
+                    // be read on the tab's own line; the subscription card
+                    // repeats it as its title fallback. A default tab owns no
+                    // card, so only a group tab can set this.
+                    self.subscription_tab_truncated = match tab {
+                        ServerTab::Group(_) => {
+                            let font = egui::TextStyle::Button.resolve(ui.style());
+                            let natural = ui
+                                .painter()
+                                .layout_no_wrap(
+                                    tab_label(tab, ctx.servers, lang).to_owned(),
+                                    font,
+                                    egui::Color32::WHITE,
+                                )
+                                .size()
+                                .x;
+                            natural > tab_strip_width + 0.5
+                        }
+                        _ => false,
+                    };
+                }
                 if selected {
                     // A tab reads as a tab through its rule, not a filled
                     // pill: the strip under the labels is the selection.
@@ -3705,13 +4171,19 @@ impl ServersScreen {
                 {
                     egui::DragAndDrop::set_payload(ui.ctx(), DragTab(tab.clone()));
                 }
-                let pinned = ctx
+                let (pinned, has_subscription) = ctx
                     .servers
                     .groups
                     .iter()
                     .find(|group| &group.id == id)
-                    .is_some_and(|group| group.pinned);
+                    .map_or((false, false), |group| {
+                        (group.pinned, group.subscription.is_some())
+                    });
                 response.context_menu(|ui| {
+                    if has_subscription && ui.button(t(lang, Key::SrvRawSubscription)).clicked() {
+                        raw = Some(id.clone());
+                        ui.close();
+                    }
                     let (key, value) = if pinned {
                         (Key::SrvUnpinTab, false)
                     } else {
@@ -3748,6 +4220,9 @@ impl ServersScreen {
         }
         if let Some(id) = delete {
             self.group_delete_pending = Some(id);
+        }
+        if let Some(id) = raw {
+            self.open_subscription_view(&id, ctx, ui.ctx().clone(), lang);
         }
         if let Some(tab) = select {
             self.select_tab(tab);
@@ -3798,10 +4273,12 @@ impl ServersScreen {
         }
     }
 
-    /// The subscription card between the tab bar and the table: the feed's
-    /// title, quota, expiry and update hint with its refresh, report and
-    /// delete actions. Only a subscription group's tab owns a feed, so the
-    /// three views and a manual group render nothing here.
+    /// The subscription card between the tab bar and the table: one row with
+    /// the feed's quota and expiry on the left and Refresh plus the overflow
+    /// menu on the right. The overflow menu carries Raw, Edit, Report and the
+    /// separated Delete group; the provider update hint is a hover. Only a
+    /// subscription group's tab owns a feed, so the three views and a manual
+    /// group render nothing here.
     ///
     /// The quota and expiry lines allocate to format, and the card paints
     /// every frame its tab is open, so they are memoized for one group, model
@@ -3844,62 +4321,140 @@ impl ServersScreen {
             .expect("the card was formatted above");
         let title = group.title.as_str();
         let has_report = subscription.report.is_some();
+        // The refresh freezes the feed it will rewrite. Raw stays available
+        // because it reads the last snapshot and changes nothing.
+        let locked = self.subscription_fetch.is_pending();
         let mut refresh = false;
         let mut show_report = false;
+        let mut show_raw = false;
         let mut delete = false;
         let mut edit = false;
-        // The group's identity is a ledger line, not a form: the title is
-        // plain text, the feed's quota and expiry read as secondary text, and
-        // the commands sit at the right end. The old boxed frame repeated a
-        // border the tab rule and the table already draw, and a clickable
-        // title read as an input.
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(title).strong());
-            if let Some(quota) = &card.quota {
-                ui.add_space(8.0);
-                ui.weak(quota.as_str());
-            }
-            match &card.expiry {
-                Some((text, true)) => {
-                    ui.add_space(8.0);
-                    ui.colored_label(status_colors_of(ui).err, text.as_str());
-                }
-                Some((text, false)) => {
-                    ui.add_space(8.0);
-                    ui.weak(text.as_str());
-                }
-                None => {}
-            }
-            if let Some(update) = &card.update {
-                ui.add_space(8.0);
-                ui.weak(update.as_str());
-            }
+        // One compact row: quota and expiry on the left, Refresh and the
+        // overflow menu on the right. The action group's width is reserved
+        // before the information lays out, so the text truncates instead of
+        // being painted underneath the buttons. The tab already names the
+        // group, so the title appears only when that tab label cannot fit the
+        // tab strip.
+        let actions_width = SUBSCRIPTION_CARD_ACTIONS_WIDTH;
+        let row_height = ui.spacing().interact_size.y;
+        let update_hint = card.update.as_deref();
+        let title_fallback = self.subscription_tab_truncated;
+        ui.horizontal(|ui| {
+            let left_width = (ui.available_width() - actions_width).max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(left_width, row_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let mut has_info = false;
+                    if let Some(quota) = &card.quota {
+                        let response = ui.add(
+                            egui::Label::new(RichText::new(quota).weak())
+                                .truncate()
+                                .selectable(false),
+                        );
+                        response.on_hover_text(quota);
+                        has_info = true;
+                    }
+                    match &card.expiry {
+                        Some((text, true)) => {
+                            ui.add_space(8.0);
+                            let response = ui.add(
+                                egui::Label::new(
+                                    RichText::new(text).color(status_colors_of(ui).err),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                            response.on_hover_text(text);
+                            has_info = true;
+                        }
+                        Some((text, false)) => {
+                            ui.add_space(8.0);
+                            let response = ui.add(
+                                egui::Label::new(RichText::new(text).weak())
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            response.on_hover_text(text);
+                            has_info = true;
+                        }
+                        None => {}
+                    }
+                    if title_fallback {
+                        if has_info {
+                            ui.add_space(8.0);
+                        }
+                        let response = ui.add(
+                            egui::Label::new(RichText::new(title).strong())
+                                .truncate()
+                                .selectable(false),
+                        );
+                        response.on_hover_text(title);
+                    }
+                    if let Some(hint) = update_hint {
+                        if has_info || title_fallback {
+                            ui.add_space(8.0);
+                        }
+                        ui.add(egui::Label::new(RichText::new("?").weak()).selectable(false))
+                            .on_hover_text(hint);
+                    }
+                },
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button(t(lang, Key::SrvDeleteGroup)).clicked() {
-                    delete = true;
-                }
-                let report_button = if has_report {
-                    ui.small_button(t(lang, Key::SrvShowReport))
-                } else {
-                    ui.add_enabled(
-                        false,
-                        egui::Button::new(t(lang, Key::SrvShowReport)).small(),
-                    )
-                };
-                if report_button.clicked() {
-                    show_report = true;
-                }
+                ui.menu_button(t(lang, Key::SrvMoreActions), |ui| {
+                    // Raw reads the last snapshot and mutates nothing, so it
+                    // stays available while a fetch or probe owns the screen.
+                    if ui.button(t(lang, Key::SrvRawSubscription)).clicked() {
+                        show_raw = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !locked,
+                            egui::Button::new(t(lang, Key::SrvEditSubscription)),
+                        )
+                        .clicked()
+                    {
+                        edit = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            has_report && !locked,
+                            egui::Button::new(t(lang, Key::SrvShowReport)),
+                        )
+                        .clicked()
+                    {
+                        show_report = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !locked,
+                            egui::Button::new(
+                                RichText::new(t(lang, Key::SrvDeleteGroup))
+                                    .color(status_colors_of(ui).err),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        delete = true;
+                        ui.close();
+                    }
+                });
                 if ui
-                    .small_button(t(lang, Key::SrvRefreshSubscription))
+                    .add_enabled(
+                        !locked,
+                        egui::Button::new(t(lang, Key::SrvRefreshSubscription)).small(),
+                    )
                     .clicked()
                 {
                     refresh = true;
                 }
-                if ui.small_button(t(lang, Key::SrvEditSubscription)).clicked() {
-                    edit = true;
-                }
             });
         });
+        let group_id = group.id.clone();
         if delete {
             self.group_delete_pending = Some(group.id.clone());
         }
@@ -3907,12 +4462,14 @@ impl ServersScreen {
             self.group_dialog = Some(GroupDraft::editing(group));
         }
         if show_report && let Some(report) = &subscription.report {
-            self.report_view = Some((group.title.clone(), report.clone()));
+            self.report_view = Some(ReportView::new(group.title.clone(), report.clone()));
+        }
+        if show_raw {
+            self.open_subscription_view(&group_id, ctx, ui.ctx().clone(), lang);
         }
         if refresh {
             let repaint = ui.ctx().clone();
-            let id = group.id.clone();
-            self.start_subscription_fetch(lang, repaint, ctx, id);
+            self.start_subscription_fetch(lang, repaint, ctx, group_id);
         }
     }
 
@@ -3920,27 +4477,6 @@ impl ServersScreen {
 
     fn show_table(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
         let lang = ctx.settings.language;
-        ui.add_space(4.0);
-        let mut reveal_changed = false;
-        ui.horizontal(|ui| {
-            ui.heading(t(lang, Key::ScreenServers));
-            // The reveal sits in front of the list, beside its title: while
-            // Hide server information masks the endpoints, the list offers
-            // the same control the editor does, so reading an address does
-            // not require opening a profile.
-            if ctx.settings.hide_server_info {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let before = self.revealed_list;
-                    widgets::reveal_toggle(ui, lang, &mut self.revealed_list);
-                    reveal_changed = before != self.revealed_list;
-                });
-            }
-        });
-        if reveal_changed {
-            // The row details memo runs on the model generation; the reveal
-            // is not part of the model, so drop the memo to repaint them.
-            self.row_details = None;
-        }
         // The route is part of the screen's state: a server row, a balancer,
         // or one of the built-in Direct/Block routes.
         let route = if let Some(tag) = ctx.settings.routing.active_balancer_tag() {
@@ -3983,10 +4519,18 @@ impl ServersScreen {
         // The toolbar's commands, with search at the end of the row so
         // filtering sits beside the actions it filters.
         let mut add_proto: Option<Protocol> = None;
+        let fetch_pending = self.subscription_fetch.is_pending();
         if probe_pending {
             // The test owns the toolbar: progress replaces the commands so
             // the set under test cannot change, while Cancel stays reachable.
+            // The pending fetch has the same shape, but never stacks under
+            // the probe: when both are in flight the probe stays the active
+            // progress surface.
             ui.horizontal(|ui| {
+                // The pending and command rows keep the same height, so the
+                // table below never moves when an operation takes the
+                // toolbar.
+                ui.set_min_height(ui.spacing().interact_size.y);
                 ui.spinner();
                 if ctx.probe_progress.total == 0 {
                     ui.label(t(lang, Key::SrvTesting));
@@ -4001,8 +4545,22 @@ impl ServersScreen {
                     ctx.hooks.send(CoreCmd::CancelLatencyProbe);
                 }
             });
+        } else if fetch_pending {
+            // The refresh is one request, so the spinner is indeterminate:
+            // no `N of M`, just the command that owns the screen and the
+            // Cancel that ends it. The previous report stays untouched until
+            // a new terminal result arrives.
+            ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
+                ui.spinner();
+                ui.label(t(lang, Key::SrvSubscriptionFetching));
+                if ui.button(t(lang, Key::Cancel)).clicked() {
+                    self.cancel_subscription_fetch();
+                }
+            });
         } else {
             ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
                 ui.add_enabled_ui(self.add.draft.is_none(), |ui| {
                     ui.menu_button(t(lang, Key::SrvAddServer), |ui| {
                         for protocol in Protocol::ALL {
@@ -4041,18 +4599,8 @@ impl ServersScreen {
                 if test_latency.clicked() {
                     action = Some(ListAction::ProbeLatencySelection);
                 }
-                // The binding choice belongs to the run: around the tunnel
-                // (the TUN screen's outbound interface) or through it.
-                if ui
-                    .checkbox(
-                        &mut ctx.settings.latency_test_bind_interface,
-                        t(lang, Key::SrvBindProbeInterface),
-                    )
-                    .on_hover_text(t(lang, Key::SrvBindProbeInterfaceHint))
-                    .changed()
-                {
-                    ctx.hooks.mark_ui_dirty();
-                }
+                // The probe's outbound path lives in the Servers Settings
+                // tab; the toolbar only starts the test.
                 // The columns fit their content until a divider is dragged;
                 // this command gives the dragged widths back to the fit.
                 if ui
@@ -4235,6 +4783,29 @@ impl ServersScreen {
                 }
             }
             seeds_before.push(seeds.len());
+            // A row can move only inside its own block, and only when that
+            // block holds another movable sibling. The active route is its
+            // own block (the generated order pins it first), so it can never
+            // move; a chain hop is not a place in its group either.
+            let active_index = ctx
+                .servers
+                .active
+                .as_deref()
+                .and_then(|id| profiles.iter().position(|profile| profile.id == id));
+            let mut drag_movable = vec![false; rows.len()];
+            if self.view == ServerTab::Emitted {
+                for (display, &index) in rows.iter().enumerate() {
+                    if emitted.chain_only.contains(&index) || Some(index) == active_index {
+                        continue;
+                    }
+                    let group = profiles[index].group_id();
+                    drag_movable[display] = seeds.iter().any(|&other| {
+                        other != index
+                            && Some(other) != active_index
+                            && profiles[other].group_id() == group
+                    });
+                }
+            }
             self.tab_rows_cache = Some(TabRowsCache {
                 generation,
                 tab: self.view.clone(),
@@ -4243,6 +4814,7 @@ impl ServersScreen {
                 rows: std::rc::Rc::from(rows),
                 seeds: std::rc::Rc::from(seeds.into_boxed_slice()),
                 seeds_before: std::rc::Rc::from(seeds_before.into_boxed_slice()),
+                drag_movable: std::rc::Rc::from(drag_movable.into_boxed_slice()),
             });
         }
         let display_rows = std::rc::Rc::clone(
@@ -4265,6 +4837,13 @@ impl ServersScreen {
                 .as_ref()
                 .expect("the tab rows were cached above")
                 .seeds_before,
+        );
+        let drag_movable = std::rc::Rc::clone(
+            &self
+                .tab_rows_cache
+                .as_ref()
+                .expect("the tab rows were cached above")
+                .drag_movable,
         );
         // A row the tab no longer shows — filtered out, or gone with its
         // group — leaves the selection before any command reads it. Only the
@@ -4299,12 +4878,15 @@ impl ServersScreen {
         let mut row_hit = false;
         // Solid scroll bars allocate their own strip, so the horizontal bar
         // cannot float over the last row's cells.
+        // The scroll state keeps a constant salt: a sibling above the table
+        // (the probe feedback row) appears and disappears across a test, and
+        // an auto id would move with it, resetting the read to the first row.
         let scroll_x = ui
             .scope(|ui| {
                 ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                 if display_rows.is_empty() {
                     let rows = egui::ScrollArea::both()
-                        .id_salt(ui.auto_id_with("servers.list.scroll"))
+                        .id_salt("servers.list.scroll")
                         .max_height(ui.available_height().max(80.0))
                         .show(ui, |ui| {
                             let message = if self.search.trim().is_empty() {
@@ -4319,7 +4901,7 @@ impl ServersScreen {
                     rows.state.clamped_offset().x
                 } else {
                     let rows = egui::ScrollArea::both()
-                        .id_salt(ui.auto_id_with("servers.list.scroll"))
+                        .id_salt("servers.list.scroll")
                         .max_height(ui.available_height().max(80.0))
                         .show_rows(ui, row_height, display_rows.len(), |ui, rows| {
                             // egui's floating (overlay) scroll bar paints and
@@ -4410,6 +4992,8 @@ impl ServersScreen {
                                 let joined_below = selected_at(display + 1);
                                 let is_active =
                                     ctx.servers.active.as_deref() == Some(p.id.as_str());
+                                let row_movable =
+                                    drag_movable.get(display).copied().unwrap_or(false);
                                 // Latency badge text is memoized per profile:
                                 // formatting runs only when the row's latency,
                                 // the language, or the theme palette moved — a
@@ -4459,6 +5043,10 @@ impl ServersScreen {
                                         joined_below,
                                         active: is_active,
                                         hop: emitted.chain_only.contains(&index),
+                                        movable: drag_movable
+                                            .get(display)
+                                            .copied()
+                                            .unwrap_or(false),
                                         dialers: if emitted.chain_only.contains(&index) {
                                             emitted
                                                 .dialers
@@ -4509,9 +5097,7 @@ impl ServersScreen {
                                 if clicks.row.drag_started_by(egui::PointerButton::Primary)
                                     && !probe_pending
                                     && !modified
-                                    && self.view == ServerTab::Emitted
-                                    && !is_active
-                                    && !emitted.chain_only.contains(&index)
+                                    && row_movable
                                 {
                                     egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
                                 }
@@ -4563,6 +5149,10 @@ impl ServersScreen {
                                     }
                                     if ui.button(t(lang, Key::SrvEdit)).clicked() {
                                         action = Some(ListAction::Edit(id.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button(t(lang, Key::SrvViewProfileJson)).clicked() {
+                                        action = Some(ListAction::ViewProfileJson(id.clone()));
                                         ui.close();
                                     }
                                     let set_active = ui.add_enabled(
@@ -4875,6 +5465,9 @@ impl ServersScreen {
                 ctx.hooks.mark_dirty();
             }
             Some(ListAction::Edit(id)) => self.open_editor(ctx.servers, lang, &id),
+            Some(ListAction::ViewProfileJson(id)) => {
+                self.open_profile_json_committed(ctx.servers, &id);
+            }
             Some(ListAction::ToggleEnabled(id)) => {
                 let enabled = ctx
                     .servers
@@ -5177,7 +5770,10 @@ impl ServersScreen {
             return;
         }
         let single = single && profiles.len() == 1;
-        self.latency_probe_feedback = None;
+        // The previous verdict stays mounted while the new test runs: the
+        // toolbar owns progress, and the new result replaces the feedback
+        // text when it lands. Clearing it here changed the rows above the
+        // table while the scroll area was live, which reset the read.
         match ctx.request_latency_probe_for_profiles(profiles) {
             Ok(()) => {
                 self.pending_latency_probe = Some(single);
@@ -5823,6 +6419,9 @@ struct RowState<'a> {
     /// The row is a chain hop: another outbound dials through it, so the row
     /// exists because of that reference. The paint marks it with a blue bar.
     hop: bool,
+    /// Whether this row can move inside its block: only then does it show the
+    /// handle, the reorder hint and the grab cursor.
+    movable: bool,
     /// The labels of the emitted servers that dial through this row, in
     /// emitted order. The latency hover names them; empty for a seed nothing
     /// dials through.
@@ -5908,6 +6507,22 @@ const TABLE_SORT_ARROW_ROOM: f32 = 18.0;
 /// control. The selected tab paints its rule three points below its label, so
 /// the toolbar sits fifteen points under the label and twelve under the rule.
 const TAB_STRIP_TO_TOOLBAR_GAP: f32 = 12.0;
+
+/// The width the subscription card reserves for Refresh and its overflow
+/// menu before the quota and expiry layout: wide enough for both labels, so
+/// the left information truncates instead of painting underneath them.
+const SUBSCRIPTION_CARD_ACTIONS_WIDTH: f32 = 150.0;
+
+/// The hit band between the raw view's two panes: wide enough to grab, thin
+/// enough to read as a divider.
+const SUBSCRIPTION_SPLIT_DIVIDER: f32 = 6.0;
+
+/// The narrowest either pane of the raw view may become when the user drags
+/// the divider. The ratio is clamped to the same band, so a window resize
+/// cannot push a pane below it.
+const SUBSCRIPTION_SPLIT_MIN_PANE: f32 = 140.0;
+const SUBSCRIPTION_SPLIT_MIN_FRACTION: f32 = 0.2;
+
 /// How wide the pointer's grab band on a column divider is.
 const TABLE_DIVIDER_HIT_WIDTH: f32 = 6.0;
 
@@ -6425,6 +7040,10 @@ struct DragTab(ServerTab);
 /// while the insertion line carries the drop position.
 const DRAGGED_ROW_OPACITY: f32 = 0.4;
 
+/// The drag handle a movable row shows before its name: four rows of dots
+/// read as a grip, and only movable rows render it.
+const DRAG_HANDLE: &str = "⠿";
+
 /// Distance from the list viewport's top/bottom edge (points) at which a row
 /// drag starts auto-scrolling, and the speed the scroll ramps to at the very
 /// edge (points per second). The band is wider than one row — the row height
@@ -6639,55 +7258,298 @@ fn unix_date(seconds: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The source address a direct subscription fetch binds: the uplink adapter
-/// the latency probe resolves, reduced to its first IPv4 (else IPv6) address,
-/// because the HTTP client binds an address rather than an adapter.
-fn subscription_bind_address(
+/// A Unix time as `YYYY-MM-DD HH:MM UTC`, for the raw viewer's snapshot
+/// header. No calendar dependency: the date half is [`unix_date`].
+fn unix_datetime(seconds: u64) -> String {
+    let day = seconds / 86_400;
+    let of_day = seconds % 86_400;
+    format!(
+        "{} {:02}:{:02} UTC",
+        unix_date(day * 86_400),
+        of_day / 3600,
+        (of_day % 3600) / 60
+    )
+}
+
+/// The persisted profile as pretty JSON, with the credentials masked unless
+/// the viewer revealed them. The serialization is the model's own, so the
+/// document carries exactly the fields the state file writes.
+fn profile_json_text(
+    profile: &ServerProfile,
+    revealed: bool,
+    hide_server_information: bool,
     lang: Language,
-    settings: &crate::model::Settings,
-    core_running: bool,
-) -> Result<Option<std::net::IpAddr>, String> {
-    if !settings.subscription_direct_fetch {
-        return Ok(None);
+) -> String {
+    let value = match serde_json::to_value(profile) {
+        Ok(value) => value,
+        Err(error) => {
+            return t_fmt(lang, Key::SrvSerializationError, &[&error]);
+        }
+    };
+    let value = if revealed {
+        value
+    } else {
+        crate::ui::json::mask_secrets(&value, hide_server_information)
+    };
+    serde_json::to_string_pretty(&value)
+        .unwrap_or_else(|error| t_fmt(lang, Key::SrvSerializationError, &[&error]))
+}
+
+/// One row of the parsed pane, flattened from the parser's result: accepted
+/// entries and refused entries with their source, and ignored parameters with
+/// the line they came from.
+enum ParsedRow<'a> {
+    Entry { name: &'a str, raw: &'a str },
+    Refused { error: &'a str, raw: &'a str },
+    Ignored { name: &'a str, raw: &'a str },
+}
+
+/// The parsed pane's rows in result order. The row count is the sum of the
+/// three lists, so the virtualized view lays out `rows.len()` without
+/// building a vector per frame.
+fn parsed_row_count(parsed: &links::BodyParse) -> usize {
+    parsed.entries.len() + parsed.refused.len() + parsed.ignored.len()
+}
+
+fn parsed_row_at(parsed: &links::BodyParse, index: usize) -> Option<ParsedRow<'_>> {
+    if let Some(entry) = parsed.entries.get(index) {
+        return Some(ParsedRow::Entry {
+            name: entry.profile.name.as_str(),
+            raw: entry.raw.as_str(),
+        });
     }
-    let interfaces = crate::sys::netif::list_all();
-    let tun_name = settings.tun.effective_name();
-    let tun_index = interfaces
-        .iter()
-        .find(|interface| interface.name == tun_name)
-        .map(|interface| interface.index);
-    let tun_active = settings.mode == crate::model::Mode::Tun && core_running;
-    match crate::sys::netif::resolve_probe_uplink(
-        Some(&settings.tun.auto_outbounds_interface),
-        tun_active,
-        tun_index,
-        &interfaces,
-    ) {
-        crate::sys::netif::ProbeUplink::Unbound => Ok(None),
-        crate::sys::netif::ProbeUplink::Interface(name) => {
-            let address = interfaces
-                .iter()
-                .find(|interface| interface.name == name)
-                .and_then(|interface| {
-                    interface
-                        .ips
-                        .iter()
-                        .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
-                        .min_by_key(|address| !address.is_ipv4())
-                });
-            address
-                .map(Some)
-                .ok_or_else(|| t_fmt(lang, Key::SrvSubscriptionNoUplinkAddress, &[&name]))
+    let index = index - parsed.entries.len();
+    if let Some(refusal) = parsed.refused.get(index) {
+        return Some(ParsedRow::Refused {
+            error: refusal.error.as_str(),
+            raw: refusal.raw.as_str(),
+        });
+    }
+    let index = index - parsed.refused.len();
+    parsed.ignored.get(index).map(|ignored| ParsedRow::Ignored {
+        name: ignored.name.as_str(),
+        raw: ignored
+            .parameter
+            .as_ref()
+            .map(|parameter| parameter.raw.as_str())
+            .unwrap_or(""),
+    })
+}
+
+/// The parsed pane's gathered text, for its own Copy: one line per row, in
+/// the same order the pane shows.
+fn parsed_pane_text(parsed: &links::BodyParse) -> String {
+    let mut text = String::new();
+    for index in 0..parsed_row_count(parsed) {
+        let Some(row) = parsed_row_at(parsed, index) else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push('\n');
         }
-        crate::sys::netif::ProbeUplink::TunSelf { name } => {
-            Err(t_fmt(lang, Key::ProbeInterfaceTunSelf, &[&name]))
+        match row {
+            ParsedRow::Entry { name, raw } => {
+                text.push_str(name);
+                if !raw.is_empty() {
+                    text.push_str(": ");
+                    text.push_str(raw);
+                }
+            }
+            ParsedRow::Refused { error, raw } => {
+                text.push_str(error);
+                if !raw.is_empty() {
+                    text.push_str(": ");
+                    text.push_str(raw);
+                }
+            }
+            ParsedRow::Ignored { name, raw } => {
+                text.push_str(name);
+                if !raw.is_empty() {
+                    text.push_str(": ");
+                    text.push_str(raw);
+                }
+            }
         }
-        crate::sys::netif::ProbeUplink::Down { name } => {
-            Err(t_fmt(lang, Key::ProbeInterfaceDown, &[&name]))
+    }
+    text
+}
+
+/// The decoded-body pane: the provider's decoded body verbatim in the
+/// monospace face, with its own Copy. No JSON colouring or redaction is
+/// applied: the body is arbitrary provider text.
+fn subscription_body_pane(
+    ui: &mut egui::Ui,
+    lang: Language,
+    snapshot: &crate::model::servers::DecodedSnapshot,
+    layout: &mut widgets::TextLayoutMemo,
+    revision: &mut widgets::TextRevision,
+    body_key: &mut Option<(u64, usize)>,
+    copied: &mut bool,
+) {
+    let key = (snapshot.revision, snapshot.body.len());
+    if *body_key != Some(key) {
+        *body_key = Some(key);
+        revision.bump();
+    }
+    ui.horizontal(|ui| {
+        ui.strong(t(lang, Key::SrvSubscriptionBodyPane));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if *copied {
+                ui.weak(t(lang, Key::SrvCopied));
+            }
+            if ui
+                .add_enabled(
+                    !snapshot.body.is_empty(),
+                    egui::Button::new(t(lang, Key::SrvCopy)).small(),
+                )
+                .clicked()
+            {
+                ui.ctx().copy_text(snapshot.body.clone());
+                *copied = true;
+            }
+        });
+    });
+    egui::ScrollArea::both()
+        .id_salt("servers.subscription-view.body")
+        .auto_shrink([false, false])
+        .max_height(ui.available_height().max(120.0))
+        .show(ui, |ui| {
+            let mut body = snapshot.body.as_str();
+            let mut layouter = layout.layouter(revision, egui::TextStyle::Monospace);
+            ui.add(
+                egui::TextEdit::multiline(&mut body)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .layouter(&mut layouter),
+            );
+        });
+}
+
+/// The parsed-entries pane: accepted entries with their source lines, then
+/// the refused and ignored rows in the parser's own result. The list is
+/// virtualized, so a large feed lays out only its visible band.
+fn subscription_parsed_pane(
+    ui: &mut egui::Ui,
+    lang: Language,
+    parsed: Option<&links::BodyParse>,
+    requested: bool,
+    error: Option<&str>,
+    copied: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.strong(t(lang, Key::SrvSubscriptionParsedPane));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if *copied {
+                ui.weak(t(lang, Key::SrvCopied));
+            }
+            if ui
+                .add_enabled(
+                    parsed.is_some(),
+                    egui::Button::new(t(lang, Key::SrvCopy)).small(),
+                )
+                .clicked()
+                && let Some(parsed) = parsed
+            {
+                ui.ctx().copy_text(parsed_pane_text(parsed));
+                *copied = true;
+            }
+        });
+    });
+    if let Some(error) = error {
+        ui.colored_label(status_colors_of(ui).err, error);
+        return;
+    }
+    let Some(parsed) = parsed else {
+        if requested {
+            ui.spinner();
+            ui.weak(t(lang, Key::SrvSubscriptionParsing));
         }
-        crate::sys::netif::ProbeUplink::Missing { name } => {
-            Err(t_fmt(lang, Key::ProbeInterfaceMissing, &[&name]))
+        return;
+    };
+    let count = parsed_row_count(parsed);
+    let row_height = ui.spacing().interact_size.y;
+    egui::ScrollArea::vertical()
+        .id_salt("servers.subscription-view.parsed")
+        .auto_shrink([false, false])
+        .max_height(ui.available_height().max(120.0))
+        .show_rows(ui, row_height, count, |ui, range| {
+            let colors = status_colors_of(ui);
+            for index in range {
+                let Some(row) = parsed_row_at(parsed, index) else {
+                    continue;
+                };
+                match row {
+                    ParsedRow::Entry { name, raw } => {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(name).strong())
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            if !raw.is_empty() {
+                                ui.add(
+                                    egui::Label::new(RichText::new(raw).monospace().small().weak())
+                                        .truncate()
+                                        .selectable(true),
+                                )
+                                .on_hover_text(raw);
+                            }
+                        });
+                    }
+                    ParsedRow::Refused { error, raw } => {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(error).color(colors.err))
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            if !raw.is_empty() {
+                                ui.add(
+                                    egui::Label::new(RichText::new(raw).monospace().small().weak())
+                                        .truncate()
+                                        .selectable(true),
+                                )
+                                .on_hover_text(raw);
+                            }
+                        });
+                    }
+                    ParsedRow::Ignored { name, raw } => {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(name).weak())
+                                    .truncate()
+                                    .selectable(false),
+                            );
+                            if !raw.is_empty() {
+                                ui.add(
+                                    egui::Label::new(RichText::new(raw).monospace().small().weak())
+                                        .truncate()
+                                        .selectable(true),
+                                )
+                                .on_hover_text(raw);
+                            }
+                        });
+                    }
+                }
+            }
+        });
+}
+
+/// The status line for a refresh path that cannot carry the fetch. Every
+/// variant names the field or adapter the user must fix; none selects
+/// another carrier, so a failed resolution is never mistaken for a working
+/// route.
+fn refresh_path_error(lang: Language, error: crate::sys::outbound_path::PathError) -> String {
+    use crate::sys::outbound_path::PathError;
+    match error {
+        PathError::UplinkUnavailable(name) => {
+            t_fmt(lang, Key::SrvSubscriptionNoUplinkAddress, &[&name])
         }
+        PathError::TunSelf(name) => t_fmt(lang, Key::ProbeInterfaceTunSelf, &[&name]),
+        PathError::UplinkDown(name) => t_fmt(lang, Key::ProbeInterfaceDown, &[&name]),
+        PathError::UplinkMissing(name) => t_fmt(lang, Key::ProbeInterfaceMissing, &[&name]),
+        PathError::Socks5HostMissing => t(lang, Key::SrvSocks5HostMissing).to_owned(),
+        PathError::Socks5PortMissing => t(lang, Key::SrvSocks5PortMissing).to_owned(),
     }
 }
 
@@ -6785,7 +7647,11 @@ fn server_list_row(
             }
         });
         let toggled = checked != row.switch.checked;
-        let name_resp = table_cell_button(ui, columns.name, lang, name, row.frozen);
+        let mut name_resp =
+            table_cell_button(ui, columns.name, lang, name, row.frozen, row.movable);
+        if row.movable {
+            name_resp = name_resp.on_hover_cursor(egui::CursorIcon::Grab);
+        }
         let latency_cell = table_cell(ui, columns.latency, |ui| {
             // The badge text/color come from the row's memoized
             // [`LatencyBadge`] — borrowed, never re-formatted per painted row.
@@ -6870,6 +7736,11 @@ fn server_list_row(
     } else {
         inner.response.interact(egui::Sense::click_and_drag())
     };
+    let resp = if row.movable {
+        resp.on_hover_cursor(egui::CursorIcon::Grab)
+    } else {
+        resp
+    };
     RowClicks {
         row: resp,
         name: name_resp,
@@ -6909,9 +7780,18 @@ fn table_cell_button(
     lang: Language,
     name: &str,
     frozen: bool,
+    movable: bool,
 ) -> egui::Response {
     let mut response = None;
     table_cell(ui, width, |ui| {
+        // The handle is a separate label at the cell's start: only a row that
+        // can move shows it, and it never becomes part of the name button's
+        // accessible label.
+        if movable {
+            ui.add(egui::Label::new(RichText::new(DRAG_HANDLE).weak()).selectable(false))
+                .on_hover_text(t(lang, Key::SrvDragToReorder));
+            ui.add_space(2.0);
+        }
         let text = if name.is_empty() {
             t(lang, Key::SrvUnnamed).to_owned()
         } else {
@@ -6922,8 +7802,13 @@ fn table_cell_button(
                 // The button's own padding would indent the name past the
                 // header above it; the cell inset is the table's only gutter.
                 ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
-                ui.add_enabled(!frozen, egui::Button::new(text).frame(false).truncate())
-                    .on_hover_text(t(lang, Key::SrvDragToReorder))
+                let response =
+                    ui.add_enabled(!frozen, egui::Button::new(text).frame(false).truncate());
+                if movable {
+                    response.on_hover_text(t(lang, Key::SrvDragToReorder))
+                } else {
+                    response
+                }
             })
             .inner,
         );
@@ -7100,6 +7985,9 @@ impl ServersScreen {
                             egui::Button::new(t(lang, Key::SrvDiscardChanges)),
                         )
                         .clicked();
+                    if ui.button(t(lang, Key::SrvViewProfileJson)).clicked() {
+                        self.open_profile_json_draft(draft, lang, false);
+                    }
                     if validating {
                         ui.spinner();
                         ui.weak(t(lang, Key::SrvValidatingXrayTest));
@@ -7162,7 +8050,7 @@ impl ServersScreen {
         // information only while the setting asks for it. One value for the
         // whole screen, derived after the control ran, so a click applies the
         // same frame.
-        let mask = widgets::Mask {
+        let mask = crate::ui::widgets::Mask {
             secrets: !self.revealed_existing,
             server_info: !self.revealed_existing && ctx.settings.hide_server_info,
         };
@@ -7451,7 +8339,7 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateUuidHint),
                     },
-                    mask.secrets,
+                    mask.hides(widgets::SecretField::Id),
                 );
                 changed |= field_changed;
                 if generate {
@@ -7549,7 +8437,7 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateUuidHint),
                     },
-                    mask.secrets,
+                    mask.hides(widgets::SecretField::Id),
                 );
                 changed |= field_changed;
                 if generate {
@@ -7579,7 +8467,7 @@ impl ServersScreen {
                     &mut settings.password,
                     "",
                     |v| v_required(lang, v),
-                    mask.secrets,
+                    mask.hides(widgets::SecretField::Password),
                 );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u32::MAX);
             }
@@ -7605,7 +8493,7 @@ impl ServersScreen {
                     &mut settings.password,
                     t(lang, Key::SrvShadowsocksPasswordHint),
                     |v| v_required(lang, v),
-                    mask.secrets,
+                    mask.hides(widgets::SecretField::Password),
                 );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u8::MAX.into());
                 if settings.level.is_some_and(|level| level > u8::MAX.into()) {
@@ -7617,18 +8505,38 @@ impl ServersScreen {
             }
             ProtocolSettings::Socks(settings) => {
                 changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
-                changed |=
-                    widgets::masked_text_field(ui, "user", &mut settings.user, "", mask.secrets);
-                changed |=
-                    widgets::masked_text_field(ui, "pass", &mut settings.pass, "", mask.secrets);
+                changed |= widgets::masked_text_field(
+                    ui,
+                    "user",
+                    &mut settings.user,
+                    "",
+                    mask.hides(widgets::SecretField::User),
+                );
+                changed |= widgets::masked_text_field(
+                    ui,
+                    "pass",
+                    &mut settings.pass,
+                    "",
+                    mask.hides(widgets::SecretField::Pass),
+                );
                 changed |= widgets::opt_num(ui, "level", &mut settings.level, 0..=u32::MAX);
             }
             ProtocolSettings::Http(settings) => {
                 changed |= addr_port(ui, lang, &mut settings.address, &mut settings.port, mask);
-                changed |=
-                    widgets::masked_text_field(ui, "user", &mut settings.user, "", mask.secrets);
-                changed |=
-                    widgets::masked_text_field(ui, "pass", &mut settings.pass, "", mask.secrets);
+                changed |= widgets::masked_text_field(
+                    ui,
+                    "user",
+                    &mut settings.user,
+                    "",
+                    mask.hides(widgets::SecretField::User),
+                );
+                changed |= widgets::masked_text_field(
+                    ui,
+                    "pass",
+                    &mut settings.pass,
+                    "",
+                    mask.hides(widgets::SecretField::Pass),
+                );
                 changed |= json_map_kv(
                     ui,
                     lang,
@@ -7650,7 +8558,7 @@ impl ServersScreen {
                         label: t(lang, Key::Generate),
                         hover: t(lang, Key::SrvGenerateWgHint),
                     },
-                    mask.secrets,
+                    mask.hides(widgets::SecretField::SecretKey),
                 );
                 changed |= field_changed;
                 if generate {
@@ -7769,7 +8677,7 @@ impl ServersScreen {
                                 &mut peer.pre_shared_key,
                                 "(optional)",
                                 |v| v_optional_wg_key(lang, v),
-                                mask.secrets,
+                                mask.hides(widgets::SecretField::PreSharedKey),
                             );
                             changed |= widgets::string_list(
                                 ui,
@@ -8109,6 +9017,13 @@ impl ServersScreen {
             protocol,
             mut mux,
         } = ctx;
+        // The transport tab renders label credentials only; a profile's
+        // address and port live in the basic tab, so the synthetic mask never
+        // hides server information.
+        let mask = crate::ui::widgets::Mask {
+            secrets: masked,
+            server_info: false,
+        };
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(t(lang, Key::SrvNetwork));
@@ -8624,7 +9539,7 @@ impl ServersScreen {
                         t(lang, Key::SrvAuthPassword),
                         &mut s.auth,
                         "",
-                        masked,
+                        mask.hides(widgets::SecretField::Auth),
                     );
                     changed |= widgets::opt_num(
                         ui,
@@ -8720,8 +9635,20 @@ impl ServersScreen {
                     // shows that value, and only the two placeholders survive the
                     // model's `MasquePathInvalid` rule.
                     changed |= widgets::text_field(ui, "path", &mut s.path, default_path);
-                    changed |= widgets::masked_text_field(ui, "user", &mut s.user, "", masked);
-                    changed |= widgets::masked_text_field(ui, "pass", &mut s.pass, "", masked);
+                    changed |= widgets::masked_text_field(
+                        ui,
+                        "user",
+                        &mut s.user,
+                        "",
+                        mask.hides(widgets::SecretField::User),
+                    );
+                    changed |= widgets::masked_text_field(
+                        ui,
+                        "pass",
+                        &mut s.pass,
+                        "",
+                        mask.hides(widgets::SecretField::Pass),
+                    );
                     changed |= transport_headers(ui, lang, &mut s.headers, &mut self.json_scratch);
                     changed |= xmux_section(ui, lang, &mut s.xmux);
                     let mut has_warp = s.warp.is_some();
@@ -8750,7 +9677,7 @@ impl ServersScreen {
                             "",
                             4,
                             |value| v_masque_warp_private_key(lang, value),
-                            masked,
+                            mask.hides(widgets::SecretField::PrivateKey),
                         );
                         changed |= widgets::masked_validated_multiline(
                             ui,
@@ -8759,7 +9686,10 @@ impl ServersScreen {
                             "",
                             4,
                             |value| v_masque_warp_public_key(lang, value),
-                            masked,
+                            // The WARP public key is not a credential, but the
+                            // reveal control hides the whole WARP block with
+                            // the secrets it guards.
+                            mask.secrets,
                         );
                         // One entry can be IPv4 or IPv6; a second must be the
                         // other family. The row rule judges one entry, and the
@@ -8839,7 +9769,7 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveSecrets),
                         &mut s.secrets,
                         "",
-                        masked,
+                        mask.hides(widgets::SecretField::Secrets),
                     );
                     match s.service.as_str() {
                         XDRIVE_SERVICE_DRIVE => {
@@ -8967,7 +9897,7 @@ impl ServersScreen {
                             lang,
                             &mut template,
                             s.secrets.len(),
-                            masked,
+                            mask,
                         ) {
                             changed = true;
                         }
@@ -9040,9 +9970,8 @@ impl ServersScreen {
         lang: Language,
         template: &mut XdriveTemplate,
         secret_count: usize,
-        // Whether the template's credentials render masked (the reveal
-        // control).
-        masked: bool,
+        // What the template's credential rows mask (the reveal control).
+        mask: widgets::Mask,
     ) -> bool {
         let mut changed = false;
         widgets::section(ui, t(lang, Key::SrvXdriveTemplate), |ui| {
@@ -9059,7 +9988,7 @@ impl ServersScreen {
             );
         });
         widgets::section(ui, t(lang, Key::SrvXdriveAuth), |ui| {
-            changed |= self.xdrive_auth_editor(ui, lang, &mut template.auth, secret_count, masked);
+            changed |= self.xdrive_auth_editor(ui, lang, &mut template.auth, secret_count, mask);
         });
         for op in XdriveOperation::ALL {
             let title = match op {
@@ -9165,10 +10094,10 @@ impl ServersScreen {
         lang: Language,
         auth: &mut XdriveTemplateAuth,
         secret_count: usize,
-        // Whether the authorization's username and password render masked
-        // (the reveal control). The token URL stays visible: it names its host,
-        // and masking a URL would hide the host with the token.
-        masked: bool,
+        // What the authorization's credential rows mask (the reveal control).
+        // The token URL stays visible: it names its host, and masking a URL
+        // would hide the host with the token.
+        mask: widgets::Mask,
     ) -> bool {
         let mut changed = false;
         changed |= widgets::combo_str_labeled(
@@ -9241,14 +10170,14 @@ impl ServersScreen {
                     t(lang, Key::SrvXdriveUsername),
                     &mut auth.username,
                     "",
-                    masked,
+                    mask.hides(widgets::SecretField::Username),
                 );
                 changed |= widgets::masked_text_field(
                     ui,
                     t(lang, Key::SrvXdrivePassword),
                     &mut auth.password,
                     "",
-                    masked,
+                    mask.hides(widgets::SecretField::Password),
                 );
             }
             _ => {}
@@ -10001,6 +10930,10 @@ impl ServersScreen {
                         ui.separator();
                         ui.label(t(lang, Key::SrvProtocol));
                         ui.monospace(draft.profile.outbound.protocol.as_str());
+                        ui.separator();
+                        if ui.button(t(lang, Key::SrvViewProfileJson)).clicked() {
+                            self.open_profile_json_draft(&draft, lang, true);
+                        }
                     });
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -10013,7 +10946,7 @@ impl ServersScreen {
                     });
                     // The dialog opens revealed (an empty form hides nothing), so
                     // this is what the dialog masks while the user hides it again.
-                    let mask = widgets::Mask {
+                    let mask = crate::ui::widgets::Mask {
                         secrets: !self.revealed_add,
                         server_info: !self.revealed_add && uictx.settings.hide_server_info,
                     };
@@ -10326,7 +11259,7 @@ impl ServersScreen {
                     }
                 });
                 egui::ScrollArea::vertical()
-                    .id_salt(ui.auto_id_with("tls-probe-output-window"))
+                    .id_salt("servers.tls-probe-output")
                     .max_height(340.0)
                     .show(ui, |ui| {
                         ui.monospace(output.as_str());
@@ -10390,6 +11323,23 @@ impl ServersScreen {
                 } else {
                     String::new()
                 };
+                // The override replaces the path and the SOCKS5 block as one
+                // unit. Turning it off clears the block, the way a disabled
+                // custom User-Agent clears its value, so the global values are
+                // the only ones in force.
+                subscription.outbound_custom = draft.outbound_custom;
+                if draft.outbound_custom {
+                    subscription.outbound_path = draft.outbound_path;
+                    subscription.socks5 = draft_socks5(
+                        &draft.socks5_host,
+                        draft.socks5_port,
+                        &draft.socks5_username,
+                        &draft.socks5_password,
+                    );
+                } else {
+                    subscription.outbound_path = RefreshPath::default();
+                    subscription.socks5 = Socks5Cfg::default();
+                }
                 subscription.title_auto = false;
             }
             return None;
@@ -10411,6 +11361,19 @@ impl ServersScreen {
                     draft.title.trim()
                 };
                 let mut group = Group::new(servers.unique_group_title(base, None));
+                let (outbound_path, socks5) = if draft.outbound_custom {
+                    (
+                        draft.outbound_path,
+                        draft_socks5(
+                            &draft.socks5_host,
+                            draft.socks5_port,
+                            &draft.socks5_username,
+                            &draft.socks5_password,
+                        ),
+                    )
+                } else {
+                    (RefreshPath::default(), Socks5Cfg::default())
+                };
                 group.subscription = Some(Subscription {
                     url,
                     user_agent_custom: draft.custom_user_agent,
@@ -10419,6 +11382,9 @@ impl ServersScreen {
                     } else {
                         String::new()
                     },
+                    outbound_custom: draft.outbound_custom,
+                    outbound_path,
+                    socks5,
                     title_auto: draft.title.trim().is_empty(),
                     ..Default::default()
                 });
@@ -10429,11 +11395,430 @@ impl ServersScreen {
         }
     }
 
+    /// Open the read-only JSON view of one committed profile. A view already
+    /// open for the profile is replaced, so one window exists per profile id.
+    fn open_profile_json_committed(
+        &mut self,
+        servers: &crate::model::ServersFile,
+        profile_id: &str,
+    ) {
+        let Some(profile) = servers
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        self.profile_views.insert(
+            profile.id.clone(),
+            ProfileJsonView::new(
+                profile.tag(),
+                ProfileJsonSource::Committed(profile.id.clone()),
+                profile,
+                false,
+            ),
+        );
+    }
+
+    /// Open the read-only JSON view of an editor draft. The view follows the
+    /// live draft while it stays open and freezes the last text afterwards.
+    fn open_profile_json_draft(&mut self, draft: &ProfileDraft, lang: Language, unsaved: bool) {
+        let title = if unsaved {
+            t(lang, Key::SrvProfileJsonUnsavedDraft).to_owned()
+        } else {
+            draft.profile.tag()
+        };
+        self.profile_views.insert(
+            draft.id.clone(),
+            ProfileJsonView::new(
+                title,
+                ProfileJsonSource::Draft(draft.id.clone()),
+                &draft.profile,
+                unsaved,
+            ),
+        );
+    }
+
+    /// Render every open profile JSON window. Each window reads its source on
+    /// the frame that renders it: a committed profile from the model, an
+    /// editor draft from its live draft. The memoized document rebuilds only
+    /// when the source generation, the reveal state or the language moves.
+    fn show_profile_views(
+        &mut self,
+        ctx: &egui::Context,
+        uictx: &mut ServersCtx<'_>,
+        lang: Language,
+    ) {
+        if self.profile_views.is_empty() {
+            return;
+        }
+        let generation = uictx.hooks.model_generation();
+        let keys: Vec<String> = self.profile_views.keys().cloned().collect();
+        for key in keys {
+            let Some(mut view) = self.profile_views.remove(&key) else {
+                continue;
+            };
+            let live = match &view.source {
+                ProfileJsonSource::Committed(id) => uictx
+                    .servers
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .map(|profile| (profile, 0)),
+                ProfileJsonSource::Draft(id) => self
+                    .existing
+                    .draft
+                    .as_ref()
+                    .filter(|draft| &draft.id == id)
+                    .map(|draft| (&draft.profile, draft.generation))
+                    .or_else(|| {
+                        self.add
+                            .draft
+                            .as_ref()
+                            .filter(|draft| &draft.id == id)
+                            .map(|draft| (&draft.profile, draft.generation))
+                    }),
+            };
+            if let Some((profile, draft_generation)) = live {
+                let revealed = view.revealed;
+                let hide_server_information = uictx.settings.hide_server_info;
+                view.refresh(
+                    profile,
+                    (
+                        generation,
+                        draft_generation,
+                        revealed,
+                        hide_server_information,
+                        lang,
+                    ),
+                );
+            }
+            let mut close_clicked = false;
+            let window_title = view.title.clone();
+            let close_requested = popup::show(
+                ctx,
+                ("servers.profile-json", key.as_str()),
+                window_title.as_str(),
+                [640.0, 520.0],
+                true,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        let (reveal_key, reveal_note) = if view.revealed {
+                            (Key::SrvHideSecrets, Key::SrvHideSecretsNote)
+                        } else {
+                            (Key::SrvRevealSecrets, Key::SrvRevealSecretsNote)
+                        };
+                        if ui
+                            .button(t(lang, reveal_key))
+                            .on_hover_text(t(lang, reveal_note))
+                            .clicked()
+                        {
+                            view.revealed = !view.revealed;
+                            view.copied = false;
+                        }
+                        if ui.button(t(lang, Key::SrvCopy)).clicked() {
+                            ui.ctx().copy_text(view.text.clone());
+                            view.copied = true;
+                        }
+                        if view.copied {
+                            ui.weak(t(lang, Key::SrvCopied));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            close_clicked = ui.button(t(lang, Key::Close)).clicked();
+                        });
+                    });
+                    ui.weak(t(lang, Key::SrvProfileJsonCopyNote));
+                    ui.separator();
+                    let ProfileJsonView {
+                        text,
+                        revision,
+                        layout,
+                        ..
+                    } = &mut view;
+                    egui::ScrollArea::both()
+                        .id_salt(("servers.profile-json.body", key.as_str()))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut body = text.as_str();
+                            let colors = crate::ui::json::json_colors(ui.visuals());
+                            let mut layouter =
+                                layout.layouter_json(revision, egui::TextStyle::Monospace, colors);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut body)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY)
+                                    .layouter(&mut layouter),
+                            );
+                        });
+                },
+            );
+            if !(close_requested || close_clicked) {
+                self.profile_views.insert(key, view);
+            }
+        }
+    }
+
+    /// Render the one subscription raw view. The decoded body sits on the left
+    /// and the parser's whole result on the right; a narrow window stacks the
+    /// two panes. A snapshot present without a session parse is parsed on a
+    /// worker when the window opens, never on this frame.
+    fn show_subscription_view(
+        &mut self,
+        ctx: &egui::Context,
+        uictx: &mut ServersCtx<'_>,
+        lang: Language,
+    ) {
+        let Some(group_id) = self
+            .subscription_view
+            .as_ref()
+            .map(|view| view.group.clone())
+        else {
+            return;
+        };
+        let Some(group) = uictx
+            .servers
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+        else {
+            self.subscription_view = None;
+            return;
+        };
+        let title = group.title.clone();
+        let snapshot = group
+            .subscription
+            .as_ref()
+            .and_then(|subscription| subscription.snapshot.as_ref());
+        // Adopt the session parse when it matches the stored snapshot, else
+        // start one worker for that snapshot.
+        let mut start: Option<(String, u64)> = None;
+        if let Some(view) = self.subscription_view.as_mut() {
+            match &snapshot {
+                None => {
+                    view.parse = None;
+                    view.parse_revision = None;
+                    view.requested_revision = None;
+                    view.parse_error = None;
+                }
+                Some(snapshot) if view.parse_revision != Some(snapshot.revision) => {
+                    if view.requested_revision != Some(snapshot.revision) {
+                        let cached = self
+                            .last_subscription_parse
+                            .as_ref()
+                            .filter(|(group, revision, _)| {
+                                group == &view.group && *revision == snapshot.revision
+                            })
+                            .map(|(_, _, parsed)| std::rc::Rc::clone(parsed));
+                        match cached {
+                            Some(parsed) => {
+                                view.parse = Some(parsed);
+                                view.parse_revision = Some(snapshot.revision);
+                                view.requested_revision = None;
+                                view.parse_error = None;
+                            }
+                            None => {
+                                start = Some((snapshot.body.clone(), snapshot.revision));
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some((body, revision)) = start {
+            self.start_subscription_view_parse(&group_id, body, revision, ctx.clone(), lang);
+        }
+        let Some(mut view) = self.subscription_view.take() else {
+            return;
+        };
+        let mut refresh = false;
+        let mut close_clicked = false;
+        let close_requested = popup::show(
+            ctx,
+            "servers.subscription-raw",
+            &t_fmt(lang, Key::SrvSubscriptionRawTitle, &[&title]),
+            [900.0, 620.0],
+            true,
+            |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(snapshot) = &snapshot {
+                        ui.label(t_fmt(
+                            lang,
+                            Key::SrvSubscriptionSnapshotAt,
+                            &[&unix_datetime(snapshot.at)],
+                        ));
+                        if let Some(parsed) = view.parse.as_deref() {
+                            ui.separator();
+                            ui.label(t_fmt(
+                                lang,
+                                Key::SrvSubscriptionCounts,
+                                &[
+                                    &parsed.entries.len(),
+                                    &parsed.refused.len(),
+                                    &parsed.ignored.len(),
+                                ],
+                            ));
+                        } else if view.requested_revision.is_some() {
+                            ui.spinner();
+                            ui.weak(t(lang, Key::SrvSubscriptionParsing));
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close_clicked = ui.button(t(lang, Key::Close)).clicked();
+                    });
+                });
+                ui.colored_label(
+                    status_colors_of(ui).warn,
+                    t(lang, Key::SrvSubscriptionRawWarning),
+                );
+                if snapshot.as_ref().is_some_and(|snapshot| snapshot.truncated) {
+                    ui.colored_label(
+                        status_colors_of(ui).warn,
+                        t(lang, Key::SrvSubscriptionTruncated),
+                    );
+                }
+                if let Some(error) = &view.parse_error {
+                    ui.colored_label(status_colors_of(ui).err, error);
+                }
+                ui.separator();
+                match &snapshot {
+                    None => {
+                        ui.weak(t(lang, Key::SrvSubscriptionSnapshotEmpty));
+                        if ui.button(t(lang, Key::SrvRefreshSubscription)).clicked() {
+                            refresh = true;
+                        }
+                    }
+                    Some(snapshot) => {
+                        let wide = ui.available_width() >= 720.0;
+                        if wide {
+                            ui.horizontal_top(|ui| {
+                                let height = ui.available_height();
+                                let available = ui.available_width();
+                                let usable = (available - SUBSCRIPTION_SPLIT_DIVIDER).max(1.0);
+                                let min = (usable * SUBSCRIPTION_SPLIT_MIN_FRACTION)
+                                    .max(SUBSCRIPTION_SPLIT_MIN_PANE)
+                                    .min(usable / 2.0);
+                                let start_x = ui.cursor().min.x;
+                                let left = (usable * view.split_ratio).clamp(min, usable - min);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(left, height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        subscription_body_pane(
+                                            ui,
+                                            lang,
+                                            snapshot,
+                                            &mut view.body_layout,
+                                            &mut view.body_revision,
+                                            &mut view.body_key,
+                                            &mut view.body_copied,
+                                        );
+                                    },
+                                );
+                                let (divider_rect, divider) = ui.allocate_exact_size(
+                                    egui::vec2(SUBSCRIPTION_SPLIT_DIVIDER, height),
+                                    egui::Sense::hover(),
+                                );
+                                let divider = divider.interact(egui::Sense::click_and_drag());
+                                divider.widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::Role::Button,
+                                        ui.is_enabled(),
+                                        t(lang, Key::SrvSubscriptionResizePanes),
+                                    )
+                                });
+                                if divider.dragged()
+                                    && let Some(pos) =
+                                        ui.input(|input| input.pointer.interact_pos())
+                                {
+                                    let dragged = (pos.x - start_x).clamp(min, usable - min);
+                                    view.split_ratio = dragged / usable;
+                                }
+                                let hot = divider.hovered() || divider.dragged();
+                                if hot {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                                }
+                                let color = if hot {
+                                    ui.visuals().widgets.hovered.bg_stroke.color
+                                } else {
+                                    ui.visuals().widgets.noninteractive.bg_stroke.color
+                                };
+                                ui.painter().vline(
+                                    divider_rect.center().x,
+                                    divider_rect.y_range(),
+                                    egui::Stroke::new(1.0, color),
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2((usable - left).max(0.0), height),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        subscription_parsed_pane(
+                                            ui,
+                                            lang,
+                                            view.parse.as_deref(),
+                                            view.requested_revision.is_some(),
+                                            view.parse_error.as_deref(),
+                                            &mut view.parsed_copied,
+                                        );
+                                    },
+                                );
+                            });
+                        } else {
+                            let height = (ui.available_height() - 12.0).max(0.0) / 2.0;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    subscription_body_pane(
+                                        ui,
+                                        lang,
+                                        snapshot,
+                                        &mut view.body_layout,
+                                        &mut view.body_revision,
+                                        &mut view.body_key,
+                                        &mut view.body_copied,
+                                    );
+                                },
+                            );
+                            ui.separator();
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    subscription_parsed_pane(
+                                        ui,
+                                        lang,
+                                        view.parse.as_deref(),
+                                        view.requested_revision.is_some(),
+                                        view.parse_error.as_deref(),
+                                        &mut view.parsed_copied,
+                                    );
+                                },
+                            );
+                        }
+                    }
+                }
+            },
+        );
+        if refresh {
+            self.start_subscription_fetch(lang, ctx.clone(), uictx, group_id);
+        }
+        if !(close_requested || close_clicked) {
+            self.subscription_view = Some(view);
+        }
+    }
+
     fn show_dialogs(&mut self, ctx: &egui::Context, uictx: &mut ServersCtx) {
         let lang = uictx.settings.language;
+        self.show_profile_views(ctx, uictx, lang);
+        self.show_subscription_view(ctx, uictx, lang);
         // Refresh/import report.
         if let Some(view) = self.report_view.take() {
-            let (title, report) = (&view.0, &view.1);
+            let ReportView {
+                title,
+                report,
+                ignored,
+            } = &view;
             let close_requested = popup::show(
                 ctx,
                 "servers.refresh-report",
@@ -10446,6 +11831,7 @@ impl ServersScreen {
                         Key::SrvReportSummary,
                         &[
                             &report.added,
+                            &report.unchanged,
                             &report.updated,
                             &report.removed,
                             &report.refused,
@@ -10462,7 +11848,46 @@ impl ServersScreen {
                     egui::ScrollArea::vertical()
                         .id_salt("servers.refresh-report.rows")
                         .show(ui, |ui| {
+                            let mut ignored_drawn = false;
                             for (index, row) in report.rows.iter().enumerate() {
+                                if row.kind == crate::model::servers::ReportKind::Ignored {
+                                    if ignored_drawn {
+                                        continue;
+                                    }
+                                    ignored_drawn = true;
+                                    for group in ignored {
+                                        egui::CollapsingHeader::new(t_fmt(
+                                            lang,
+                                            Key::SrvReportIgnoredGroup,
+                                            &[&group.key, &group.count],
+                                        ))
+                                        .id_salt(group.key.as_str())
+                                        .show(ui, |ui| {
+                                            for detail in report.rows.iter().filter(|detail| {
+                                                detail.kind
+                                                    == crate::model::servers::ReportKind::Ignored
+                                                    && if detail.key.is_empty() {
+                                                        detail.name == group.key
+                                                    } else {
+                                                        detail.key == group.key
+                                                    }
+                                            }) {
+                                                ui.label(&detail.name);
+                                                if !detail.raw.is_empty() {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&detail.raw)
+                                                                .monospace(),
+                                                        )
+                                                        .selectable(true)
+                                                        .wrap(),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    }
+                                    continue;
+                                }
                                 let label = match row.kind {
                                     crate::model::servers::ReportKind::Added => {
                                         t(lang, Key::SrvReportAdded)
@@ -10571,6 +11996,64 @@ impl ServersScreen {
                                 "",
                             );
                         }
+                        // The outbound override replaces the global refresh
+                        // path and its SOCKS5 block as one unit, like the
+                        // custom User-Agent above. The effective-path line
+                        // always says which set is in force.
+                        ui.checkbox(
+                            &mut draft.outbound_custom,
+                            t(lang, Key::SrvOutboundOverride),
+                        );
+                        let tun_on = uictx.settings.mode == Mode::Tun && uictx.core_running;
+                        let global_path = uictx.settings.subscription_path;
+                        let effective = if draft.outbound_custom {
+                            crate::sys::outbound_path::effective_refresh_path(
+                                draft.outbound_path,
+                                tun_on,
+                            )
+                        } else {
+                            crate::sys::outbound_path::effective_refresh_path(global_path, tun_on)
+                        };
+                        if draft.outbound_custom {
+                            let disabled =
+                                (!tun_on).then_some(Key::SettingsPathBindNicDisabledHint);
+                            let options = [
+                                (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
+                                (RefreshPath::Native, Key::SettingsPathNative, None),
+                                (RefreshPath::Socks5, Key::SettingsPathSocks5, None),
+                            ];
+                            if let Some(path) = crate::ui::outbound_settings::path_control(
+                                ui, lang, effective, &options,
+                            ) && path != draft.outbound_path
+                            {
+                                draft.outbound_path = path;
+                            }
+                            ui.label(
+                                RichText::new(crate::ui::outbound_settings::refresh_path_note(
+                                    lang,
+                                    effective,
+                                    draft.outbound_path,
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            crate::ui::outbound_settings::socks5_editor(
+                                ui,
+                                lang,
+                                &mut draft.socks5_host,
+                                &mut draft.socks5_port,
+                                &mut draft.socks5_username,
+                                &mut draft.socks5_password,
+                                &mut draft.reveal_password,
+                            );
+                        }
+                        let path_label = refresh_path_label(effective, lang);
+                        let effective_line = if draft.outbound_custom {
+                            t_fmt(lang, Key::SrvOutboundCustom, &[&path_label])
+                        } else {
+                            t_fmt(lang, Key::SrvOutboundUsingGlobal, &[&path_label])
+                        };
+                        ui.label(effective_line);
                     }
                     let ready = match draft.kind {
                         crate::model::servers::GroupKind::Manual => true,
@@ -10684,8 +12167,7 @@ impl ServersScreen {
                 // The fetch belongs to the group it was started for: a group
                 // deleted mid-fetch cancels that fetch and no other.
                 if self.subscription_fetch_group.as_deref() == Some(id.as_str()) {
-                    self.subscription_fetch.cancel();
-                    self.subscription_fetch_group = None;
+                    self.cancel_subscription_fetch();
                 }
                 if uictx.servers.delete_group(&id) {
                     uictx.hooks.mark_dirty();
@@ -11310,13 +12792,14 @@ mod tests {
     use super::keygen::{keygen_value, redacted_tool_args};
     use super::raw_editor::JsonBuf;
     use super::{
-        AdvancedTabCtx, Column, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline, DraftKind,
-        DraftTarget, EditorTab, EditorValidationCache, EditorValidationFindings,
+        AdvancedTabCtx, Column, DRAG_HANDLE, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline,
+        DraftKind, DraftTarget, EditorTab, EditorValidationCache, EditorValidationFindings,
         EditorValidationRender, FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language,
-        LatencyBadge, LeaveAction, ProfileDraft, RawField, Request, RowCells, RowDetail, RowExtras,
-        RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile, ServerTab,
-        ServersScreen, StatusLine, TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe,
-        TransportTabCtx, basic_tab_inline_verdict, column_bounds, drag_divider, drag_scroll_delta,
+        LatencyBadge, LeaveAction, ProfileDraft, RawField, ReportView, Request, RowCells,
+        RowDetail, RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers,
+        ServerProfile, ServerTab, ServersScreen, ServersSide, StatusLine, SubscriptionFetchResult,
+        TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe, TransportTabCtx,
+        basic_tab_inline_verdict, column_bounds, drag_divider, drag_scroll_delta,
         ech_sockopt_editor, editor_validation_findings, feedback_preview, final_rules_editor,
         finalmask_udp_settings_editor, fingerprint_allowed, frozen_widths, mux_tab, noises_editor,
         reorder_target, sanitized_widths, server_list_row, status_colors_of, status_toast_expired,
@@ -11335,10 +12818,10 @@ mod tests {
         FinalmaskNoiseItem, FinalmaskQuicParams, FinalmaskRawValue, FinalmaskRealm,
         FinalmaskRealmTls, FinalmaskTcpItem, FinalmaskTcpMask, FinalmaskUdpHop, FinalmaskUdpMask,
         FinalmaskXdns, FinalmaskXdnsDomain, FinalmaskXdnsResolver, FreedomFinalRule,
-        HysteriaTransport, Int32Range, MasqueTransport, MasqueWarp, Network, Noise, OutboundModel,
-        ProbeOutcome, ProbeSource, ProbeVerdict, Protocol, ProtocolSettings, RealityModel,
-        Security, SockoptModel, StreamModel, TlsCert, TlsModel, WireguardPeer, WsSettings,
-        XhttpSettings, XmuxConfig,
+        HysteriaTransport, Int32Range, MasqueTransport, MasqueWarp, Mode, Network, Noise,
+        OutboundModel, ProbeOutcome, ProbeSource, ProbeVerdict, Protocol, ProtocolSettings,
+        RealityModel, Security, SockoptModel, StreamModel, TlsCert, TlsModel, WireguardPeer,
+        WsSettings, XhttpSettings, XmuxConfig,
     };
     use crate::rt::{
         CoreCmd, JobKind, LatencyProbeResult, OutboundStatusView, ProbeFailure,
@@ -11856,22 +13339,37 @@ Authentication: ML-KEM-768, Post-Quantum
         let report = RefreshReport {
             added: 1,
             refused: 1,
+            ignored: 2,
             rows: vec![
                 ReportRow {
                     kind: ReportKind::Added,
                     name: "Tokyo".into(),
+                    key: String::new(),
                     raw: String::new(),
                 },
                 ReportRow {
                     kind: ReportKind::Refused,
                     name: "bad entry".into(),
+                    key: String::new(),
                     raw: "vless://broken".into(),
+                },
+                ReportRow {
+                    kind: ReportKind::Ignored,
+                    name: "Tokyo: quicSecurity=none".into(),
+                    key: "quicSecurity=none".into(),
+                    raw: "vless://a#quicSecurity=none".into(),
+                },
+                ReportRow {
+                    kind: ReportKind::Ignored,
+                    name: "Osaka: quicSecurity=none".into(),
+                    key: "quicSecurity=none".into(),
+                    raw: "vless://b#quicSecurity=none".into(),
                 },
             ],
             ..Default::default()
         };
         let screen = ServersScreen {
-            report_view: Some(("Feed report".into(), report)),
+            report_view: Some(ReportView::new("Feed report".into(), report)),
             ..ServersScreen::default()
         };
         let mut harness = screen_harness(UiTestRig::default(), screen);
@@ -11886,12 +13384,1130 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         assert!(
             harness
+                .query_by_label(&t_fmt(
+                    Language::En,
+                    Key::SrvReportSummary,
+                    &[&1usize, &0usize, &0usize, &0usize, &1usize, &2usize],
+                ))
+                .is_some(),
+            "the summary order is added, unchanged, updated, removed, refused, ignored"
+        );
+        assert!(
+            harness
                 .get_all_by_label_contains("refused")
                 .next()
                 .is_some(),
             "the refused section is present"
         );
+        assert!(
+            harness
+                .query_by_label_contains("ignored quicSecurity=none (2 entries)")
+                .is_some(),
+            "repeated ignored parameters group under one count"
+        );
+        assert!(
+            harness
+                .query_by_label_contains("Osaka: quicSecurity=none")
+                .is_none(),
+            "a grouped ignored entry stays inside the expansion"
+        );
+        harness
+            .get_by_label("ignored quicSecurity=none (2 entries)")
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .get_all_by_label_contains("Tokyo: quicSecurity=none")
+                .next()
+                .is_some()
+                && harness
+                    .get_all_by_label_contains("Osaka: quicSecurity=none")
+                    .next()
+                    .is_some(),
+            "expanding the group shows every entry name"
+        );
+        assert!(
+            harness
+                .get_all_by_label_contains("vless://a#quicSecurity=none")
+                .next()
+                .is_some(),
+            "an ignored row keeps its bounded raw source line"
+        );
         assert!(harness.query_by_label("Feed report").is_some());
+    }
+
+    /// A trojan profile whose JSON carries a credential and an unknown
+    /// flattened key, for the read-only profile view.
+    fn profile_json_fixture() -> ServerProfile {
+        let mut profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Trojan));
+        if let ProtocolSettings::Trojan(settings) = &mut profile.outbound.settings {
+            settings.address = "t.example.com".into();
+            settings.port = 443;
+            settings.password = "secret-password".into();
+        }
+        profile
+            .extra
+            .insert("futureField".into(), serde_json::json!("kept"));
+        profile.enabled = true;
+        profile
+    }
+
+    /// The clipboard text one frame emitted, if any.
+    fn copied_text(harness: &Harness<'static, (ServersScreen, UiTestRig)>) -> Vec<String> {
+        harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_row_menu_opens_a_masked_read_only_profile_json_window() {
+        let profile = profile_json_fixture();
+        let masked = super::profile_json_text(&profile, false, false, Language::En);
+        let revealed = super::profile_json_text(&profile, true, false, Language::En);
+        assert!(
+            masked.contains("\"futureField\"")
+                && masked.contains("\"outbound\"")
+                && !masked.contains("\"verdict\"")
+                && !masked.contains("\"groupTitle\"")
+                && !masked.contains("\"tag\""),
+            "the document is the persisted profile shape, not the wire outbound: {masked}"
+        );
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile.clone());
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvViewProfileJson))
+            .click();
+        harness.run();
+
+        assert!(
+            harness.query_by_label(&profile.tag()).is_some(),
+            "the window title names the profile as [Group] Name"
+        );
+        assert!(
+            harness.query_by_value(masked.as_str()).is_some(),
+            "the window shows the persisted JSON with the secret masked and the unknown key kept"
+        );
+        assert!(
+            harness.query_by_value(revealed.as_str()).is_none(),
+            "the secret stays masked until Reveal"
+        );
+
+        // Copy hands the visible (masked) text to the clipboard.
+        harness.get_by_label(t(Language::En, Key::SrvCopy)).click();
+        harness.step();
+        assert_eq!(
+            copied_text(&harness),
+            vec![masked.clone()],
+            "Copy must copy exactly the masked text on screen"
+        );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvCopied))
+                .is_some(),
+            "the copied state confirms the action"
+        );
+
+        harness
+            .get_by_label(t(Language::En, Key::SrvRevealSecrets))
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_value(revealed.as_str()).is_some(),
+            "Reveal shows the real credential"
+        );
+
+        // Closing drops the reveal state: reopening starts masked again, and
+        // the profile still has exactly one window.
+        harness.get_by_label(t(Language::En, Key::Close)).click();
+        harness.run();
+        assert!(harness.query_by_label(&profile.tag()).is_none());
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvViewProfileJson))
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label(&profile.tag()).count(),
+            1,
+            "one window exists per profile id"
+        );
+        assert!(
+            harness.query_by_value(masked.as_str()).is_some()
+                && harness.query_by_value(revealed.as_str()).is_none(),
+            "closing the window re-masks the secrets"
+        );
+    }
+
+    #[test]
+    fn two_profile_json_windows_can_coexist() {
+        let mut rig = UiTestRig::default();
+        let mut ids = Vec::new();
+        for name in ["Tokyo", "Osaka"] {
+            let profile = ServerProfile::new(name, OutboundModel::new(Protocol::Freedom));
+            ids.push(profile.id.clone());
+            rig.servers.profiles.push(profile);
+        }
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        let servers = harness.state().1.servers.clone();
+        for id in &ids {
+            harness
+                .state_mut()
+                .0
+                .open_profile_json_committed(&servers, id);
+        }
+        harness.run();
+        assert!(harness.query_by_label("[Manual] Tokyo").is_some());
+        assert!(harness.query_by_label("[Manual] Osaka").is_some());
+    }
+
+    #[test]
+    fn the_editor_opens_the_live_draft_json() {
+        let mut rig = UiTestRig::default();
+        rig.servers.profiles.push(profile_json_fixture());
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness.get_by_label("Tokyo").click_secondary();
+        harness.run();
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvEdit))
+            .last()
+            .expect("the row menu offers Edit")
+            .click();
+        harness.run();
+        // An unsaved rename is part of the live draft.
+        {
+            let draft = harness
+                .state_mut()
+                .0
+                .existing
+                .draft
+                .as_mut()
+                .expect("the editor opened");
+            draft.profile.name = "Tokyo draft".into();
+        }
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvViewProfileJson))
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label("[Manual] Tokyo draft").is_some(),
+            "the editor view names the draft's current name"
+        );
+        let expected = harness
+            .state()
+            .0
+            .existing
+            .draft
+            .as_ref()
+            .map(|draft| super::profile_json_text(&draft.profile, false, false, Language::En))
+            .expect("the draft stays open");
+        assert!(
+            harness.query_by_value(expected.as_str()).is_some(),
+            "the editor view shows the unsaved draft"
+        );
+    }
+
+    #[test]
+    fn an_add_draft_profile_json_view_says_unsaved() {
+        let mut harness = screen_harness(UiTestRig::default(), ServersScreen::default());
+        harness.run();
+        open_add_editor(&mut harness);
+        harness
+            .get_by_label(t(Language::En, Key::SrvViewProfileJson))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvProfileJsonUnsavedDraft))
+                .is_some(),
+            "an add draft has no committed identity and says Unsaved draft"
+        );
+    }
+
+    /// The snapshot revision [`subscription_view_rig`] stamps. Zero, the
+    /// default a snapshot loaded from the state file carries: a capture always
+    /// takes a positive value from the session counter, so the fixture can
+    /// never collide with a later capture's revision.
+    const VIEW_REVISION: u64 = 0;
+
+    /// A subscription rig with one feed group and one emitted row, and the
+    /// snapshot time when a body is stored.
+    fn subscription_view_rig(body: Option<&str>, truncated: bool) -> (UiTestRig, String, u64) {
+        use crate::model::servers::{Group, Subscription};
+        let mut rig = UiTestRig::default();
+        let mut group = Group::new("Feed");
+        let at = 1_700_000_000;
+        group.subscription = Some(Subscription {
+            url: "https://example.com/sub".into(),
+            snapshot: body.map(|body| crate::model::servers::DecodedSnapshot {
+                body: body.to_owned(),
+                truncated,
+                at,
+                revision: VIEW_REVISION,
+            }),
+            ..Default::default()
+        });
+        let feed_id = group.id.clone();
+        let mut profile = ServerProfile::new("FeedOne", OutboundModel::new(Protocol::Freedom));
+        profile.group = feed_id.clone();
+        profile.enabled = true;
+        rig.servers.profiles = vec![profile];
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        (rig, feed_id, at)
+    }
+
+    /// Step the harness until the session cache holds a parse delivered for
+    /// `revision`, as the off-thread worker does on its own schedule.
+    fn wait_for_parse_revision(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+        revision: u64,
+    ) {
+        for _ in 0..200 {
+            if harness
+                .state()
+                .0
+                .last_subscription_parse
+                .as_ref()
+                .is_some_and(|(_, cached, _)| *cached == revision)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            harness.step();
+        }
+        panic!("no parse for revision {revision} landed");
+    }
+
+    fn open_raw_from_card(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) {
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvMoreActions))
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvRawSubscription))
+            .click();
+        harness.run();
+    }
+
+    /// Open the feed group's tab, which mounts the subscription card.
+    fn open_feed_tab(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) {
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
+            .click();
+        harness.run();
+    }
+
+    /// Park an in-flight refresh without a request: the reply channel stays
+    /// open, so the screen reads a pending terminal until the test sends one
+    /// or cancels. The returned sender must stay alive for the fetch to
+    /// remain pending.
+    fn park_pending_refresh(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+        group: &str,
+    ) -> tokio::sync::oneshot::Sender<SubscriptionFetchResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let screen = &mut harness.state_mut().0;
+        screen.subscription_fetch = Request::reply(rx);
+        screen.subscription_fetch_group = Some(group.to_owned());
+        tx
+    }
+
+    #[test]
+    fn a_pending_refresh_replaces_the_toolbar_and_keeps_the_table_in_place() {
+        let (rig, feed, _at) = subscription_view_rig(None, false);
+        let mut harness =
+            screen_harness_at(egui::vec2(1100.0, 700.0), rig, ServersScreen::default());
+        harness.run();
+        open_feed_tab(&mut harness);
+        let row_before = harness.get_by_label("FeedOne").rect().top();
+        let _terminal = park_pending_refresh(&mut harness, &feed);
+        harness.step();
+
+        assert!(
+            harness
+                .query_all_by_role(egui::accesskit::Role::ProgressIndicator)
+                .next()
+                .is_some(),
+            "the refresh shows the latency test's spinner"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionFetching))
+                .is_some(),
+            "the pending toolbar names the fetch"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::Cancel))
+                .is_some(),
+            "the pending toolbar offers Cancel"
+        );
+        for label in [Key::SrvAddServer, Key::TestLatency, Key::SrvFitColumns] {
+            assert!(
+                harness.query_by_label(t(Language::En, label)).is_none(),
+                "the pending fetch replaces the {label:?} command"
+            );
+        }
+        let row_after = harness.get_by_label("FeedOne").rect().top();
+        assert!(
+            (row_after - row_before).abs() < 0.5,
+            "the pending toolbar keeps the normal height ({row_before} -> {row_after})"
+        );
+    }
+
+    #[test]
+    fn a_pending_refresh_disables_the_card_actions_but_not_raw() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        if let Some(subscription) = rig
+            .servers
+            .groups
+            .iter_mut()
+            .find(|group| group.id == feed)
+            .and_then(|group| group.subscription.as_mut())
+        {
+            // Give Report something to offer so its disabled state is the
+            // fetch's doing, not the missing report's.
+            subscription.report = Some(crate::model::servers::RefreshReport::default());
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_feed_tab(&mut harness);
+        let _terminal = park_pending_refresh(&mut harness, &feed);
+        harness.step();
+
+        let refresh = harness.get_by_label(t(Language::En, Key::SrvRefreshSubscription));
+        assert!(
+            refresh.accesskit_node().is_disabled(),
+            "Refresh waits for the in-flight fetch"
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvMoreActions))
+            .click();
+        harness.run_steps(3);
+        for label in [
+            Key::SrvEditSubscription,
+            Key::SrvShowReport,
+            Key::SrvDeleteGroup,
+        ] {
+            let node = harness.get_by_label(t(Language::En, label));
+            assert!(
+                node.accesskit_node().is_disabled(),
+                "{label:?} must be disabled during the fetch"
+            );
+        }
+        let raw = harness.get_by_label(t(Language::En, Key::SrvRawSubscription));
+        assert!(
+            !raw.accesskit_node().is_disabled(),
+            "Raw only reads the last snapshot and stays available"
+        );
+    }
+
+    #[test]
+    fn a_second_refresh_cannot_start_while_one_is_in_flight() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        let mut other = crate::model::servers::Group::new("Other feed");
+        other.subscription = Some(crate::model::servers::Subscription {
+            // An unusable target: if the single-flight guard ever lets this
+            // start, the worker fails before any request leaves the app.
+            url: "not a url".into(),
+            ..Default::default()
+        });
+        let other_id = other.id.clone();
+        rig.servers.groups.push(other);
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::Native;
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        let _terminal = park_pending_refresh(&mut harness, &feed);
+        harness.step();
+
+        let repaint = harness.ctx.clone();
+        {
+            let state = harness.state_mut();
+            let (screen, rig) = (&mut state.0, &mut state.1);
+            let mut uictx = rig.ctx();
+            let mut ctx = uictx.servers();
+            screen.start_subscription_fetch(Language::En, repaint, &mut ctx, other_id);
+        }
+        assert_eq!(
+            harness.state().0.subscription_fetch_group.as_deref(),
+            Some(feed.as_str()),
+            "the in-flight fetch keeps ownership; a second start is refused"
+        );
+        assert!(harness.state().0.subscription_fetch.is_pending());
+    }
+
+    #[test]
+    fn cancelling_a_refresh_keeps_the_previous_report_and_stores_no_new_one() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        if let Some(subscription) = rig
+            .servers
+            .groups
+            .iter_mut()
+            .find(|group| group.id == feed)
+            .and_then(|group| group.subscription.as_mut())
+        {
+            subscription.report = Some(crate::model::servers::RefreshReport {
+                added: 7,
+                ..Default::default()
+            });
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_feed_tab(&mut harness);
+        let _terminal = park_pending_refresh(&mut harness, &feed);
+        harness.step();
+        harness.get_by_label(t(Language::En, Key::Cancel)).click();
+        // The click lands in the pending frame; the next frame chooses the
+        // normal toolbar again.
+        harness.step();
+        harness.step();
+
+        assert!(
+            !harness.state().0.subscription_fetch.is_pending(),
+            "Cancel ends the fetch"
+        );
+        assert_eq!(harness.state().0.subscription_fetch_group, None);
+        assert!(
+            harness.state().0.report_view.is_none(),
+            "Cancel stores no report and opens no window"
+        );
+        let subscription = harness
+            .state()
+            .1
+            .servers
+            .groups
+            .iter()
+            .find(|group| group.id == feed)
+            .and_then(|group| group.subscription.as_ref())
+            .expect("the feed group stays");
+        assert_eq!(
+            subscription.report.as_ref().map(|report| report.added),
+            Some(7),
+            "the previous report is kept"
+        );
+        assert!(
+            subscription.last_fetch.is_none(),
+            "no new fetch result was recorded"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvAddServer))
+                .is_some(),
+            "Cancel returns the normal toolbar"
+        );
+    }
+
+    #[test]
+    fn a_terminal_refresh_opens_the_report_window_and_returns_the_toolbar() {
+        let (rig, feed, _at) = subscription_view_rig(None, false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.subscription_fetch = Request::reply(rx);
+            screen.subscription_fetch_group = Some(feed.clone());
+        }
+        tx.send(SubscriptionFetchResult {
+            group_id: feed,
+            outcome: Err(crate::sys::subscription::FetchError::Status(503)),
+        })
+        .expect("deliver the terminal result");
+        harness.run();
+
+        assert!(
+            harness.query_by_label_contains("refused 1").is_some(),
+            "the terminal result opens the report window"
+        );
+        assert!(!harness.state().0.subscription_fetch.is_pending());
+        assert_eq!(harness.state().0.subscription_fetch_group, None);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvAddServer))
+                .is_some(),
+            "the normal commands return with the terminal"
+        );
+    }
+
+    #[test]
+    fn the_latency_probe_keeps_the_toolbar_while_a_refresh_is_pending() {
+        let (rig, feed, _at) = subscription_view_rig(None, false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_feed_tab(&mut harness);
+        let _terminal = park_pending_refresh(&mut harness, &feed);
+        {
+            let screen = &mut harness.state_mut().0;
+            screen.pending_latency_probe = Some(false);
+            screen.latency_probe = Request::park_in_shell();
+        }
+        harness.step();
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvTesting))
+                .is_some(),
+            "the probe stays the active progress surface"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionFetching))
+                .is_none(),
+            "the fetch does not stack a second progress row"
+        );
+        assert_eq!(
+            harness
+                .query_all_by_role(egui::accesskit::Role::ProgressIndicator)
+                .count(),
+            1,
+            "one progress surface owns the toolbar"
+        );
+        assert!(
+            harness
+                .get_by_label(t(Language::En, Key::SrvRefreshSubscription))
+                .accesskit_node()
+                .is_disabled(),
+            "the card stays locked while either operation runs"
+        );
+    }
+
+    #[test]
+    fn a_refresh_path_without_a_socks5_host_fails_loudly_and_starts_no_fetch() {
+        let (mut rig, _feed, _at) = subscription_view_rig(None, false);
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::Socks5;
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_feed_tab(&mut harness);
+        harness
+            .get_by_label(t(Language::En, Key::SrvRefreshSubscription))
+            .click();
+        harness.run();
+
+        assert!(
+            !harness.state().0.subscription_fetch.is_pending(),
+            "an unusable path starts no fetch"
+        );
+        assert_eq!(harness.state().0.subscription_fetch_group, None);
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .status
+                .as_ref()
+                .map(|status| status.text.as_str()),
+            Some(t(Language::En, Key::SrvSocks5HostMissing)),
+            "the path failure is reported with its own key"
+        );
+    }
+
+    #[test]
+    fn a_refresh_uses_the_group_override_path_not_the_global_one() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        // The global path is usable; the group's own SOCKS5 block has no
+        // host, so only a refresh that reads the override can fail.
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::Native;
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::Socks5;
+            subscription.socks5 = crate::model::Socks5Cfg::default();
+        }
+        let mut screen = ServersScreen::default();
+        {
+            let mut uictx = rig.ctx();
+            let mut ctx = uictx.servers();
+            screen.start_subscription_fetch(Language::En, egui::Context::default(), &mut ctx, feed);
+        }
+
+        assert!(
+            !screen.subscription_fetch.is_pending(),
+            "an unusable custom path starts no fetch"
+        );
+        assert_eq!(
+            screen.status.as_ref().map(|status| status.text.as_str()),
+            Some(t(Language::En, Key::SrvSocks5HostMissing)),
+            "the group's SOCKS5 block is the one in force"
+        );
+    }
+
+    #[test]
+    fn a_usable_group_override_replaces_an_unusable_global_path() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        // The global SOCKS5 block cannot produce a carrier; the group's
+        // Native override can, so the refresh must not fail on the global.
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::Socks5;
+        rig.settings.subscription_socks5 = crate::model::Socks5Cfg::default();
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            // An unusable target keeps the worker off the network: the URL
+            // fails before any request leaves the app.
+            subscription.url = "not a url".into();
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::Native;
+        }
+        let mut screen = ServersScreen::default();
+        {
+            let mut uictx = rig.ctx();
+            let mut ctx = uictx.servers();
+            screen.start_subscription_fetch(Language::En, egui::Context::default(), &mut ctx, feed);
+        }
+
+        assert!(
+            screen.status.is_none(),
+            "the override must keep the unusable global path out of force"
+        );
+        assert!(
+            screen.subscription_fetch.is_pending(),
+            "the refresh starts on the group's Native override"
+        );
+    }
+
+    #[test]
+    fn the_subscription_card_and_tab_menu_open_the_raw_view() {
+        let (rig, _feed, at) = subscription_view_rig(Some("vless://body"), false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_raw_from_card(&mut harness);
+        assert!(
+            harness.query_by_label("Feed raw view").is_some(),
+            "the card's Raw command opens the raw view"
+        );
+        assert!(
+            harness
+                .query_by_label(&t_fmt(
+                    Language::En,
+                    Key::SrvSubscriptionSnapshotAt,
+                    &[&super::unix_datetime(at)],
+                ))
+                .is_some(),
+            "the header names the snapshot time"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionRawWarning))
+                .is_some(),
+            "the window warns that the body is raw provider content"
+        );
+        assert!(harness.query_all_by_value("vless://body").next().is_some());
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionBodyPane))
+                .is_some()
+                && harness
+                    .query_by_label(t(Language::En, Key::SrvSubscriptionParsedPane))
+                    .is_some(),
+            "the wide viewer shows both panes side by side"
+        );
+
+        // Close, then open the same view from the group tab's menu.
+        harness.get_by_label(t(Language::En, Key::Close)).click();
+        harness.run();
+        assert!(
+            harness.query_by_label("Feed raw view").is_none(),
+            "the Close control removes the window"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
+            .click_secondary();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvRawSubscription))
+            .click();
+        harness.run();
+        assert!(harness.query_by_label("Feed raw view").is_some());
+    }
+
+    #[test]
+    fn the_raw_view_shows_refused_and_ignored_rows_and_copies_each_pane() {
+        use crate::model::servers::Group;
+        use std::rc::Rc;
+
+        let body = "Alpha body";
+        let (mut rig, feed_id, at) = subscription_view_rig(Some(body), false);
+        let mut parsed = links::BodyParse::default();
+        parsed.entries.push(links::BodyEntry {
+            profile: ServerProfile::new("Alpha", OutboundModel::new(Protocol::Freedom)),
+            raw: "vless://alpha".into(),
+            ignored: Vec::new(),
+        });
+        parsed.refused.push(links::BodyRefusal {
+            raw: "vless://broken".into(),
+            error: "bad entry".into(),
+        });
+        parsed.ignored.push(links::IgnoredSection::parameter(
+            "Alpha",
+            links::CompatibilityParameter {
+                name: "quicSecurity".into(),
+                value: "none".into(),
+                raw: "vless://alpha?quicSecurity=none".into(),
+            },
+        ));
+        let parsed_text = super::parsed_pane_text(&parsed);
+        rig.servers.groups = vec![Group::manual(), {
+            let mut group = Group::new("Feed");
+            group.id = feed_id.clone();
+            group.subscription = Some(crate::model::servers::Subscription {
+                snapshot: Some(crate::model::servers::DecodedSnapshot {
+                    body: body.into(),
+                    truncated: false,
+                    at,
+                    revision: VIEW_REVISION,
+                }),
+                ..Default::default()
+            });
+            group
+        }];
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.state_mut().0.last_subscription_parse =
+            Some((feed_id, VIEW_REVISION, Rc::new(parsed)));
+        harness.run();
+        open_raw_from_card(&mut harness);
+        assert!(
+            harness
+                .query_by_label(&t_fmt(
+                    Language::En,
+                    Key::SrvSubscriptionCounts,
+                    &[&1, &1, &1],
+                ))
+                .is_some(),
+            "the header counts parsed, refused and ignored entries"
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("Alpha")
+                .next()
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("bad entry")
+                .next()
+                .is_some()
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains("quicSecurity=none")
+                .next()
+                .is_some(),
+            "an ignored row shows its parameter=value pair"
+        );
+
+        // The parsed pane owns the second Copy.
+        harness
+            .get_all_by_label(t(Language::En, Key::SrvCopy))
+            .nth(1)
+            .expect("the parsed pane has its own Copy")
+            .click();
+        harness.step();
+        assert_eq!(copied_text(&harness), vec![parsed_text]);
+        harness.run();
+    }
+
+    #[test]
+    fn the_raw_view_shows_truncation_and_an_empty_state() {
+        let (rig, _feed, _at) = subscription_view_rig(Some("cut body"), true);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_raw_from_card(&mut harness);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionTruncated))
+                .is_some(),
+            "a cut snapshot names the truncation"
+        );
+
+        harness.get_by_label(t(Language::En, Key::Close)).click();
+        harness.run();
+        let (rig, _feed, _at) = subscription_view_rig(None, false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_raw_from_card(&mut harness);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionSnapshotEmpty))
+                .is_some(),
+            "no snapshot shows the empty state"
+        );
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvRefreshSubscription))
+                .next()
+                .is_some(),
+            "the empty state offers Refresh"
+        );
+    }
+
+    #[test]
+    fn opening_a_persisted_snapshot_derives_its_entries() {
+        let (rig, feed, _at) = subscription_view_rig(Some("vless://body"), false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        assert!(
+            harness.state().0.last_subscription_parse.is_none(),
+            "no session refresh has supplied a parse yet"
+        );
+        open_raw_from_card(&mut harness);
+        // The persisted snapshot is parsed on a worker; the delivered parse
+        // is cached for the session and populates the pane.
+        for _ in 0..200 {
+            if harness.state().0.last_subscription_parse.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            harness.step();
+        }
+        let cached = harness
+            .state()
+            .0
+            .last_subscription_parse
+            .as_ref()
+            .expect("the worker's parse lands in the session cache");
+        assert_eq!(cached.0, feed);
+        assert_eq!(cached.1, VIEW_REVISION);
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("refused, 0 ignored")
+                .is_some(),
+            "the worker's parse populates the header counts"
+        );
+    }
+
+    /// The raw viewer keys its parse and body-layout caches by the snapshot
+    /// revision, not the display second: a capture stored inside the same
+    /// second but carrying a new revision is parsed again, so the panes never
+    /// show the stale body's result.
+    #[test]
+    fn a_same_second_snapshot_revision_reparses_the_raw_view() {
+        let (rig, feed, at) = subscription_view_rig(Some("vless://first"), false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_raw_from_card(&mut harness);
+        wait_for_parse_revision(&mut harness, VIEW_REVISION);
+
+        let second = "vless://second";
+        let second_revision = {
+            let subscription = harness
+                .state_mut()
+                .1
+                .servers
+                .groups
+                .iter_mut()
+                .find(|group| group.id == feed)
+                .and_then(|group| group.subscription.as_mut())
+                .expect("the rig carries the feed");
+            subscription.store_snapshot(second, at);
+            let snapshot = subscription.snapshot.as_ref().expect("the capture lands");
+            assert_eq!(snapshot.at, at, "the display second is unchanged");
+            snapshot.revision
+        };
+        assert_ne!(
+            second_revision, VIEW_REVISION,
+            "a capture carries a positive revision of its own"
+        );
+
+        wait_for_parse_revision(&mut harness, second_revision);
+        harness.run();
+
+        assert!(
+            harness.query_all_by_value(second).count() >= 2,
+            "both panes show the second snapshot"
+        );
+        assert!(
+            harness.query_all_by_value("vless://first").next().is_none(),
+            "the stale first snapshot is gone from both panes"
+        );
+    }
+
+    #[test]
+    fn dragging_the_raw_view_divider_resizes_the_panes_and_keeps_the_ratio() {
+        use std::rc::Rc;
+
+        let (rig, feed, _at) = subscription_view_rig(Some("vless://body"), false);
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.state_mut().0.last_subscription_parse =
+            Some((feed, VIEW_REVISION, Rc::new(links::BodyParse::default())));
+        harness.run();
+        open_raw_from_card(&mut harness);
+        let divider = harness
+            .get_by_label(t(Language::En, Key::SrvSubscriptionResizePanes))
+            .rect();
+        let parsed_before = harness
+            .query_by_label(t(Language::En, Key::SrvSubscriptionParsedPane))
+            .expect("the parsed pane is on screen")
+            .rect()
+            .min
+            .x;
+        let from = divider.center();
+        harness.hover_at(from);
+        harness.step();
+        harness.drag_at(from);
+        harness.step();
+        let to = from + egui::vec2(90.0, 0.0);
+        harness.hover_at(to);
+        harness.step();
+        harness.drop_at(to);
+        harness.step();
+        harness.run();
+
+        let ratio = harness
+            .state()
+            .0
+            .subscription_view
+            .as_ref()
+            .expect("the view stays open")
+            .split_ratio;
+        assert!(ratio > 0.5, "dragging right widens the body pane: {ratio}");
+        let parsed_after = harness
+            .query_by_label(t(Language::En, Key::SrvSubscriptionParsedPane))
+            .expect("the parsed pane is still on screen")
+            .rect()
+            .min
+            .x;
+        assert!(
+            parsed_after > parsed_before + 20.0,
+            "the parsed pane moved right: {parsed_before} -> {parsed_after}"
+        );
+        // The ratio is held by the open window, not reset by a repaint.
+        harness.run();
+        let after = harness
+            .state()
+            .0
+            .subscription_view
+            .as_ref()
+            .expect("the view stays open")
+            .split_ratio;
+        assert!(
+            (after - ratio).abs() < f32::EPSILON,
+            "the open window keeps the user's ratio"
+        );
+    }
+
+    #[test]
+    fn a_narrow_raw_view_stacks_its_panes() {
+        let (rig, _feed, _at) = subscription_view_rig(Some("vless://body"), false);
+        let mut harness =
+            screen_harness_at(egui::vec2(600.0, 600.0), rig, ServersScreen::default());
+        harness.run();
+        open_raw_from_card(&mut harness);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvSubscriptionBodyPane))
+                .is_some()
+                && harness
+                    .query_by_label(t(Language::En, Key::SrvSubscriptionParsedPane))
+                    .is_some(),
+            "the narrow viewer keeps both panes reachable"
+        );
+    }
+
+    #[test]
+    fn a_narrow_card_keeps_its_information_left_of_its_actions() {
+        let mut rig = UiTestRig::default();
+        let mut group = crate::model::servers::Group::new("A very long feed title");
+        group.subscription = Some(crate::model::servers::Subscription {
+            metadata: Some(crate::model::servers::SubscriptionMetadata {
+                upload: 1_000,
+                download: 2_000,
+                total: 10_000,
+                expire: super::unix_now() + 86_400 * 30,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        let mut harness =
+            screen_harness_at(egui::vec2(520.0, 600.0), rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "A very long feed title")
+            .click();
+        harness.run();
+        let quota = harness
+            .query_by_label_contains("30%")
+            .expect("the quota line is present");
+        let refresh = harness
+            .query_by_label(t(Language::En, Key::SrvRefreshSubscription))
+            .expect("Refresh is present");
+        assert!(
+            quota.rect().max.x <= refresh.rect().min.x,
+            "the information must stop before the reserved action group"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvMoreActions))
+                .is_some(),
+            "the overflow menu stays reachable at a narrow width"
+        );
+    }
+
+    #[test]
+    fn the_card_does_not_repeat_a_short_readable_tab_title() {
+        use crate::model::servers::{Group, Subscription};
+        let mut rig = UiTestRig::default();
+        let mut group = Group::new("Feed");
+        group.subscription = Some(Subscription::default());
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label("Feed").count(),
+            1,
+            "a tab label that fits the strip is not repeated in the card"
+        );
+    }
+
+    #[test]
+    fn the_card_repeats_a_tab_title_that_cannot_fit_the_strip() {
+        use crate::model::servers::{Group, Subscription};
+        let long = "Provider feed with a title too long for the tab strip on one line and still going well beyond the width a single tab can show in this window";
+        let mut rig = UiTestRig::default();
+        let mut group = Group::new(long);
+        group.subscription = Some(Subscription::default());
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        let mut harness =
+            screen_harness_at(egui::vec2(600.0, 600.0), rig, ServersScreen::default());
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, long)
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label(long).count(),
+            2,
+            "the card falls back to the title when the tab label cannot fit"
+        );
     }
 
     /// A rig with the reserved manual group holding `manual` and one `Feed`
@@ -12562,6 +15178,548 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
+    fn the_servers_header_switch_defaults_to_table_and_mounts_the_settings_side() {
+        let mut harness = screen_harness_at(
+            egui::vec2(1100.0, 700.0),
+            UiTestRig::default(),
+            ServersScreen::default(),
+        );
+        harness.run();
+
+        assert_eq!(
+            harness.state().0.side,
+            ServersSide::Table,
+            "the screen must open on Table"
+        );
+        let lang = Language::En;
+        let table_label = t(lang, Key::SrvHeaderTable);
+        let settings_label = t(lang, Key::SrvHeaderSettings);
+        let (table_rect, settings_rect) = {
+            let table = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, table_label)
+                .rect();
+            let settings = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+                .rect();
+            (table, settings)
+        };
+        let viewport = harness.ctx.input(|input| input.viewport_rect());
+        assert!(
+            settings_rect.right() > viewport.right() - 40.0,
+            "the switch must sit at the header's right edge \
+             (settings right {} vs viewport right {})",
+            settings_rect.right(),
+            viewport.right()
+        );
+        assert!(
+            table_rect.left() < settings_rect.left(),
+            "the segments must read Table | Settings"
+        );
+
+        // The Table side keeps the table's toolbar and mounts no settings.
+        assert!(
+            harness.query_by_label(t(lang, Key::SrvAddServer)).is_some(),
+            "the table side keeps its commands"
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsLatencyTest))
+                .is_none(),
+            "the settings controls must not render over the table"
+        );
+
+        // Both segments take keyboard focus.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, table_label)
+            .focus();
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, table_label)
+                .is_focused(),
+            "the Table segment must take keyboard focus"
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+            .focus();
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+                .is_focused(),
+            "the Settings segment must take keyboard focus"
+        );
+
+        // The Settings side mounts the shared component, not a copy.
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, settings_label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.side, ServersSide::Settings);
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsLatencyTest))
+                .is_some()
+                && harness
+                    .query_by_label(t(lang, Key::SettingsSubscriptions))
+                    .is_some(),
+            "the Settings side mounts the latency and subscription sections"
+        );
+        assert!(
+            harness.query_by_label(t(lang, Key::SrvAddServer)).is_none(),
+            "the table leaves while Settings is selected"
+        );
+
+        // Editing a moved control keeps the one dirty/save pipeline.
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("probe URL field")
+            .click();
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .next()
+            .expect("probe URL field keeps focus")
+            .type_text("https://example.com/generate_204");
+        harness.run_steps(4);
+        assert_eq!(
+            harness.state().1.settings.probe_url,
+            "https://example.com/generate_204",
+            "an edit from the Servers mount commits the shared settings"
+        );
+        assert!(
+            harness.state().1.requests.dirty,
+            "an edit from the Servers mount must mark the settings dirty"
+        );
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, table_label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().0.side, ServersSide::Table);
+        assert!(harness.query_by_label(t(lang, Key::SrvAddServer)).is_some());
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsLatencyTest))
+                .is_none()
+        );
+    }
+
+    /// The subscription group whose feed `group` names.
+    fn feed_subscription_mut<'a>(
+        rig: &'a mut UiTestRig,
+        group: &str,
+    ) -> &'a mut crate::model::servers::Subscription {
+        rig.servers
+            .groups
+            .iter_mut()
+            .find(|group_record| group_record.id == group)
+            .and_then(|group_record| group_record.subscription.as_mut())
+            .expect("the feed group carries a subscription")
+    }
+
+    /// Open the feed card's Edit subscription dialog.
+    fn open_subscription_editor(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) {
+        open_feed_tab(harness);
+        harness
+            .get_by_label(t(Language::En, Key::SrvMoreActions))
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvEditSubscription))
+            .click();
+        harness.run();
+    }
+
+    /// Bring the control `label` into the popup's visible area, then click it.
+    /// The dialog body scrolls, so a control below the fold must reach the
+    /// window before a pointer click can land on it.
+    fn scroll_and_click(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+        role: egui::accesskit::Role,
+        label: &str,
+    ) {
+        harness.get_by_role_and_label(role, label).scroll_to_me();
+        harness.run();
+        harness.get_by_role_and_label(role, label).click();
+        harness.run();
+    }
+
+    #[test]
+    fn the_subscription_dialog_shows_the_override_and_the_global_effective_path() {
+        let (mut rig, _feed, _at) = subscription_view_rig(None, false);
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::Socks5;
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        let checkbox = harness.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            t(lang, Key::SrvOutboundOverride),
+        );
+        assert!(
+            !matches!(
+                checkbox.accesskit_node().toggled(),
+                Some(egui::accesskit::Toggled::True)
+            ),
+            "the override starts off for a group without one"
+        );
+        let socks5_label = t(lang, Key::SettingsPathSocks5);
+        assert!(
+            harness
+                .query_by_label(&t_fmt(lang, Key::SrvOutboundUsingGlobal, &[&socks5_label],))
+                .is_some(),
+            "the dialog must name the effective global path"
+        );
+    }
+
+    #[test]
+    fn enabling_the_override_writes_the_subscription_fields() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        rig.settings.mode = Mode::Tun;
+        rig.phase = crate::rt::CorePhase::Running;
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::Native;
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::CheckBox,
+            t(lang, Key::SrvOutboundOverride),
+        );
+        let custom_label = t_fmt(
+            lang,
+            Key::SrvOutboundCustom,
+            &[&t(lang, Key::SettingsPathBindNic)],
+        );
+        assert!(
+            harness.query_by_label(&custom_label).is_some(),
+            "the enabled override shows the custom path in force"
+        );
+
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::Button,
+            t(lang, Key::SettingsPathSocks5),
+        );
+        replace_field_text(
+            &mut harness,
+            t(lang, Key::SettingsSocks5Host),
+            "proxy.example",
+        );
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::Button,
+            t(lang, Key::SrvSaveSubscription),
+        );
+
+        let subscription = harness
+            .state()
+            .1
+            .servers
+            .groups
+            .iter()
+            .find(|group| group.id == feed)
+            .and_then(|group| group.subscription.as_ref())
+            .expect("the feed group stays");
+        assert!(
+            subscription.outbound_custom,
+            "enabling the override is saved"
+        );
+        assert_eq!(
+            subscription.outbound_path,
+            crate::model::settings::RefreshPath::Socks5
+        );
+        assert_eq!(subscription.socks5.host, "proxy.example");
+        assert!(
+            harness.state().1.requests.dirty,
+            "the dialog commit keeps the dirty pipeline"
+        );
+    }
+
+    #[test]
+    fn the_override_disables_bind_nic_while_tun_is_off_and_replaces_it_with_native() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        rig.settings.mode = Mode::Off;
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::BindNic;
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        let bind_nic = t(lang, Key::SettingsPathBindNic);
+        let native = t(lang, Key::SettingsPathNative);
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, bind_nic)
+                .accesskit_node()
+                .is_disabled(),
+            "Bind NIC cannot bind while TUN mode is off"
+        );
+        assert!(
+            !harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, native)
+                .accesskit_node()
+                .is_disabled(),
+            "Native stays available"
+        );
+        assert!(
+            harness
+                .query_by_label(&t_fmt(
+                    lang,
+                    Key::SrvOutboundCustom,
+                    &[&t(lang, Key::SettingsPathNative)],
+                ))
+                .is_some(),
+            "the effective value reads Native while TUN is off"
+        );
+        let draft = harness
+            .state()
+            .0
+            .group_dialog
+            .as_ref()
+            .expect("the dialog is open");
+        assert_eq!(
+            draft.outbound_path,
+            crate::model::settings::RefreshPath::BindNic,
+            "the stored preference must survive a TUN-off frame"
+        );
+
+        scroll_and_click(&mut harness, egui::accesskit::Role::Button, native);
+        assert_eq!(
+            harness
+                .state()
+                .0
+                .group_dialog
+                .as_ref()
+                .expect("the dialog is open")
+                .outbound_path,
+            crate::model::settings::RefreshPath::Native,
+            "selecting Native explicitly replaces the stored preference"
+        );
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::Button,
+            t(lang, Key::SrvSaveSubscription),
+        );
+        let subscription = harness
+            .state()
+            .1
+            .servers
+            .groups
+            .iter()
+            .find(|group| group.id == feed)
+            .and_then(|group| group.subscription.as_ref())
+            .expect("the feed group stays");
+        assert_eq!(
+            subscription.outbound_path,
+            crate::model::settings::RefreshPath::Native
+        );
+    }
+
+    #[test]
+    fn the_override_controls_take_keyboard_focus() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        rig.settings.mode = Mode::Tun;
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::Socks5;
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SettingsPathSocks5),
+            )
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SettingsPathSocks5),
+            )
+            .focus();
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(lang, Key::SettingsPathSocks5),
+                )
+                .is_focused(),
+            "a path segment in the override must take keyboard focus"
+        );
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SettingsSocks5RevealPassword),
+            )
+            .scroll_to_me();
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SettingsSocks5RevealPassword),
+            )
+            .focus();
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(lang, Key::SettingsSocks5RevealPassword),
+                )
+                .is_focused(),
+            "the dialog's reveal control must take keyboard focus"
+        );
+    }
+
+    #[test]
+    fn the_override_password_starts_masked_and_reveals_in_the_dialog() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::Socks5;
+            subscription.socks5 = crate::model::Socks5Cfg {
+                host: "proxy.example".into(),
+                port: 1080,
+                username: Some("alice".into()),
+                password: Some("hunter2".into()),
+            };
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        assert!(
+            !harness
+                .get_all_by_role(egui::accesskit::Role::TextInput)
+                .any(|node| node.value().as_deref() == Some("hunter2")),
+            "the stored password must stay out of reach while masked"
+        );
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::Label)
+                .all(|node| node.value().as_deref() != Some("hunter2")),
+            "no label may expose the masked password"
+        );
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::Button,
+            t(Language::En, Key::SettingsSocks5RevealPassword),
+        );
+        assert!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::TextInput)
+                .any(|node| node.value().as_deref() == Some("hunter2")),
+            "revealing shows the stored password in the dialog's field"
+        );
+    }
+
+    #[test]
+    fn the_override_save_writes_the_port_and_optional_credentials() {
+        use crate::model::servers::{Group, GroupKind, Subscription};
+        let mut group = Group::new("Feed");
+        group.subscription = Some(Subscription {
+            url: "https://example.com/sub".into(),
+            ..Default::default()
+        });
+        let id = group.id.clone();
+        let mut servers = crate::model::ServersFile::default();
+        servers.groups.push(group);
+        let draft = GroupDraft {
+            editing: Some(id.clone()),
+            kind: GroupKind::Subscription,
+            title: "Feed".into(),
+            url: "https://example.com/sub".into(),
+            outbound_custom: true,
+            outbound_path: crate::model::settings::RefreshPath::Socks5,
+            socks5_host: "proxy.example".into(),
+            socks5_port: 1080,
+            socks5_username: "alice".into(),
+            socks5_password: " s3cret ".into(),
+            ..GroupDraft::default()
+        };
+        let fetch = ServersScreen::commit_group_dialog(
+            draft,
+            &mut servers,
+            &mut crate::model::Settings::default(),
+        );
+        assert!(fetch.is_none(), "an edited group never starts a fetch");
+        let subscription = servers
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .and_then(|group| group.subscription.as_ref())
+            .expect("the subscription stays");
+        assert!(subscription.outbound_custom);
+        assert_eq!(
+            subscription.socks5,
+            crate::model::Socks5Cfg {
+                host: "proxy.example".into(),
+                port: 1080,
+                username: Some("alice".into()),
+                password: Some(" s3cret ".into()),
+            },
+            "a password keeps its spaces, as the global field does"
+        );
+
+        // A blank optional field is stored as absent, and turning the
+        // override off leaves only the global block in force.
+        let draft = GroupDraft {
+            editing: Some(id.clone()),
+            kind: GroupKind::Subscription,
+            title: "Feed".into(),
+            url: "https://example.com/sub".into(),
+            outbound_custom: false,
+            outbound_path: crate::model::settings::RefreshPath::Socks5,
+            socks5_host: " ".into(),
+            socks5_port: 1080,
+            socks5_username: String::new(),
+            socks5_password: "   ".into(),
+            ..GroupDraft::default()
+        };
+        let fetch = ServersScreen::commit_group_dialog(
+            draft,
+            &mut servers,
+            &mut crate::model::Settings::default(),
+        );
+        assert!(fetch.is_none(), "an edited group never starts a fetch");
+        let subscription = servers
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .and_then(|group| group.subscription.as_ref())
+            .expect("the subscription stays");
+        assert!(!subscription.outbound_custom);
+        assert_eq!(
+            subscription.outbound_path,
+            crate::model::settings::RefreshPath::default(),
+            "a disabled override clears the stored path"
+        );
+        assert_eq!(
+            subscription.socks5,
+            crate::model::Socks5Cfg::default(),
+            "a disabled override clears the stored carrier"
+        );
+    }
+
+    #[test]
     fn an_edited_draft_cannot_convert_a_manual_group_into_a_subscription() {
         use crate::model::servers::{Group, GroupKind};
         let mine = Group::new("Mine");
@@ -12958,28 +16116,74 @@ Authentication: ML-KEM-768, Post-Quantum
             .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
             .click();
         harness.run();
+        // One compact row: Refresh and the overflow menu are visible; the
+        // routine and destructive commands live in the menu. The tab already
+        // names the group, so the title is not repeated.
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvRefreshSubscription))
+                .is_some(),
+            "the card offers Refresh"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvMoreActions))
+                .is_some(),
+            "the card offers the overflow menu"
+        );
+        assert_eq!(
+            harness.get_all_by_label("Feed").count(),
+            1,
+            "the card must not repeat the tab title"
+        );
         for label in [
-            Key::SrvRefreshSubscription,
             Key::SrvShowReport,
             Key::SrvDeleteGroup,
             Key::SrvEditSubscription,
+            Key::SrvRawSubscription,
         ] {
             assert!(
-                harness.query_by_label(t(Language::En, label)).is_some(),
-                "the subscription card must offer {label:?}"
+                harness.query_by_label(t(Language::En, label)).is_none(),
+                "{label:?} belongs in the overflow menu, not the card row"
             );
         }
         assert!(
             harness.query_by_label_contains("30%").is_some(),
             "the card shows the quota use"
         );
+        // The provider hint is a hover, not a row.
+        assert!(
+            harness.query_by_label_contains("12 h").is_none(),
+            "the provider hint must not occupy the card row"
+        );
+        harness
+            .query_by_label("?")
+            .expect("the update hint icon")
+            .hover();
+        harness.run();
+        harness.run();
         assert!(
             harness.query_by_label_contains("12 h").is_some(),
-            "the card shows the provider's update hint"
+            "the update hint icon carries the provider hint"
         );
 
-        // The name is text; the edit command is its own control, and the
-        // command opens the group dialog.
+        harness
+            .get_by_label(t(Language::En, Key::SrvMoreActions))
+            .click();
+        harness.run();
+        for label in [
+            Key::SrvRawSubscription,
+            Key::SrvEditSubscription,
+            Key::SrvShowReport,
+            Key::SrvDeleteGroup,
+        ] {
+            assert!(
+                harness.query_by_label(t(Language::En, label)).is_some(),
+                "the overflow menu must offer {label:?}"
+            );
+        }
+
+        // The edit command opens the group dialog.
         harness
             .get_by_label(t(Language::En, Key::SrvEditSubscription))
             .click();
@@ -13278,8 +16482,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the latency value must end on its column header's right edge ({cell} vs {header})"
         );
         let header = left(&harness, t(Language::En, Key::SrvColEnabled));
-        // The toolbar carries checkboxes too (the probe options), and they
-        // render before the table: the row's switch is the last one.
+        // The row's switch is the only checkbox the table renders.
         let switch = harness
             .query_all_by_role(egui::accesskit::Role::CheckBox)
             .last()
@@ -13852,6 +17055,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         joined_below: false,
                         active: false,
                         hop: false,
+                        movable: false,
                         dialers: &[],
                         frozen: false,
                         switch: RowSwitch {
@@ -13924,6 +17128,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     joined_below: false,
                     active: false,
                     hop: false,
+                    movable: false,
                     dialers: &[],
                     frozen: false,
                     switch: RowSwitch {
@@ -13968,6 +17173,7 @@ Authentication: ML-KEM-768, Post-Quantum
                         joined_below: false,
                         active: false,
                         hop: false,
+                        movable: false,
                         dialers: &[],
                         frozen: false,
                         switch: RowSwitch {
@@ -14019,6 +17225,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     joined_below: false,
                     active: false,
                     hop: false,
+                    movable: false,
                     dialers: &[],
                     frozen: false,
                     switch: RowSwitch {
@@ -14170,6 +17377,136 @@ Authentication: ML-KEM-768, Post-Quantum
             .find(|node| (node.rect().center().y - row_y).abs() < 2.0)
             .unwrap_or_else(|| panic!("the {name:?} row must render a switch"))
             .click();
+    }
+
+    /// One enabled profile in its own group: its block holds no other row, so
+    /// it cannot move.
+    fn single_server_group_rig() -> UiTestRig {
+        use crate::model::servers::Group;
+        let mut rig = UiTestRig::default();
+        let group = Group::new("Solo");
+        let group_id = group.id.clone();
+        let mut profile = ServerProfile::new("Solo", OutboundModel::new(Protocol::Freedom));
+        profile.group = group_id;
+        profile.enabled = true;
+        rig.servers.profiles = vec![profile];
+        rig.servers.groups.push(group);
+        rig.servers.hydrate_group_titles();
+        rig
+    }
+
+    #[test]
+    fn only_movable_emitted_rows_show_the_drag_handle() {
+        // Three enabled manual rows: every row has a movable sibling.
+        let mut harness = drag_harness(drag_rig());
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label(DRAG_HANDLE).count(),
+            3,
+            "every movable Emitted row shows the handle"
+        );
+
+        // The active route and the chain-only hop cannot move.
+        let mut harness = drag_harness(hop_drag_rig());
+        harness.run();
+        assert_eq!(
+            harness.get_all_by_label(DRAG_HANDLE).count(),
+            2,
+            "the active row and the hop show no handle"
+        );
+
+        // A group block of one row cannot move either.
+        let mut harness = drag_harness(single_server_group_rig());
+        harness.run();
+        assert!(
+            harness.query_by_label(DRAG_HANDLE).is_none(),
+            "a single-server group's row shows no handle"
+        );
+
+        // The other tabs never advertise a row drag.
+        let mut harness = drag_harness(drag_rig());
+        harness.run();
+        for tab in [
+            t(Language::En, Key::SrvTabManual),
+            t(Language::En, Key::SrvTabAll),
+        ] {
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, tab)
+                .click();
+            harness.run();
+            assert!(
+                harness.query_by_label(DRAG_HANDLE).is_none(),
+                "the {tab:?} tab shows no row drag handle"
+            );
+        }
+
+        let mut harness = drag_harness(grouped_drag_rig());
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Feed")
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label(DRAG_HANDLE).is_none(),
+            "a group tab shows no row drag handle"
+        );
+    }
+
+    #[test]
+    fn a_locked_or_non_emitted_row_produces_no_drag_payload() {
+        // A manual tab: the gesture neither moves a row nor dirties the model.
+        let mut harness = drag_harness(drag_rig());
+        harness.run();
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvTabManual),
+            )
+            .click();
+        harness.run();
+        let alpha = harness.get_by_label("Alpha").rect();
+        let charlie = harness.get_by_label("Charlie").rect();
+        drag_list_row(
+            &mut harness,
+            alpha.center(),
+            egui::pos2(charlie.center().x, charlie.bottom() + 2.0),
+        );
+        assert_eq!(
+            harness
+                .state()
+                .1
+                .servers
+                .profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "Bravo", "Charlie"],
+            "a Manual row cannot be reordered"
+        );
+        assert!(
+            !harness.state().1.requests.dirty,
+            "a gesture that produced no payload changes nothing"
+        );
+
+        // A group block of one row has no destination of its own either.
+        let mut harness = drag_harness(single_server_group_rig());
+        harness.run();
+        let solo = harness
+            .get_all_by_label("Solo")
+            .last()
+            .expect("the row named Solo")
+            .rect();
+        drag_list_row(
+            &mut harness,
+            solo.center(),
+            egui::pos2(solo.center().x, solo.bottom() + 2.0),
+        );
+        assert_eq!(
+            harness.state().1.servers.profiles[0].name,
+            "Solo",
+            "the sole row of a group cannot move"
+        );
+        assert!(!harness.state().1.requests.dirty);
     }
 
     #[test]
@@ -14604,22 +17941,6 @@ Authentication: ML-KEM-768, Post-Quantum
             ["Alpha", "Bravo", "Charlie"]
         );
         assert!(!harness.state().1.requests.dirty);
-    }
-
-    /// The binding switch saves with the UI settings.
-    #[test]
-    fn the_toolbar_switch_turns_the_interface_binding_off() {
-        let mut harness = screen_harness(drag_rig(), ServersScreen::default());
-        harness.run();
-        assert!(harness.state().1.settings.latency_test_bind_interface);
-        harness
-            .get_by_label(t(Language::En, Key::SrvBindProbeInterface))
-            .click();
-        harness.run();
-        assert!(
-            !harness.state().1.settings.latency_test_bind_interface,
-            "the checkbox must flip the saved option"
-        );
     }
 
     /// The toolbar sets the route from a single selection: disabled with no
@@ -15119,6 +18440,184 @@ Authentication: ML-KEM-768, Post-Quantum
                 .is_some(),
             "the toolbar's commands must be back"
         );
+    }
+
+    #[test]
+    fn a_latency_test_keeps_the_scrolled_list_in_place_on_the_first_run() {
+        let (rig, _ids) = seeded_rig(64);
+        let mut harness =
+            screen_harness_at(egui::vec2(1100.0, 700.0), rig, ServersScreen::default());
+        harness.run();
+        scroll_to_middle(&mut harness);
+        let (top, rect) = top_laid_out_server(&harness).expect("the middle band shows rows");
+        assert!(top > 0, "the list must be scrolled off the first row");
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvDismissFeedback))
+                .is_none(),
+            "the first run starts with no feedback row"
+        );
+
+        harness
+            .get_by_label(t(Language::En, Key::TestLatency))
+            .click();
+        harness.run_steps(3);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvTesting))
+                .is_some(),
+            "the test owns the toolbar"
+        );
+        let (during, during_rect) = top_laid_out_server(&harness).expect("the band stays");
+        assert_eq!(
+            during, top,
+            "the pending toolbar must not re-sort or reset the list"
+        );
+        assert!(
+            (during_rect.top() - rect.top()).abs() < 0.5,
+            "the pending toolbar must keep the normal height ({} -> {})",
+            rect.top(),
+            during_rect.top()
+        );
+
+        let feedback = finish_probe_cancelled(&mut harness);
+        harness.run();
+        assert!(
+            harness.query_by_label(&feedback).is_some(),
+            "the result replaces the feedback text"
+        );
+        let (after, _) = top_laid_out_server(&harness).expect("the band stays");
+        assert_eq!(
+            after, top,
+            "the result must not reset the scroll offset to the first row"
+        );
+
+        // Removing the row above the table returns the exact frame the test
+        // ran against: the offset survived both the pending and terminal
+        // layouts, which is what the unstable id used to break.
+        harness
+            .get_by_label(t(Language::En, Key::SrvDismissFeedback))
+            .click();
+        harness.run();
+        let (dismissed, dismissed_rect) = top_laid_out_server(&harness).expect("the band stays");
+        assert_eq!(dismissed, top);
+        assert!(
+            (dismissed_rect.top() - rect.top()).abs() < 0.5,
+            "the scroll offset survived completion"
+        );
+    }
+
+    #[test]
+    fn a_latency_test_keeps_the_previous_feedback_and_the_scrolled_list() {
+        let (rig, _ids) = seeded_rig(64);
+        let mut harness = screen_harness_at(
+            egui::vec2(1100.0, 700.0),
+            rig,
+            ServersScreen {
+                latency_probe_feedback: Some((
+                    FeedbackLevel::Ok,
+                    "Server 'Seed' responded in 23 ms.".to_owned(),
+                )),
+                ..ServersScreen::default()
+            },
+        );
+        harness.run();
+        scroll_to_middle(&mut harness);
+        let (top, rect) = top_laid_out_server(&harness).expect("the middle band shows rows");
+        assert!(top > 0, "the list must be scrolled off the first row");
+        let previous = "Server 'Seed' responded in 23 ms.";
+        assert!(harness.query_by_label(previous).is_some());
+
+        harness
+            .get_by_label(t(Language::En, Key::TestLatency))
+            .click();
+        harness.run_steps(3);
+        assert!(
+            harness.query_by_label(previous).is_some(),
+            "starting a test must not clear the mounted feedback row"
+        );
+        let (during, during_rect) = top_laid_out_server(&harness).expect("the band stays");
+        assert_eq!(during, top);
+        assert!(
+            (during_rect.top() - rect.top()).abs() < 0.5,
+            "the feedback row and toolbar keep their height while the test runs"
+        );
+
+        let feedback = finish_probe_cancelled(&mut harness);
+        harness.run();
+        assert!(
+            harness.query_by_label(previous).is_none(),
+            "the new result replaces the previous verdict"
+        );
+        assert!(harness.query_by_label(&feedback).is_some());
+        let (after, after_rect) = top_laid_out_server(&harness).expect("the band stays");
+        assert_eq!(
+            after, top,
+            "the result must not reset the scroll offset to the first row"
+        );
+        assert!(
+            (after_rect.top() - rect.top()).abs() < 0.5,
+            "the feedback row keeps its height when the result lands"
+        );
+    }
+
+    /// Park one cancelled probe result and return the feedback text it
+    /// renders, so the tests can look for the terminal row.
+    fn finish_probe_cancelled(
+        harness: &mut Harness<'static, (ServersScreen, UiTestRig)>,
+    ) -> String {
+        let tags: Vec<String> = harness
+            .state()
+            .1
+            .servers
+            .profiles
+            .iter()
+            .map(ServerProfile::tag)
+            .collect();
+        let total = tags.len();
+        harness
+            .state_mut()
+            .1
+            .probe_feedback
+            .park(LatencyProbeResult {
+                tags,
+                result: Err(ProbeFailure::plain(Diag::new(Key::ProbeCancelledByUser))),
+                progress: crate::rt::ProbeProgress { done: 0, total },
+            });
+        t_fmt(Language::En, Key::SrvLatencyCancelled, &[&0, &total])
+    }
+
+    /// The virtualized band's first `Server {i:02}` row and its rect.
+    fn top_laid_out_server(
+        harness: &Harness<'static, (ServersScreen, UiTestRig)>,
+    ) -> Option<(usize, egui::Rect)> {
+        (0..harness.state().1.servers.profiles.len()).find_map(|index| {
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    &format!("Server {index:02}"),
+                )
+                .map(|node| (index, node.rect()))
+        })
+    }
+
+    /// Wheel the pointer over the list until a middle band is on screen.
+    fn scroll_to_middle(harness: &mut Harness<'static, (ServersScreen, UiTestRig)>) {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(egui::pos2(100.0, 300.0)));
+        for _ in 0..6 {
+            harness.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -100.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+        harness.run_steps(40);
     }
 
     #[test]
@@ -17728,6 +21227,87 @@ Authentication: ML-KEM-768, Post-Quantum
             unreachable!();
         };
         assert_eq!(settings.level, Some(u32::MAX));
+    }
+
+    /// The basic tab masks the catalogued credential rows under the secrets
+    /// class and the address/port rows under the server-information class, so
+    /// each control hides exactly its own fields and Reveal shows them again.
+    #[test]
+    fn the_basic_tab_masks_credentials_and_server_information_by_class() {
+        let mut profile = ServerProfile::new("trojan", OutboundModel::new(Protocol::Trojan));
+        let ProtocolSettings::Trojan(settings) = &mut profile.outbound.settings else {
+            unreachable!("the fixture is Trojan");
+        };
+        settings.address = "203.0.113.7".into();
+        settings.port = 443;
+        settings.password = "trojan-secret".into();
+        let address = settings.address.clone();
+        let password = settings.password.clone();
+
+        let mut screen = ServersScreen::default();
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ = screen.basic_tab_for_target(
+                ui,
+                Language::En,
+                &mut profile,
+                None,
+                &[],
+                crate::ui::widgets::Mask {
+                    secrets: true,
+                    server_info: true,
+                },
+            );
+        });
+        harness.run();
+        assert!(
+            harness.query_all_by_value(&password).next().is_none()
+                && harness.query_all_by_value(&address).next().is_none(),
+            "both classes mask their rows while the screen hides them"
+        );
+        assert!(
+            harness
+                .query_all_by_label_contains(&address)
+                .next()
+                .is_none(),
+            "the hidden address must not leak through a label either"
+        );
+        drop(harness);
+
+        // Revealing the secrets leaves the server information hidden: the
+        // classes are independent.
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ = screen.basic_tab_for_target(
+                ui,
+                Language::En,
+                &mut profile,
+                None,
+                &[],
+                crate::ui::widgets::Mask {
+                    secrets: false,
+                    server_info: true,
+                },
+            );
+        });
+        harness.run();
+        assert!(
+            harness.query_all_by_value(&password).next().is_some(),
+            "Reveal shows the catalogued password"
+        );
+        assert!(
+            harness.query_all_by_value(&address).next().is_none(),
+            "the address stays hidden while server information is hidden"
+        );
+        drop(harness);
+
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ =
+                screen.basic_tab_for_target(ui, Language::En, &mut profile, None, &[], revealed());
+        });
+        harness.run();
+        assert!(
+            harness.query_all_by_value(&address).next().is_some(),
+            "Reveal shows the address too"
+        );
     }
 
     #[test]
@@ -21360,7 +24940,7 @@ Authentication: ML-KEM-768, Post-Quantum
         );
 
         // Test latency in the row's menu sends exactly that profile. It runs
-        // last: the pending probe's toolbar row shifts the table below.
+        // last: the pending probe owns the toolbar and freezes the rows.
         harness
             .query_by_role_and_label(egui::accesskit::Role::Button, "Server 63")
             .expect("the last row is laid out")

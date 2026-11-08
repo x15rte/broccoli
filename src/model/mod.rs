@@ -43,7 +43,7 @@ pub use routing::{
 };
 pub use safety::{HazardClass, SafetyCode, SafetyFinding};
 pub use servers::{Group, ProbeOutcome, ProbeSource, ProbeVerdict, ServerProfile, ServersFile};
-pub use settings::{Mode, PolicyCfg, PolicyLevelCfg, Settings};
+pub use settings::{Mode, PolicyCfg, PolicyLevelCfg, ProbePath, RefreshPath, Settings, Socks5Cfg};
 pub use stream::{
     CustomSockopt, FINALMASK_XDNS_DEFAULT_TYPES, FinalmaskFilter, FinalmaskFragment,
     FinalmaskHeaderCustomTcp, FinalmaskHeaderCustomUdp, FinalmaskMkcpLegacy, FinalmaskModel,

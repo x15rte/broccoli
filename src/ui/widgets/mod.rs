@@ -228,9 +228,99 @@ pub fn context_revision(value: impl std::hash::Hash) -> u64 {
     hasher.finish()
 }
 
+macro_rules! secret_fields {
+    ($(
+        $(#[$meta:meta])*
+        $variant:ident => $key:literal
+    ),+ $(,)?) => {
+        /// One credential field the editors mask and the read-only JSON view
+        /// hides.
+        ///
+        /// The catalog is the one spelling of the credential vocabulary: an
+        /// editor row names the entry it renders, and the JSON viewer
+        /// (`ui::json`) derives the keys and paths it masks by matching every
+        /// JSON object key against [`Self::matches`]. A new credential is one
+        /// entry here plus its editor row — the JSON view keeps no list of its
+        /// own that could drift and let it leak.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum SecretField {
+            $(
+                $(#[$meta])*
+                $variant,
+            )+
+        }
+
+        impl SecretField {
+            /// Every catalogued credential: the vocabulary the editors mask
+            /// and the JSON view hides.
+            pub const ALL: &[SecretField] = &[$(SecretField::$variant),+];
+
+            /// The field's wire spelling.
+            fn key(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $key,)+
+                }
+            }
+        }
+    };
+}
+
+secret_fields! {
+    /// A protocol's dial credential (`outbound.settings.id`). A profile's own
+    /// top-level `id` is its identity, not a credential, and stays visible.
+    Id => "id",
+    /// An object's `password`.
+    Password => "password",
+    /// SOCKS and HTTP's `pass` spelling.
+    Pass => "pass",
+    /// A settings object's `user` account name.
+    User => "user",
+    /// An auth object's `username`.
+    Username => "username",
+    /// Hysteria's `auth` token.
+    Auth => "auth",
+    /// WireGuard's `secretKey`.
+    SecretKey => "secretKey",
+    /// A PEM `privateKey` (WARP, REALITY).
+    PrivateKey => "privateKey",
+    /// A WireGuard peer's `preSharedKey`.
+    PreSharedKey => "preSharedKey",
+    /// Xdrive's `secrets` list.
+    Secrets => "secrets",
+}
+
+impl SecretField {
+    /// Whether the object key `key`, found under the object path `path`, is
+    /// this field. `path` names the objects enclosing the one that carries
+    /// `key`, outermost first.
+    ///
+    /// A few fields are scoped to the object that gives them meaning: `user`
+    /// and `username` are credentials only inside a `settings`, `auth`, or
+    /// `masqueSettings` object, `auth` only inside Hysteria's settings, and a
+    /// protocol `id` only under `outbound.settings`. Every other entry matches
+    /// wherever its spelling appears.
+    pub fn matches(self, path: &[String], key: &str) -> bool {
+        if key != self.key() {
+            return false;
+        }
+        match self {
+            SecretField::Id => path.len() == 2 && path[0] == "outbound" && path[1] == "settings",
+            SecretField::User | SecretField::Username => path.last().is_some_and(|parent| {
+                matches!(parent.as_str(), "settings" | "auth" | "masqueSettings")
+            }),
+            SecretField::Auth => path
+                .last()
+                .is_some_and(|parent| parent == "hysteriaSettings"),
+            _ => true,
+        }
+    }
+}
+
 /// The two visibility classes one screen can mask this frame. A screen derives
 /// it once from its own reveal control and passes the class a field belongs to,
-/// so a field cannot disagree with the control about what it hides.
+/// so a field cannot disagree with the control about what it hides. A
+/// credential row asks [`Self::hides`] with its catalogued [`SecretField`], so
+/// the row and the JSON view share one vocabulary.
 #[derive(Clone, Copy)]
 pub struct Mask {
     /// Secret field values: the credentials a profile dials with.
@@ -238,6 +328,16 @@ pub struct Mask {
     /// Server information: a profile's address, its port, and a WireGuard peer
     /// endpoint.
     pub server_info: bool,
+}
+
+impl Mask {
+    /// Whether the catalogued credential `field` is hidden this frame. Every
+    /// entry is a credential, so the secrets class hides them all; naming the
+    /// entry at the row keeps the form's vocabulary and the JSON view's on the
+    /// one catalog.
+    pub fn hides(self, _field: SecretField) -> bool {
+        self.secrets
+    }
 }
 
 /// The per-screen reveal control: one toggle that shows what the screen hides —

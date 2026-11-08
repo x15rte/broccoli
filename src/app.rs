@@ -2585,6 +2585,7 @@ impl eframe::App for BroccoliApp {
         // The nav rail owns its panel and its own memo for the readout; the
         // shell supplies the frame's facts and hands the screen it owns back
         // to be written.
+        let previous_screen = self.screen;
         ui::nav::show_nav_panel(
             ui,
             &ui::nav::NavRailState {
@@ -2596,9 +2597,18 @@ impl eframe::App for BroccoliApp {
             &mut self.screen,
             &mut self.nav,
         );
+        if self.screen != previous_screen {
+            match self.screen {
+                ui::Screen::Servers => self.servers_ui.enter(),
+                ui::Screen::Routing => self.routing.enter(),
+                _ => {}
+            }
+        }
 
         // Central screen dispatch. Scroll ownership: dashboard/servers/logs
-        // manage their own scrolling; the rest get an outer ScrollArea.
+        // manage their own scrolling; routing owns its in-screen body scroll
+        // so its fixed `Rules | Settings` header stays put; the rest get an
+        // outer ScrollArea.
         let operation = self.operation.as_ref().map(|held| held.kind);
         egui::CentralPanel::default().show(ui, |ui| {
             let snapshot = &self.ui_ctx_snapshot;
@@ -2631,7 +2641,8 @@ impl eframe::App for BroccoliApp {
                 Screen::ProfilePreview => {
                     self.profile_preview.show(ui, &mut uictx.profile_preview())
                 }
-                Screen::Routing => scroll(ui, |ui| self.routing.show(ui, &mut uictx.routing())),
+                // Routing draws its own fixed header and body scroll.
+                Screen::Routing => self.routing.show(ui, &mut uictx.routing()),
                 Screen::Dns => scroll(ui, |ui| self.dns.show(ui, &mut uictx.dns())),
                 Screen::Inbounds => scroll(ui, |ui| self.inbounds.show(ui, &mut uictx.inbounds())),
                 Screen::Tun => scroll(ui, |ui| self.tun.show(ui, &mut uictx.tun())),

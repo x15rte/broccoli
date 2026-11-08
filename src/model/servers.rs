@@ -1,12 +1,13 @@
 //! Server profiles (GUI state: %APPDATA%\broccoli\state\servers.json).
 
 use super::outbound::OutboundModel;
-use super::settings::Settings;
+use super::settings::{RefreshPath, Settings, Socks5Cfg};
 use super::{StateLoadError, load_state, save_state, skip_empty_vec, skip_false};
 use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The reserved id and title of the group hand-added servers live in. The
 /// group always exists, sorts first, and can be neither renamed nor deleted.
@@ -101,6 +102,20 @@ pub struct Subscription {
     /// The custom User-Agent, meaningful only when `user_agent_custom` is set.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub user_agent: String,
+    /// Whether the group replaces the global refresh outbound path and its
+    /// SOCKS5 fields with its own block. The override replaces the mode and
+    /// the SOCKS5 fields together, the same way a custom User-Agent replaces
+    /// the global one.
+    #[serde(default, skip_serializing_if = "skip_false")]
+    pub outbound_custom: bool,
+    /// The custom refresh outbound path, meaningful only when
+    /// `outbound_custom` is set. Absent loads as the global default, Bind NIC.
+    #[serde(skip_serializing_if = "skip_default_refresh_path")]
+    pub outbound_path: RefreshPath,
+    /// The custom SOCKS5 carrier the override's SOCKS5 path dials through,
+    /// meaningful only when `outbound_custom` is set.
+    #[serde(skip_serializing_if = "skip_default_socks5")]
+    pub socks5: Socks5Cfg,
     /// True while the title came from the add dialog's default rather than
     /// the user; a provider title may name the group only then.
     #[serde(default, skip_serializing_if = "skip_false")]
@@ -115,6 +130,10 @@ pub struct Subscription {
     /// The last refresh's report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report: Option<RefreshReport>,
+    /// The last successful fetch's decoded body, kept for the raw viewer. A
+    /// failed fetch leaves the previous snapshot in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<DecodedSnapshot>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -130,6 +149,105 @@ impl Subscription {
             global.to_owned()
         }
     }
+    /// The refresh outbound path this group's fetch uses: the custom path when
+    /// the group enabled its override, the global path otherwise. The caller
+    /// then applies the live TUN gate, exactly as it does for the global value.
+    pub fn effective_refresh_path(&self, global: RefreshPath) -> RefreshPath {
+        if self.outbound_custom {
+            self.outbound_path
+        } else {
+            global
+        }
+    }
+    /// The SOCKS5 fields this group's fetch uses: the custom block when the
+    /// group enabled its override, the global block otherwise. They travel
+    /// with the path, never mixed field by field.
+    pub fn effective_socks5<'a>(&'a self, global: &'a Socks5Cfg) -> &'a Socks5Cfg {
+        if self.outbound_custom {
+            &self.socks5
+        } else {
+            global
+        }
+    }
+    /// Store the decoded body of a successful fetch: the previous snapshot is
+    /// replaced, and an oversized body is cut at [`MAX_SNAPSHOT_BYTES`] and
+    /// marked truncated. The stored snapshot carries a fresh session revision,
+    /// so the raw viewer can tell two captures in the same second apart.
+    pub fn store_snapshot(&mut self, decoded: &str, at: u64) {
+        self.snapshot = Some(DecodedSnapshot::capture(decoded, at));
+    }
+}
+
+/// Skip the override's path key while it holds the global default: an absent
+/// path loads as Bind NIC, so writing it would only add noise to the state
+/// file.
+fn skip_default_refresh_path(path: &RefreshPath) -> bool {
+    *path == RefreshPath::default()
+}
+
+/// Skip the override's SOCKS5 block while every field is unset. The block
+/// travels with the override flag, so an absent block loads as the empty
+/// carrier and fails loudly only if SOCKS5 is actually selected.
+fn skip_default_socks5(socks5: &Socks5Cfg) -> bool {
+    *socks5 == Socks5Cfg::default()
+}
+
+/// How many bytes of the decoded provider body a subscription keeps for the
+/// raw viewer. A provider body can be arbitrarily large, so the cap bounds the
+/// state file; a cut body is marked truncated rather than dropped silently.
+pub const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
+
+/// The whole-body Base64-decoded provider body of a subscription's last
+/// successful fetch, bounded and replaceable.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DecodedSnapshot {
+    /// The decoded body, cut at [`MAX_SNAPSHOT_BYTES`] on a character
+    /// boundary when the provider's body is larger.
+    pub body: String,
+    /// Whether `body` was cut at the cap.
+    #[serde(skip_serializing_if = "skip_false")]
+    pub truncated: bool,
+    /// Unix seconds the body was captured, for display.
+    pub at: u64,
+    /// Session-unique capture identity. The raw viewer keys its parse and body
+    /// caches by it, so two captures in the same second stay distinct while
+    /// [`Self::at`] remains the timestamp the window shows.
+    ///
+    /// Not persisted: the caches live in the session that captured the body,
+    /// so a snapshot loaded from the state file starts at the default zero
+    /// instead of inheriting a revision that a later capture could reuse.
+    #[serde(skip)]
+    pub revision: u64,
+}
+
+/// Issues the session's snapshot revisions. Monotonic and never reset, so a
+/// body stored later always outranks every body stored before it.
+static SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+impl DecodedSnapshot {
+    /// Capture `decoded` at `at`, truncating it to [`MAX_SNAPSHOT_BYTES`] and
+    /// stamping a fresh session revision.
+    pub fn capture(decoded: &str, at: u64) -> Self {
+        let (body, truncated) = bound_snapshot(decoded);
+        Self {
+            body,
+            truncated,
+            at,
+            revision: SNAPSHOT_REVISION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+fn bound_snapshot(text: &str) -> (String, bool) {
+    if text.len() <= MAX_SNAPSHOT_BYTES {
+        return (text.to_owned(), false);
+    }
+    let mut end = MAX_SNAPSHOT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
 }
 
 /// One fetch's outcome.
@@ -272,6 +390,12 @@ pub struct RefreshReport {
     /// Unix seconds of the refresh.
     pub at: u64,
     pub added: usize,
+    /// Matched entries whose stored profile did not change. Count only: a
+    /// refresh never pushes a row for one.
+    pub unchanged: usize,
+    /// Matched entries whose stored profile changed, including a provider
+    /// rename. The preserved id and switch, the runtime verdict, and row
+    /// order do not make an update.
     pub updated: usize,
     pub removed: usize,
     pub refused: usize,
@@ -291,6 +415,10 @@ pub struct RefreshReport {
 pub struct ReportRow {
     pub kind: ReportKind,
     pub name: String,
+    /// For an ignored row, the `parameter=value` pair repeats group under;
+    /// empty for every other kind and for an older persisted report.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw: String,
 }
@@ -387,6 +515,43 @@ pub fn push_report_row(rows: &mut Vec<ReportRow>, row: ReportRow) {
     }
 }
 
+/// One `parameter=value` group of ignored report rows: the heading, how many
+/// entries it holds, and their names in report order (the expandable detail).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IgnoredGroup {
+    /// The shared `parameter=value` pair; a plain section's own name when an
+    /// older report carries no key.
+    pub key: String,
+    pub count: usize,
+    pub names: Vec<String>,
+}
+
+/// Group a report's ignored rows by their `parameter=value` key, first-seen
+/// order, so the report window can collapse repeats without re-parsing names.
+/// Rows of other kinds are skipped.
+pub fn group_ignored_rows(rows: &[ReportRow]) -> Vec<IgnoredGroup> {
+    let mut groups: Vec<IgnoredGroup> = Vec::new();
+    for row in rows.iter().filter(|row| row.kind == ReportKind::Ignored) {
+        let key = if row.key.is_empty() {
+            row.name.clone()
+        } else {
+            row.key.clone()
+        };
+        match groups.iter_mut().find(|group| group.key == key) {
+            Some(group) => {
+                group.count += 1;
+                group.names.push(row.name.clone());
+            }
+            None => groups.push(IgnoredGroup {
+                key,
+                count: 1,
+                names: vec![row.name.clone()],
+            }),
+        }
+    }
+    groups
+}
+
 /// A name unique among `taken` too: the freshly built group rows are not in
 /// the server list yet while a refresh resolves names.
 fn unique_against<'a>(base: &str, taken: impl Iterator<Item = &'a str>) -> String {
@@ -409,6 +574,19 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+/// Whether two profiles persist to the same state shape. The runtime verdict
+/// and the cached group title are not stored, so re-deriving them is not a
+/// profile update; every stored field, including the origin keys and the
+/// provider name, is compared.
+fn persisted_eq(left: &ServerProfile, right: &ServerProfile) -> bool {
+    match (serde_json::to_value(left), serde_json::to_value(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        // A profile that cannot be serialized cannot be proven unchanged;
+        // counting it as an update is the honest direction.
+        _ => false,
+    }
 }
 
 impl ServersFile {
@@ -465,10 +643,11 @@ impl ServersFile {
     ///
     /// Provider fields and names win; each entry keeps the matched profile's
     /// switch and id (so the active route and every reference survive), matched
-    /// by the stored content key first and the identity key second. A profile
-    /// with no matching entry is removed — and when it was the active server
-    /// the route becomes Block. Returns the report for the caller to extend
-    /// with its refused/ignored rows.
+    /// by the stored content key first and the identity key second. A matched
+    /// entry whose stored profile is otherwise identical counts as unchanged
+    /// instead of updated. A profile with no matching entry is removed — and
+    /// when it was the active server the route becomes Block. Returns the
+    /// report for the caller to extend with its refused/ignored rows.
     pub fn refresh_subscription_group(
         &mut self,
         settings: &mut Settings,
@@ -542,15 +721,23 @@ impl ServersFile {
                 if old_tag != new_tag {
                     renames.push((old_tag, new_tag));
                 }
-                report.updated += 1;
-                push_report_row(
-                    &mut report.rows,
-                    ReportRow {
-                        kind: ReportKind::Updated,
-                        name: profile.name.clone(),
-                        raw: String::new(),
-                    },
-                );
+                // A matched entry counts as updated only when its stored
+                // profile actually changes: the preserved id and switch, the
+                // runtime verdict, and row order cannot make it one.
+                if persisted_eq(old, &profile) {
+                    report.unchanged += 1;
+                } else {
+                    report.updated += 1;
+                    push_report_row(
+                        &mut report.rows,
+                        ReportRow {
+                            kind: ReportKind::Updated,
+                            name: profile.name.clone(),
+                            key: String::new(),
+                            raw: String::new(),
+                        },
+                    );
+                }
             } else {
                 profile.name = self.unique_profile_name(group_id, &profile.name, None);
                 profile.name = unique_against(
@@ -565,6 +752,7 @@ impl ServersFile {
                     ReportRow {
                         kind: ReportKind::Added,
                         name: profile.name.clone(),
+                        key: String::new(),
                         raw: String::new(),
                     },
                 );
@@ -581,6 +769,7 @@ impl ServersFile {
                 ReportRow {
                     kind: ReportKind::Removed,
                     name: profile.name.clone(),
+                    key: String::new(),
                     raw: String::new(),
                 },
             );
@@ -2053,12 +2242,345 @@ mod tests {
                 ReportRow {
                     kind: ReportKind::Added,
                     name: format!("server-{index}"),
+                    key: String::new(),
                     raw: String::new(),
                 },
             );
         }
         assert_eq!(report.rows.len(), REPORT_ROW_LIMIT);
         assert_eq!(report.added, REPORT_ROW_LIMIT + 5);
+    }
+
+    /// A feed holding one `Tokyo` whose persisted shape is exactly what the
+    /// next fetch restates: same name, outbound, origin keys, and switch.
+    fn unchanged_feed() -> (ServersFile, String) {
+        let mut feed = Group::new("Feed");
+        feed.subscription = Some(Subscription::default());
+        let feed_id = feed.id.clone();
+        let mut profile = vless_profile("Tokyo", 443);
+        profile.group = feed_id.clone();
+        profile.enabled = true;
+        profile.origin = Some(ProfileOrigin {
+            content_key: "content".into(),
+            identity_key: "identity".into(),
+            ..Default::default()
+        });
+        let mut servers = ServersFile {
+            active: Some(profile.id.clone()),
+            profiles: vec![profile],
+            ..ServersFile::default()
+        };
+        servers.groups.push(feed);
+        servers.hydrate_group_titles();
+        (servers, feed_id)
+    }
+
+    fn vless_profile(name: &str, port: u16) -> ServerProfile {
+        let mut profile = ServerProfile::new(name, OutboundModel::new(Protocol::Vless));
+        if let ProtocolSettings::Vless(settings) = &mut profile.outbound.settings {
+            settings.port = port;
+        }
+        profile
+    }
+
+    fn subscription_entry(profile: ServerProfile) -> SubscriptionEntry {
+        SubscriptionEntry {
+            profile,
+            content_key: "content".into(),
+            identity_key: "identity".into(),
+        }
+    }
+
+    #[test]
+    fn older_reports_load_with_zero_unchanged() {
+        let report: RefreshReport = serde_json::from_value(serde_json::json!({
+            "at": 7,
+            "added": 2,
+            "updated": 3,
+            "removed": 1,
+            "refused": 1,
+            "ignored": 4,
+            "rows": [],
+        }))
+        .expect("a report written before the field still loads");
+        assert_eq!(report.unchanged, 0);
+        assert_eq!((report.added, report.updated, report.ignored), (2, 3, 4));
+    }
+
+    #[test]
+    fn older_subscriptions_load_without_a_snapshot() {
+        let subscription: Subscription = serde_json::from_value(serde_json::json!({
+            "url": "https://provider.example/sub",
+            "lastFetch": { "at": 3, "ok": true },
+            "report": { "at": 3, "added": 1, "updated": 2 },
+        }))
+        .expect("a subscription written before the snapshot still loads");
+        assert!(subscription.snapshot.is_none());
+        assert_eq!(
+            subscription.report.as_ref().map(|report| report.unchanged),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn refresh_counts_an_unchanged_profile_as_unchanged_without_a_row() {
+        let (mut servers, feed_id) = unchanged_feed();
+        // The runtime verdict is not persisted, so it cannot make the profile
+        // an update.
+        servers.profiles[0].verdict = Some(ProbeVerdict::delay(120, ProbeSource::LatencyTest));
+
+        let mut settings = Settings::default();
+        let report = servers.refresh_subscription_group(
+            &mut settings,
+            &feed_id,
+            vec![subscription_entry(vless_profile("Tokyo", 443))],
+        );
+
+        assert_eq!((report.unchanged, report.updated), (1, 0));
+        assert!(
+            !report
+                .rows
+                .iter()
+                .any(|row| row.kind == ReportKind::Updated),
+            "unchanged profiles are count-only"
+        );
+        assert!(report.rows.is_empty());
+        assert!(
+            servers.profiles[0].enabled,
+            "the stored switch survives an unchanged profile"
+        );
+        assert_eq!(
+            servers.active.as_deref(),
+            Some(servers.profiles[0].id.as_str()),
+            "the stored id and the route survive"
+        );
+    }
+
+    #[test]
+    fn refresh_counts_a_changed_profile_as_updated() {
+        let (mut servers, feed_id) = unchanged_feed();
+        let mut settings = Settings::default();
+        let report = servers.refresh_subscription_group(
+            &mut settings,
+            &feed_id,
+            vec![subscription_entry(vless_profile("Tokyo", 8443))],
+        );
+
+        assert_eq!((report.unchanged, report.updated), (0, 1));
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].kind, ReportKind::Updated);
+        assert_eq!(report.rows[0].name, "Tokyo");
+    }
+
+    #[test]
+    fn refresh_counts_a_provider_rename_as_updated() {
+        let (mut servers, feed_id) = unchanged_feed();
+        let mut settings = Settings::default();
+        let report = servers.refresh_subscription_group(
+            &mut settings,
+            &feed_id,
+            vec![subscription_entry(vless_profile("Tokyo Edge", 443))],
+        );
+
+        assert_eq!((report.unchanged, report.updated), (0, 1));
+        assert_eq!(servers.profiles[0].name, "Tokyo Edge");
+        assert_eq!(report.rows[0].name, "Tokyo Edge");
+    }
+
+    #[test]
+    fn refresh_does_not_count_order_only_changes() {
+        let mut feed = Group::new("Feed");
+        feed.subscription = Some(Subscription::default());
+        let feed_id = feed.id.clone();
+        let mut first = vless_profile("First", 443);
+        first.group = feed_id.clone();
+        first.origin = Some(ProfileOrigin {
+            content_key: "first".into(),
+            identity_key: "first".into(),
+            ..Default::default()
+        });
+        let mut second = vless_profile("Second", 443);
+        second.group = feed_id.clone();
+        second.origin = Some(ProfileOrigin {
+            content_key: "second".into(),
+            identity_key: "second".into(),
+            ..Default::default()
+        });
+        let mut servers = ServersFile {
+            profiles: vec![first, second],
+            ..ServersFile::default()
+        };
+        servers.groups.push(feed);
+        servers.hydrate_group_titles();
+        let mut settings = Settings::default();
+
+        let report = servers.refresh_subscription_group(
+            &mut settings,
+            &feed_id,
+            vec![
+                SubscriptionEntry {
+                    profile: vless_profile("Second", 443),
+                    content_key: "second".into(),
+                    identity_key: "second".into(),
+                },
+                SubscriptionEntry {
+                    profile: vless_profile("First", 443),
+                    content_key: "first".into(),
+                    identity_key: "first".into(),
+                },
+            ],
+        );
+
+        assert_eq!((report.unchanged, report.updated), (2, 0));
+        assert!(report.rows.is_empty());
+        let names: Vec<&str> = servers
+            .profiles
+            .iter()
+            .filter(|profile| profile.group_id() == feed_id)
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, ["Second", "First"], "the entry order is applied");
+    }
+
+    #[test]
+    fn decoded_snapshot_round_trips_through_the_state_file() {
+        use crate::sys::appdata::with_appdata;
+
+        with_appdata(|| {
+            let mut feed = Group::new("Feed");
+            let feed_id = feed.id.clone();
+            feed.subscription = Some(Subscription::default());
+            feed.subscription
+                .as_mut()
+                .expect("the feed carries a subscription")
+                .store_snapshot("vless://body\n", 41);
+            let mut servers = ServersFile::default();
+            servers.groups.push(feed);
+            servers.save().expect("save servers.json");
+
+            let reloaded = ServersFile::load().expect("reload servers.json");
+            let snapshot = reloaded
+                .groups
+                .iter()
+                .find(|group| group.id == feed_id)
+                .and_then(|group| group.subscription.as_ref())
+                .and_then(|subscription| subscription.snapshot.as_ref())
+                .expect("the snapshot survives a restart");
+            assert_eq!(snapshot.body, "vless://body\n");
+            assert!(!snapshot.truncated);
+            assert_eq!(snapshot.at, 41);
+            assert_eq!(
+                snapshot.revision, 0,
+                "the session revision is not persisted; a reload starts at the default"
+            );
+        });
+    }
+
+    #[test]
+    fn decoded_snapshot_is_capped_and_marks_truncation() {
+        let oversized = "a".repeat(MAX_SNAPSHOT_BYTES + 1);
+        let snapshot = DecodedSnapshot::capture(&oversized, 5);
+        assert_eq!(snapshot.body.len(), MAX_SNAPSHOT_BYTES);
+        assert!(snapshot.truncated, "a cut body is marked");
+        assert_eq!(snapshot.at, 5);
+
+        // A multi-byte character at the cap is never cut in half.
+        let wide = "é".repeat(MAX_SNAPSHOT_BYTES);
+        let snapshot = DecodedSnapshot::capture(&wide, 6);
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.body.chars().count(), MAX_SNAPSHOT_BYTES / 2);
+        assert!(wide.starts_with(&snapshot.body));
+    }
+
+    #[test]
+    fn a_later_capture_replaces_the_snapshot() {
+        let mut subscription = Subscription::default();
+        subscription.store_snapshot("first", 1);
+        subscription.store_snapshot("second", 2);
+        let snapshot = subscription.snapshot.expect("the second capture lands");
+        assert_eq!(snapshot.body, "second");
+        assert_eq!(snapshot.at, 2);
+    }
+
+    /// The revision identifies a capture independently of the display time, so
+    /// two refreshes served in the same second still carry distinct identities
+    /// the raw viewer can key its caches by.
+    #[test]
+    fn captures_in_the_same_second_carry_distinct_revisions() {
+        let mut subscription = Subscription::default();
+        subscription.store_snapshot("first", 7);
+        let first = subscription
+            .snapshot
+            .clone()
+            .expect("the first capture lands");
+        subscription.store_snapshot("second", 7);
+        let second = subscription.snapshot.expect("the second capture lands");
+
+        assert_eq!(first.at, second.at, "same display second");
+        assert_ne!(
+            first.revision, second.revision,
+            "the revision, not the second, identifies the capture"
+        );
+        assert_ne!(first.body, second.body, "the bodies differ as well");
+    }
+
+    #[test]
+    fn ignored_rows_group_by_parameter_value() {
+        let report = RefreshReport {
+            ignored: 3,
+            rows: vec![
+                ReportRow {
+                    kind: ReportKind::Ignored,
+                    name: "One: quicSecurity=none".into(),
+                    key: "quicSecurity=none".into(),
+                    raw: "vless://one?quicSecurity=none".into(),
+                },
+                ReportRow {
+                    kind: ReportKind::Added,
+                    name: "Two".into(),
+                    key: String::new(),
+                    raw: String::new(),
+                },
+                ReportRow {
+                    kind: ReportKind::Ignored,
+                    name: "Two: quicSecurity=none".into(),
+                    key: "quicSecurity=none".into(),
+                    raw: "vless://two?quicSecurity=none".into(),
+                },
+                ReportRow {
+                    kind: ReportKind::Ignored,
+                    name: "Three: mux".into(),
+                    key: "mux".into(),
+                    raw: "vless://three?mux".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let groups = group_ignored_rows(&report.rows);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].key, "quicSecurity=none");
+        assert_eq!(groups[0].count, 2);
+        assert_eq!(
+            groups[0].names,
+            ["One: quicSecurity=none", "Two: quicSecurity=none"]
+        );
+        assert_eq!(groups[1].key, "mux");
+        assert_eq!(groups[1].count, 1);
+    }
+
+    #[test]
+    fn older_ignored_rows_without_a_key_group_by_their_name() {
+        let rows = vec![ReportRow {
+            kind: ReportKind::Ignored,
+            name: "Old: mux".into(),
+            key: String::new(),
+            raw: String::new(),
+        }];
+        let groups = group_ignored_rows(&rows);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "Old: mux");
+        assert_eq!(groups[0].count, 1);
     }
 
     #[test]
@@ -2173,6 +2695,110 @@ mod tests {
         );
         subscription.user_agent_custom = false;
         assert_eq!(subscription.effective_user_agent(""), "");
+    }
+
+    #[test]
+    fn subscription_outbound_override_defaults_to_the_global_block() {
+        let subscription = Subscription::default();
+        assert!(!subscription.outbound_custom);
+        assert_eq!(subscription.outbound_path, RefreshPath::BindNic);
+        assert_eq!(subscription.socks5, Socks5Cfg::default());
+
+        let global_path = RefreshPath::Socks5;
+        let global = Socks5Cfg {
+            host: "global.example".into(),
+            port: 1080,
+            username: Some("gina".into()),
+            password: Some("global-secret".into()),
+        };
+        assert_eq!(
+            subscription.effective_refresh_path(global_path),
+            global_path,
+            "without an override the global path is in force"
+        );
+        assert_eq!(
+            subscription.effective_socks5(&global),
+            &global,
+            "without an override the global SOCKS5 fields are in force"
+        );
+    }
+
+    #[test]
+    fn subscription_outbound_override_replaces_mode_and_socks5_as_one_block() {
+        let global = Socks5Cfg {
+            host: "global.example".into(),
+            port: 1080,
+            username: None,
+            password: None,
+        };
+        let mut subscription = Subscription {
+            outbound_custom: true,
+            outbound_path: RefreshPath::Socks5,
+            socks5: Socks5Cfg {
+                host: "custom.example".into(),
+                port: 9050,
+                username: Some("alice".into()),
+                password: Some("custom-secret".into()),
+            },
+            ..Subscription::default()
+        };
+        assert_eq!(
+            subscription.effective_refresh_path(RefreshPath::BindNic),
+            RefreshPath::Socks5
+        );
+        assert_eq!(
+            subscription.effective_socks5(&global),
+            &subscription.socks5,
+            "the whole custom block replaces the global one"
+        );
+
+        // The flag alone decides; the custom values never leak while it is off.
+        subscription.outbound_custom = false;
+        assert_eq!(
+            subscription.effective_refresh_path(RefreshPath::Native),
+            RefreshPath::Native
+        );
+        assert_eq!(subscription.effective_socks5(&global), &global);
+    }
+
+    #[test]
+    fn subscription_outbound_override_round_trips_and_hides_defaults() {
+        let default_wire = serde_json::to_value(Subscription::default()).expect("subscription");
+        for absent in ["outboundCustom", "outboundPath", "socks5"] {
+            assert!(
+                default_wire.get(absent).is_none(),
+                "a fresh subscription must not write {absent:?}"
+            );
+        }
+
+        let subscription = Subscription {
+            outbound_custom: true,
+            outbound_path: RefreshPath::Socks5,
+            socks5: Socks5Cfg {
+                host: "custom.example".into(),
+                port: 9050,
+                username: Some("alice".into()),
+                password: Some("custom-secret".into()),
+            },
+            ..Subscription::default()
+        };
+        let wire = serde_json::to_value(&subscription).expect("subscription serialize");
+        assert_eq!(wire["outboundCustom"], true);
+        assert_eq!(wire["outboundPath"], "socks5");
+        assert_eq!(wire["socks5"]["host"], "custom.example");
+
+        let loaded: Subscription = serde_json::from_value(wire).expect("subscription load");
+        assert!(loaded.outbound_custom);
+        assert_eq!(loaded.outbound_path, RefreshPath::Socks5);
+        assert_eq!(loaded.socks5, subscription.socks5);
+
+        // An older record without the keys loads as the global default.
+        let legacy: Subscription =
+            serde_json::from_value(serde_json::json!({ "url": "https://example.com" }))
+                .expect("legacy subscription");
+        assert!(!legacy.outbound_custom);
+        assert_eq!(legacy.outbound_path, RefreshPath::BindNic);
+        assert_eq!(legacy.socks5, Socks5Cfg::default());
     }
 
     #[test]

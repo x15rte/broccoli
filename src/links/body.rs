@@ -58,13 +58,66 @@ fn comment_metadata(line: &str) -> Option<(String, String)> {
     Some((key, value.trim().to_owned()))
 }
 
+/// One compatibility parameter a parser dropped: the name the provider
+/// spelled, the value it carried, and the bounded raw source line it came
+/// from.
+///
+/// The report groups repeats of the same `parameter=value` under one heading,
+/// so that pair is the grouping key. `raw` is bounded per item
+/// ([`MAX_RAW_CHARS`]) instead of duplicating a whole provider link
+/// unbounded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompatibilityParameter {
+    pub name: String,
+    pub value: String,
+    /// The bounded raw source line; empty when the source is a document the
+    /// parser cannot point into.
+    pub raw: String,
+}
+
+impl CompatibilityParameter {
+    /// A parameter the parser named but the document carries no source line
+    /// for: the shape a document converter produces.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: String::new(),
+            raw: String::new(),
+        }
+    }
+    /// The `parameter=value` pair, or the bare name when the link spelled no
+    /// value.
+    pub fn key(&self) -> String {
+        if self.value.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}={}", self.name, self.value)
+        }
+    }
+}
+
+impl From<&str> for CompatibilityParameter {
+    fn from(name: &str) -> Self {
+        Self::named(name)
+    }
+}
+
+impl From<String> for CompatibilityParameter {
+    fn from(name: String) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
+    }
+}
+
 /// One accepted entry: the profile plus the raw text it came from.
 #[derive(Debug, Clone)]
 pub struct BodyEntry {
     pub profile: ServerProfile,
     pub raw: String,
     /// The compatibility parameters the link grammar dropped.
-    pub ignored: Vec<String>,
+    pub ignored: Vec<CompatibilityParameter>,
 }
 
 /// One refused item: its raw text and the reason it was refused.
@@ -74,11 +127,56 @@ pub struct BodyRefusal {
     pub error: String,
 }
 
-/// One document section the converter ignored (rules, groups, routing), named
-/// for the report.
+/// One ignored item for the report: a document section the converter
+/// skipped, or one compatibility parameter dropped from an entry.
 #[derive(Debug, Clone)]
 pub struct IgnoredSection {
+    /// The report row name: the containing entry plus `parameter=value`, or
+    /// the document section's own name.
     pub name: String,
+    /// The dropped compatibility parameter; `None` for a plain section.
+    pub parameter: Option<CompatibilityParameter>,
+}
+
+impl IgnoredSection {
+    /// A document section the converter ignored (rules, groups, routing).
+    pub fn section(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            parameter: None,
+        }
+    }
+    /// One compatibility parameter dropped from the entry `owner`.
+    pub fn parameter(owner: &str, parameter: CompatibilityParameter) -> Self {
+        let key = parameter.key();
+        Self {
+            name: if owner.is_empty() {
+                key
+            } else {
+                format!("{owner}: {key}")
+            },
+            parameter: Some(parameter),
+        }
+    }
+    /// The `parameter=value` key repeats group under; `None` for a plain
+    /// section.
+    pub fn key(&self) -> Option<String> {
+        self.parameter.as_ref().map(CompatibilityParameter::key)
+    }
+    /// The report row this item contributes: the `parameter=value` name, its
+    /// grouping key, and the bounded raw source line.
+    pub fn report_row(&self) -> crate::model::servers::ReportRow {
+        crate::model::servers::ReportRow {
+            kind: ReportKind::Ignored,
+            name: self.name.clone(),
+            key: self.key().unwrap_or_default(),
+            raw: self
+                .parameter
+                .as_ref()
+                .map(|parameter| parameter.raw.clone())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// A decoded body's outcome.
@@ -93,12 +191,22 @@ pub struct BodyParse {
 }
 
 impl BodyParse {
-    /// The report row a refusal contributes.
-    pub fn refused_row(&self, refusal: &BodyRefusal) -> crate::model::servers::ReportRow {
-        crate::model::servers::ReportRow {
-            kind: ReportKind::Refused,
-            name: String::new(),
-            raw: refusal.raw.clone(),
+    /// Append this parse's refused and ignored rows, in parse order, while the
+    /// report row bound allows; the report counts stay exact either way.
+    pub fn push_diagnostic_rows(&self, rows: &mut Vec<crate::model::servers::ReportRow>) {
+        for refusal in &self.refused {
+            crate::model::servers::push_report_row(
+                rows,
+                crate::model::servers::ReportRow {
+                    kind: ReportKind::Refused,
+                    name: refusal.error.clone(),
+                    key: String::new(),
+                    raw: refusal.raw.clone(),
+                },
+            );
+        }
+        for ignored in &self.ignored {
+            crate::model::servers::push_report_row(rows, ignored.report_row());
         }
     }
 }
@@ -125,9 +233,8 @@ pub fn parse_body_cancellable(text: &str, stop: &AtomicBool) -> BodyParse {
         };
         for entry in &outcome.entries {
             for parameter in &entry.ignored {
-                outcome.ignored.push(IgnoredSection {
-                    name: format!("{}: {parameter}", entry.profile.name),
-                });
+                let section = IgnoredSection::parameter(&entry.profile.name, parameter.clone());
+                outcome.ignored.push(section);
             }
         }
         return outcome;
@@ -147,9 +254,9 @@ pub fn parse_body_cancellable(text: &str, stop: &AtomicBool) -> BodyParse {
             Some(item) => match classify(&item) {
                 Ok(link) => {
                     for parameter in &link.ignored {
-                        outcome.ignored.push(IgnoredSection {
-                            name: format!("{}: {parameter}", link.profile.name),
-                        });
+                        let section =
+                            IgnoredSection::parameter(&link.profile.name, parameter.clone());
+                        outcome.ignored.push(section);
                     }
                     outcome.entries.push(BodyEntry {
                         profile: link.profile,
@@ -368,6 +475,78 @@ mod tests {
             "the dropped parameter is named: {:#?}",
             parsed.ignored
         );
+    }
+
+    #[test]
+    fn compatibility_parameters_carry_their_value_and_bounded_source() {
+        let body = "trojan://pw@example.com:443?allowInsecure=1&mux=3#One";
+        let parsed = parse_body(body);
+        let section = parsed
+            .ignored
+            .iter()
+            .find(|section| {
+                section
+                    .parameter
+                    .as_ref()
+                    .is_some_and(|parameter| parameter.name == "allowInsecure")
+            })
+            .expect("the dropped parameter is reported");
+        let parameter = section
+            .parameter
+            .as_ref()
+            .expect("a compatibility parameter, not a section");
+        assert_eq!(parameter.value, "1");
+        assert_eq!(parameter.key(), "allowInsecure=1");
+        assert!(
+            parameter.raw.starts_with("trojan://") && parameter.raw.contains("allowInsecure=1"),
+            "the raw source is the link itself, got {:?}",
+            parameter.raw
+        );
+        assert_eq!(section.name, "One: allowInsecure=1");
+
+        // The report row carries the pair, its grouping key, and the bounded
+        // source line.
+        let row = section.report_row();
+        assert_eq!(row.kind, ReportKind::Ignored);
+        assert_eq!(row.name, "One: allowInsecure=1");
+        assert_eq!(row.key, "allowInsecure=1");
+        assert_eq!(row.raw, parameter.raw);
+    }
+
+    #[test]
+    fn the_reported_raw_line_is_bounded_per_item() {
+        let long = "a".repeat(MAX_RAW_CHARS * 2);
+        let body = format!("trojan://pw@example.com:443?allowInsecure=1&tcp_fast_open={long}");
+        let parsed = parse_body(&body);
+        let section = parsed
+            .ignored
+            .iter()
+            .find(|section| section.parameter.is_some())
+            .expect("the dropped parameter is reported");
+        let row = section.report_row();
+        assert_eq!(row.raw.chars().count(), MAX_RAW_CHARS);
+        assert_eq!(
+            row.raw,
+            body.chars().take(MAX_RAW_CHARS).collect::<String>()
+        );
+
+        // One copy per repeated parameter: the row bound still holds.
+        let mut rows = Vec::new();
+        for _ in 0..(crate::model::servers::REPORT_ROW_LIMIT + 3) {
+            parsed.push_diagnostic_rows(&mut rows);
+        }
+        assert_eq!(rows.len(), crate::model::servers::REPORT_ROW_LIMIT);
+    }
+
+    #[test]
+    fn a_plain_document_section_is_not_a_parameter() {
+        let section = IgnoredSection::section("rules");
+        assert!(section.parameter.is_none());
+        assert_eq!(section.key(), None);
+        let row = section.report_row();
+        assert_eq!(row.name, "rules");
+        assert_eq!(row.key, "");
+        assert_eq!(row.raw, "");
     }
 
     #[test]

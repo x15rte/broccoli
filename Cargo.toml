@@ -97,7 +97,10 @@ serde_path_to_error = "0.1"
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
+# "socks" enables the SOCKS5 subscription carrier. reqwest implements the
+# handshake in-tree (hyper-util's client-legacy proxy module), so the feature
+# pulls in no new crate and changes no lock entry.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream", "socks"] }
 # reqwest 0.12 has no aws-lc-rs feature (its rustls features are provider-agnostic;
 # the "-no-provider" variants select no crypto provider at all). This direct rustls
 # dependency enables the aws-lc-rs provider feature on the single shared rustls build

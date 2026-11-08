@@ -1075,28 +1075,6 @@ fn row_context_menu_delete_removes_selected_server() {
     );
 }
 
-#[test]
-fn settings_renders_geodata_section() {
-    let (_lock, _tmp, mut h) = common::boot(|_| {}, None);
-    h.set_size(egui::Vec2::new(1100.0, 720.0));
-    h.run();
-
-    common::dismiss_wizard(&mut h);
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Settings")
-        .click();
-    h.run();
-
-    assert!(
-        h.get_all_by_label("Geodata").next().is_some(),
-        "Settings must render the Geodata section"
-    );
-    assert!(
-        h.get_all_by_label("geoip.dat").next().is_some()
-            && h.get_all_by_label("geosite.dat").next().is_some(),
-        "the Geodata section must bind both dat file URL fields"
-    );
-}
-
 /// Right-clicking must no longer offer a Copy button on any surface: the
 /// static-label menu, the log-row menu, and the text-field menu were all
 /// removed (the logs toolbar's "Copy all" button remains).

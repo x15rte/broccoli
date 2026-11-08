@@ -7,7 +7,7 @@
 //! the pinned core or a required field is missing. Non-server document
 //! sections are ignored and named for the report.
 
-use super::body::{BodyEntry, BodyRefusal, IgnoredSection};
+use super::body::{BodyEntry, BodyRefusal, CompatibilityParameter, IgnoredSection};
 use crate::model::ServerProfile;
 use crate::model::outbound::{
     HttpSettings, HysteriaSettings, MasqueSettings, OutboundModel, Protocol, ProtocolSettings,
@@ -98,9 +98,7 @@ fn convert_clash(document: &Value) -> ConvertOutcome {
     let mut outcome = ConvertOutcome::default();
     for section in ["rules", "proxy-groups", "dns"] {
         if document.get(section).is_some() {
-            outcome.ignored.push(IgnoredSection {
-                name: section.to_owned(),
-            });
+            outcome.ignored.push(IgnoredSection::section(section));
         }
     }
     let Some(proxies) = document.get("proxies").and_then(Value::as_array) else {
@@ -109,10 +107,15 @@ fn convert_clash(document: &Value) -> ConvertOutcome {
     for proxy in proxies {
         let raw = bound(proxy);
         match clash_entry(proxy) {
-            Ok(entry) => outcome.entries.push(entry),
+            Ok(mut entry) => {
+                for parameter in &mut entry.ignored {
+                    parameter.raw.clone_from(&raw);
+                }
+                outcome.entries.push(entry);
+            }
             Err(Refusal { error, ignored }) if error.is_empty() => {
                 // Non-server entry (a selector, a group reference).
-                outcome.ignored.push(IgnoredSection { name: ignored });
+                outcome.ignored.push(IgnoredSection::section(ignored));
             }
             Err(Refusal { error, .. }) => outcome.refused.push(BodyRefusal { raw, error }),
         }
@@ -285,7 +288,7 @@ fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
         .flat_map(|object| object.keys())
     {
         if !CLASH_KEYS.contains(&key.as_str()) {
-            ignored.push(key.clone());
+            ignored.push(key.as_str().into());
         }
     }
     for key in ["alterId", "cipher", "ipv6", "plugin"] {
@@ -311,7 +314,7 @@ fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
     })
 }
 
-fn clash_wireguard(proxy: &Value, ignored: &mut Vec<String>) -> WireguardSettings {
+fn clash_wireguard(proxy: &Value, ignored: &mut Vec<CompatibilityParameter>) -> WireguardSettings {
     let mut settings = WireguardSettings {
         secret_key: field(proxy, "private-key").into(),
         address: string_list(proxy, "ip"),
@@ -348,7 +351,11 @@ fn clash_wireguard(proxy: &Value, ignored: &mut Vec<String>) -> WireguardSetting
     settings
 }
 
-fn clash_stream(proxy: &Value, protocol: Protocol, ignored: &mut Vec<String>) -> StreamModel {
+fn clash_stream(
+    proxy: &Value,
+    protocol: Protocol,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> StreamModel {
     let mut stream = StreamModel::default();
     let network = field(proxy, "network").to_ascii_lowercase();
     match network.as_str() {
@@ -400,9 +407,9 @@ fn clash_stream(proxy: &Value, protocol: Protocol, ignored: &mut Vec<String>) ->
         }
         "h2" | "http" => {
             // The pinned core has no HTTP/1.1 or HTTP/2 transport.
-            ignored.push(format!("network {network}"));
+            ignored.push(format!("network {network}").into());
         }
-        other => ignored.push(format!("network {other}")),
+        other => ignored.push(format!("network {other}").into()),
     }
     if protocol == Protocol::Hysteria {
         let _ = stream.select_network(Network::Hysteria);
@@ -463,9 +470,7 @@ fn convert_json_document(document: &Value) -> ConvertOutcome {
     let mut outcome = ConvertOutcome::default();
     for section in ["inbounds", "routing", "route", "dns", "log"] {
         if document.get(section).is_some() {
-            outcome.ignored.push(IgnoredSection {
-                name: section.to_owned(),
-            });
+            outcome.ignored.push(IgnoredSection::section(section));
         }
     }
     let Some(outbounds) = document.get("outbounds").and_then(Value::as_array) else {
@@ -477,13 +482,11 @@ fn convert_json_document(document: &Value) -> ConvertOutcome {
             // Xray outbound object: the persisted model is the same shape.
             let protocol = protocol.to_ascii_lowercase();
             if matches!(protocol.as_str(), "freedom" | "blackhole" | "dns") {
-                outcome.ignored.push(IgnoredSection {
-                    name: outbound
-                        .get("tag")
-                        .and_then(Value::as_str)
-                        .unwrap_or(&protocol)
-                        .to_owned(),
-                });
+                let name = outbound
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&protocol);
+                outcome.ignored.push(IgnoredSection::section(name));
                 continue;
             }
             if UNDIALABLE.contains(&protocol.as_str()) {
@@ -511,15 +514,20 @@ fn convert_json_document(document: &Value) -> ConvertOutcome {
         }
         let ty = field(outbound, "type").to_ascii_lowercase();
         if ty.is_empty() {
-            outcome.ignored.push(IgnoredSection {
-                name: field(outbound, "tag").to_owned(),
-            });
+            outcome
+                .ignored
+                .push(IgnoredSection::section(field(outbound, "tag")));
             continue;
         }
         match sing_box_entry(outbound) {
-            Ok(entry) => outcome.entries.push(entry),
+            Ok(mut entry) => {
+                for parameter in &mut entry.ignored {
+                    parameter.raw.clone_from(&raw);
+                }
+                outcome.entries.push(entry);
+            }
             Err(Refusal { error, ignored }) if error.is_empty() => {
-                outcome.ignored.push(IgnoredSection { name: ignored });
+                outcome.ignored.push(IgnoredSection::section(ignored));
             }
             Err(Refusal { error, .. }) => outcome.refused.push(BodyRefusal { raw, error }),
         }
@@ -668,7 +676,7 @@ fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
         .flat_map(|object| object.keys())
     {
         if !SING_BOX_KEYS.contains(&key.as_str()) {
-            ignored.push(key.clone());
+            ignored.push(key.as_str().into());
         }
     }
     for key in ["multiplex", "udp", "packet_encoding", "domain_strategy"] {
@@ -715,7 +723,11 @@ fn sing_box_wireguard(outbound: &Value) -> WireguardSettings {
     settings
 }
 
-fn sing_box_stream(outbound: &Value, protocol: Protocol, ignored: &mut Vec<String>) -> StreamModel {
+fn sing_box_stream(
+    outbound: &Value,
+    protocol: Protocol,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> StreamModel {
     let mut stream = StreamModel::default();
     if let Some(transport) = outbound.get("transport") {
         let ty = field(transport, "type").to_ascii_lowercase();
@@ -762,9 +774,9 @@ fn sing_box_stream(outbound: &Value, protocol: Protocol, ignored: &mut Vec<Strin
                     ..Default::default()
                 });
             }
-            "http" | "h2" => ignored.push(format!("transport {ty}")),
+            "http" | "h2" => ignored.push(format!("transport {ty}").into()),
             _ if ty.is_empty() => {}
-            other => ignored.push(format!("transport {other}")),
+            other => ignored.push(format!("transport {other}").into()),
         }
     }
     if protocol == Protocol::Hysteria {
@@ -893,9 +905,7 @@ fn convert_wireguard_conf(text: &str) -> ConvertOutcome {
         }
     }
     if interface.is_empty() && peer.is_empty() {
-        outcome.ignored.push(IgnoredSection {
-            name: "wireguard".into(),
-        });
+        outcome.ignored.push(IgnoredSection::section("wireguard"));
         return outcome;
     }
     let private = interface.get("privatekey").cloned().unwrap_or_default();
@@ -913,7 +923,7 @@ fn convert_wireguard_conf(text: &str) -> ConvertOutcome {
     } else {
         server.clone()
     };
-    let mut ignored = Vec::new();
+    let mut ignored: Vec<CompatibilityParameter> = Vec::new();
     let mut settings = WireguardSettings {
         secret_key: private,
         address: split_list(interface.get("address")),
@@ -938,7 +948,11 @@ fn convert_wireguard_conf(text: &str) -> ConvertOutcome {
     outbound.settings = ProtocolSettings::Wireguard(settings);
     outbound.stream = StreamModel::default();
     if let Some(table) = interface.get("table") {
-        ignored.push(format!("Table {table}"));
+        ignored.push(format!("Table {table}").into());
+    }
+    let raw: String = text.chars().take(super::body::MAX_RAW_CHARS).collect();
+    for parameter in &mut ignored {
+        parameter.raw.clone_from(&raw);
     }
     outcome.entries.push(BodyEntry {
         profile: ServerProfile::new(name, outbound),
@@ -969,10 +983,10 @@ fn convert_hysteria2(document: &Value) -> ConvertOutcome {
             name.to_owned()
         }
     };
-    let mut ignored = Vec::new();
+    let mut ignored: Vec<CompatibilityParameter> = Vec::new();
     for key in ["obfs", "fastOpen", "lazy"] {
         if document.get(key).is_some() {
-            ignored.push(key.to_owned());
+            ignored.push(key.into());
         }
     }
     let bandwidth = |key: &str| -> String {
@@ -1037,6 +1051,10 @@ fn convert_hysteria2(document: &Value) -> ConvertOutcome {
     });
     if bool_field(document, "skip-cert-verify") {
         ignored.push("skip-cert-verify".into());
+    }
+    let raw = bound(document);
+    for parameter in &mut ignored {
+        parameter.raw.clone_from(&raw);
     }
     outbound.stream = stream;
     outcome.entries.push(BodyEntry {
@@ -1248,7 +1266,16 @@ proxies:
             outcome.entries[0]
                 .ignored
                 .iter()
-                .any(|key| key == "some-future-key")
+                .any(|parameter| parameter.name == "some-future-key")
+        );
+        assert!(
+            outcome.entries[0]
+                .ignored
+                .iter()
+                .all(|parameter| !parameter.raw.is_empty()
+                    && parameter.raw.chars().count() <= crate::links::body::MAX_RAW_CHARS),
+            "a document parameter still points at its bounded source: {:?}",
+            outcome.entries[0].ignored
         );
         let json = r#"{"outbounds":[{"type":"socks","tag":"S","server":"s.example.com","server_port":1080,"future_field":true}]}"#;
         let outcome = convert_document(json).expect("json");
@@ -1256,7 +1283,7 @@ proxies:
             outcome.entries[0]
                 .ignored
                 .iter()
-                .any(|key| key == "future_field")
+                .any(|parameter| parameter.name == "future_field")
         );
     }
 

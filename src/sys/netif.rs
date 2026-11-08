@@ -47,6 +47,19 @@ pub struct NetIf {
     pub ips: Vec<String>,
 }
 
+impl NetIf {
+    /// The address a socket binds to when this adapter carries the outbound
+    /// path: its first IPv4 address, else its first IPv6 address. An adapter
+    /// with no parsable unicast address yields `None`, which the caller
+    /// reports as an unavailable uplink rather than falling back.
+    pub fn bind_address(&self) -> Option<std::net::IpAddr> {
+        self.ips
+            .iter()
+            .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .min_by_key(|address| !address.is_ipv4())
+    }
+}
+
 /// List non-loopback, non-tunnel interfaces with their unicast IPs.
 /// Returns an empty vec on any API failure (best-effort enumeration).
 pub fn list() -> Vec<NetIf> {
@@ -710,5 +723,33 @@ mod tests {
             resolve_probe_uplink(Some("auto"), true, None, &[]),
             ProbeUplink::Unbound
         );
+    }
+
+    #[test]
+    fn bind_address_prefers_ipv4_and_falls_back_to_ipv6() {
+        let dual = test_iface(
+            "Ethernet",
+            2,
+            false,
+            true,
+            &["fe80::1", "10.0.0.7", "10.0.0.8"],
+        );
+        assert_eq!(
+            dual.bind_address(),
+            Some("10.0.0.7".parse().expect("ipv4")),
+            "the first IPv4 address wins over every IPv6"
+        );
+
+        let v6_only = test_iface("Ethernet", 2, false, true, &["fe80::1", "fe80::2"]);
+        assert_eq!(
+            v6_only.bind_address(),
+            Some("fe80::1".parse().expect("ipv6")),
+            "an IPv6-only adapter binds its first IPv6 address"
+        );
+
+        let none = test_iface("Ethernet", 2, false, true, &["not an address"]);
+        assert_eq!(none.bind_address(), None);
+        let empty = test_iface("Ethernet", 2, false, true, &[]);
+        assert_eq!(empty.bind_address(), None);
     }
 }
