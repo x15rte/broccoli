@@ -158,6 +158,16 @@ user-id = 6741
 user-login = "Darksonn"
 user-name = "Alice Ryhl"
 
+[[publisher.tonic-build]]
+version = "0.14.9"
+when = "2026-10-29"
+trusted-publisher = "github:grpc/grpc-rust"
+
+[[publisher.tonic-prost-build]]
+version = "0.14.7"
+when = "2026-10-27"
+trusted-publisher = "github:grpc/grpc-rust"
+
 [[publisher.tray-icon]]
 version = "0.26.1"
 when = "2026-10-07"
