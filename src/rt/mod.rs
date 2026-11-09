@@ -9095,7 +9095,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_generation_refusal_during_a_pending_update_keeps_the_installed_core() {
-        with_appdata_async(async {
+        Box::pin(with_appdata_async(async {
             seed_pending_swap(b"installed-v26.9.9", b"retained-v26.7.28");
             let installed_before = tree_hash(&crate::sys::paths::core_dir());
             // The saved profiles still carry the retired spelling the pinned
@@ -9163,13 +9163,13 @@ mod tests {
                     && text.contains("streamSettings.sockopt.dialerProxy"),
                 "the app's own finding must reach the user, got: {text}"
             );
-        })
+        }))
         .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_start_regenerates_from_the_saved_state_over_a_stored_artefact() {
-        with_appdata_async(async {
+        Box::pin(with_appdata_async(async {
             let tag = {
                 let profile = ServerProfile {
                     id: "0123456789abcdef".into(),
@@ -9228,13 +9228,13 @@ mod tests {
                 "the configuration must come from the saved server list: {active}"
             );
             assert!(super::apply::stamp_is_current());
-        })
+        }))
         .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_gate_start_runs_the_app_owned_configuration_not_the_users_profiles() {
-        with_appdata_async(async {
+        Box::pin(with_appdata_async(async {
             let seeded_tag = {
                 let profile = ServerProfile {
                     id: "0123456789abcdef".into(),
@@ -9288,7 +9288,7 @@ mod tests {
                 "no user profile may reach the gate configuration"
             );
             assert!(super::apply::stamp_is_current());
-        })
+        }))
         .await;
     }
 

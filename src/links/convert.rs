@@ -73,9 +73,7 @@ pub fn convert_document(text: &str) -> Option<ConvertOutcome> {
             return Some(convert_sip008(&value));
         }
     }
-    if let Ok(value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text)
-        && let Ok(value) = serde_json::to_value(value)
-    {
+    if let Ok(value) = serde_saphyr::from_str::<Value>(text) {
         if value.get("proxies").and_then(Value::as_array).is_some() {
             return Some(convert_clash(&value));
         }

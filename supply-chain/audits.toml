@@ -3069,6 +3069,11 @@ version = "0.2.2"
 criteria = "safe-to-deploy"
 version = "0.1.6"
 
+[[audits.annotate-snippets]]
+criteria = "safe-to-deploy"
+version = "0.12.17"
+notes = "New dependency of serde-saphyr; error-snippet rendering only."
+
 [[audits.anstream]]
 criteria = "safe-to-deploy"
 version = "1.0.0"
@@ -3100,6 +3105,11 @@ version = "1.4.2"
 [[audits.arboard]]
 criteria = "safe-to-deploy"
 version = "3.6.1"
+
+[[audits.arraydeque]]
+criteria = "safe-to-deploy"
+version = "0.5.1"
+notes = "New dependency of granit-parser; deque used by the YAML parser."
 
 [[audits.arrayref]]
 criteria = "safe-to-deploy"
@@ -3366,6 +3376,11 @@ version = "0.10.2"
 criteria = "safe-to-deploy"
 version = "0.23.2"
 
+[[audits.core_detect]]
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "New dependency of encoding_rs; runtime SIMD detection."
+
 [[audits.cpufeatures]]
 criteria = "safe-to-deploy"
 version = "0.2.17"
@@ -3530,6 +3545,16 @@ who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
 version = "3.0.12"
 notes = "3.0.11 -> 3.0.12: code changes are confined to non-MSVC RC compiler detection (the variant is read from the first line of `-V /?` output; aarch64-gnullvm prefers `windres` unless it is llvm-windres), plus a winreg 0.55 -> 0.56 bump and an author entry. Used only by build scripts; no unsafe, no new dependency, and its Windows/MSVC path is untouched."
+
+[[audits.encoding_rs]]
+criteria = "safe-to-deploy"
+version = "0.8.44"
+notes = "New dependency of serde-saphyr; decodes non-UTF-8 YAML input."
+
+[[audits.encoding_rs_io]]
+criteria = "safe-to-deploy"
+version = "0.1.8"
+notes = "New dependency of serde-saphyr; encoding_rs reader adapter."
 
 [[audits.endi]]
 criteria = "safe-to-deploy"
@@ -3755,6 +3780,11 @@ version = "0.6.1"
 [[audits.gobject-sys]]
 criteria = "safe-to-deploy"
 version = "0.18.0"
+
+[[audits.granit-parser]]
+criteria = "safe-to-deploy"
+version = "2.1.0"
+notes = "New dependency of serde-saphyr; pure-Rust YAML parser."
 
 [[audits.gtk]]
 criteria = "safe-to-deploy"
@@ -4083,6 +4113,11 @@ version = "0.20.0"
 [[audits.multimap]]
 criteria = "safe-to-deploy"
 version = "0.10.1"
+
+[[audits.multiversion_no_op]]
+criteria = "safe-to-deploy"
+version = "1.0.0"
+notes = "New dependency of encoding_rs; no-op multiversion shim."
 
 [[audits.ndk]]
 criteria = "safe-to-deploy"
@@ -4437,6 +4472,11 @@ criteria = "safe-to-deploy"
 version = "0.13.5"
 notes = "Delta from 0.13.4 reviewed: the wikilink sibling-chain leak, a multibyte list-offset fix, and list tightness moved into a Cell; no unsafe, FFI or capability change."
 
+[[audits.pulldown-cmark]]
+criteria = "safe-to-deploy"
+version = "0.13.6"
+notes = "Delta from 0.13.5: the RUSTSEC-2026-0433 wikilink quadratic-parse fix."
+
 [[audits.pulldown-cmark-to-cmark]]
 criteria = "safe-to-deploy"
 version = "22.0.0"
@@ -4632,6 +4672,11 @@ version = "1.0.28"
 [[audits.serde]]
 criteria = "safe-to-deploy"
 version = "1.0.229"
+
+[[audits.serde-saphyr]]
+criteria = "safe-to-deploy"
+version = "2.1.1"
+notes = "New YAML deserializer replacing serde_yaml_ng; pure Rust, used only for Clash and hysteria2 imports."
 
 [[audits.serde_core]]
 criteria = "safe-to-deploy"
