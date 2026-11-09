@@ -930,7 +930,7 @@ const OUTPUT_DRAIN_WINDOW: Duration = Duration::from_secs(2);
 /// is likely stuck inside that wait, and terminating it there wedges PnP
 /// device creation for every wintun user on the machine (2026-08-28;
 /// the 2026-09-09 reconnect outage replayed it — a stop during the stall
-/// broke Throne's tun for minutes). The create resolves by itself within the
+/// broke TUN for minutes). The create resolves by itself within the
 /// window: the child either exits (create failed) or serves the API again
 /// (create succeeded), so the stop path waits this window before hard-killing
 /// a TUN core that did not answer the graceful close. Lanes that never carry

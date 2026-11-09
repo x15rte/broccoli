@@ -2335,7 +2335,7 @@ fn parse_legacy_vmess(
                     }
                 }
                 "http" => {
-                    // v2rayN semantics: host/path may be comma-separated lists.
+                    // Host and path may be comma-separated lists in a share link.
                     let mut headers = Map::new();
                     if !host.is_empty() {
                         let hosts: Vec<&str> = host.split(',').filter(|h| !h.is_empty()).collect();
