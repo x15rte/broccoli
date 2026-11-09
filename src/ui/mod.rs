@@ -459,9 +459,10 @@ pub struct CoreSetupCtx<'a> {
 pub struct ServersCtx<'a> {
     pub(crate) servers: &'a mut ServersFile,
     pub(crate) settings: &'a mut Settings,
-    /// Whether the managed core is running now: the subscription fetch's
-    /// physical-uplink resolution reads it the way the latency probe does.
-    pub(crate) core_running: bool,
+    /// Whether the running core owns the TUN capture. The path controls are
+    /// enabled by TUN mode; this is the runtime gate for the actual bind. With
+    /// no live capture, Bind NIC and Native are the same OS path.
+    pub(crate) tun_live: bool,
     pub(crate) busy: gate::BusyWindow,
     /// Outcome slot of the one single-flight latency probe: the shell parks
     /// the drained result here and the servers screen adopts it through its
@@ -541,15 +542,13 @@ impl<'a> ServersCtx<'a> {
         let probe_url = self.settings.ping_test_probe_url().to_owned();
         let lang = self.settings.language;
         // The probe carries the TUN adapter's own name so its resolution can
-        // exclude that adapter, and — when the stored path is Bind NIC and the
-        // tunnel actually owns the capture — the TUN screen's outbound
-        // interface, so its dials bypass the capture. The effective path is
-        // Native whenever Bind NIC cannot bind (TUN mode off or the core not
-        // running), so the stored preference never leaks a meaningless bind
-        // into the probe.
-        let tun_active = self.settings.mode == crate::model::Mode::Tun && self.core_running;
+        // exclude that adapter, and — while the stored path is Bind NIC and TUN
+        // mode is on — the TUN screen's outbound interface. The probe runtime
+        // still checks the live capture: a Bind NIC path chosen before the
+        // tunnel connects is the same OS path as Native.
+        let tun_enabled = self.settings.mode == crate::model::Mode::Tun;
         let path =
-            sys::outbound_path::effective_probe_path(self.settings.latency_test_path, tun_active);
+            sys::outbound_path::effective_probe_path(self.settings.latency_test_path, tun_enabled);
         let tun_outbound_interface =
             sys::outbound_path::probe_interface_setting(path, &self.settings.tun);
         let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
@@ -891,7 +890,8 @@ impl<'a> UiCtx<'a> {
         ServersCtx {
             servers: &mut *self.servers,
             settings: &mut *self.settings,
-            core_running: matches!(self.phase, crate::rt::CorePhase::Running),
+            tun_live: matches!(self.phase, crate::rt::CorePhase::Running)
+                && matches!(self.transport, Some(CoreTransport::Tun)),
             busy: self.busy,
             probe_feedback: &mut *self.probe_feedback,
             probe_progress: &mut *self.probe_progress,
@@ -2383,9 +2383,41 @@ mod tests {
         }
     }
 
-    /// The probe carries the outbound interface only while the stored path is
-    /// Bind NIC and the tunnel is live; the effective path decides, exactly as
-    /// the Settings control displays it.
+    /// The probe carries the outbound interface while the stored path is Bind
+    /// NIC and TUN mode is on; the effective path decides, exactly as the
+    /// Settings control displays it. Without a live tunnel the probe runtime
+    /// treats the bind as Native, which is the same OS path.
+    #[test]
+    fn servers_tun_live_is_the_running_tuns_ownership_not_the_mode() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = crate::model::Mode::Tun;
+        let cases = [
+            (
+                CorePhase::Running,
+                Some(CoreTransport::Tun),
+                true,
+                "a running TUN owns the live capture",
+            ),
+            (
+                CorePhase::Running,
+                Some(CoreTransport::Direct),
+                false,
+                "a Direct core in TUN mode owns no capture",
+            ),
+            (
+                CorePhase::Stopped,
+                Some(CoreTransport::Tun),
+                false,
+                "a stopped core cannot own a live capture",
+            ),
+        ];
+        for (phase, transport, expected, why) in cases {
+            rig.phase = phase;
+            rig.transport = transport;
+            assert_eq!(rig.ctx().servers().tun_live, expected, "{why}");
+        }
+    }
+
     #[test]
     fn request_latency_probe_follows_the_effective_outbound_path() {
         let mut rig = UiTestRig::default();
@@ -2449,8 +2481,9 @@ mod tests {
             panic!("expected ProbeLatency, got a different command");
         }
 
-        // TUN mode requested but the core is not running yet: the live gate
-        // still reads as no tunnel, so the probe carries no bind.
+        // TUN mode requested but the core is not running yet: the request
+        // still carries the chosen interface, and the probe runtime treats it
+        // as Native because no live capture exists.
         rig.settings.mode = crate::model::Mode::Tun;
         rig.phase = CorePhase::Stopped;
         rig.ctx()
@@ -2463,8 +2496,9 @@ mod tests {
         } = rig._cmd_rx.try_recv().expect("probe command")
         {
             assert_eq!(
-                tun_outbound_interface, None,
-                "a stopped core owns no tunnel, so Bind NIC binds nothing"
+                tun_outbound_interface.as_deref(),
+                Some("auto"),
+                "the probe must carry the chosen bind; its runtime decides Native vs bind"
             );
         } else {
             panic!("expected ProbeLatency, got a different command");

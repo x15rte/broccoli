@@ -359,6 +359,47 @@ pub fn reveal_toggle(ui: &mut egui::Ui, lang: Language, revealed: &mut bool) {
     }
 }
 
+/// The fixed two-way header switch a screen uses to move between its data side
+/// and its settings side. It wears the app's navigation look — frameless labels
+/// with the selected segment's underline — rather than a control that reads as
+/// a command. The selected segment publishes its selected state for assistive
+/// technology; the visual underline is the second cue.
+pub fn side_switch<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    selected: &mut T,
+    options: &[(T, &str, &str)],
+) {
+    for (index, &(value, label, hint)) in options.iter().enumerate() {
+        let is_selected = *selected == value;
+        let text = if is_selected {
+            egui::RichText::new(label)
+                .strong()
+                .color(ui.visuals().text_color())
+        } else {
+            egui::RichText::new(label).weak()
+        };
+        let response = ui
+            .add(egui::Button::selectable(is_selected, text).frame(false))
+            .on_hover_text(hint);
+        if is_selected {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(response.rect.left(), response.rect.bottom() + 1.0),
+                    egui::vec2(response.rect.width(), 2.0),
+                ),
+                1.0,
+                ui.visuals().selection.bg_fill,
+            );
+        }
+        if response.clicked() && !is_selected {
+            *selected = value;
+        }
+        if index + 1 < options.len() {
+            ui.add_space(8.0);
+        }
+    }
+}
+
 /// The run that stands in for a masked value. Fixed width: the run never
 /// reports the hidden value's length.
 const MASKED_RUN: &str = "••••••••";

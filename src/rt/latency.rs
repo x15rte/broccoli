@@ -186,6 +186,9 @@ pub(crate) fn resolve_probe_interface(
         .and_then(|name| ifaces.iter().find(|iface| iface.name == name))
         .map(|iface| iface.index);
     match sys::netif::resolve_probe_uplink(setting, tun_active, tun_self_index, ifaces) {
+        // A Bind NIC request carries an interface while TUN mode is on, but
+        // without a live capture it and Native are the same OS path. Falling
+        // back to no bind is therefore not a silent route change.
         ProbeUplink::Unbound => Ok(None),
         ProbeUplink::Interface(name) => Ok(Some(name.to_owned())),
         ProbeUplink::TunSelf { name } => Err(ProbeFailure::plain(
@@ -885,9 +888,23 @@ mod tests {
     }
 
     #[test]
-    fn inactive_tun_wins_over_a_fixed_name_error() {
+    fn inactive_tun_with_a_requested_interface_stays_unbound() {
         let resolved = resolve_probe_interface(Some("ghost"), false, None, &[])
-            .expect("no error when the TUN is inactive");
+            .expect("without a live capture Bind NIC and Native are the same path");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn inactive_tun_without_a_requested_interface_stays_unbound() {
+        let resolved = resolve_probe_interface(None, false, None, &[])
+            .expect("Native has no interface to bind");
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn live_tun_without_a_candidate_stays_unbound() {
+        let resolved = resolve_probe_interface(Some("auto"), true, None, &[])
+            .expect("a live TUN with no auto candidate keeps the unbound fallback");
         assert_eq!(resolved, None);
     }
 

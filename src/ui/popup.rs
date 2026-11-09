@@ -25,10 +25,12 @@ use egui::{Context, Id, Ui, ViewportBuilder, ViewportId};
 /// open.
 ///
 /// `size` is the initial inner size in points and `resizable` the window's
-/// resize affordance, both applied when the window is first created. The
+/// resize affordance, applied only when the window is created or reopened. The
 /// window's geometry is kept for the session: the size and position it last
 /// reported are what a window that closed and reopened returns to, so the
-/// caller's default never replaces what the user gave it.
+/// caller's default never replaces what the user gave it. While the window
+/// stays open its geometry belongs to the platform: writing the last reported
+/// geometry back every frame makes a resize or a drag fight the user.
 ///
 /// Returns whether the platform asked for the window to close — its title-bar
 /// close button or Alt+F4. That request is the pop-up's counterpart of the
@@ -52,19 +54,28 @@ pub(crate) fn show(
     // The geometry the window last reported, kept in the context's data for
     // the session: an immediate viewport starts from its builder every time it
     // is shown, so the caller's default size would otherwise replace the one
-    // the user resized to.
+    // the user resized to. The pass the window was last shown in tells an
+    // open window from one that closed and reopened: only the latter applies
+    // the kept geometry. Writing it back while the window stays open makes
+    // every resize and drag a feedback loop against the platform.
     let geometry_id = Id::unique(("popup-kept-geometry", &key));
+    let shown_id = Id::unique(("popup-last-shown", &key));
     let kept = ctx.data(|data| data.get_temp::<KeptGeometry>(geometry_id));
+    let pass = ctx.cumulative_pass_nr();
+    let last_pass = ctx.data(|data| data.get_temp::<u64>(shown_id));
+    let reopening = last_pass.is_none_or(|last| last.saturating_add(1) < pass);
     let viewport_id = ViewportId::from_hash_of(key);
     let mut viewport = ViewportBuilder::default()
         .with_title(title)
         .with_resizable(resizable);
-    viewport = match kept {
-        Some(kept) => viewport
-            .with_inner_size(kept.size)
-            .with_position(kept.position),
-        None => viewport.with_inner_size(size),
-    };
+    if reopening {
+        viewport = match kept {
+            Some(kept) => viewport
+                .with_inner_size(kept.size)
+                .with_position(kept.position),
+            None => viewport.with_inner_size(size),
+        };
+    }
     let embedded = ctx.embed_viewports();
     let mut close_requested = false;
     ctx.show_viewport_immediate(viewport_id, viewport, |ui, _class| {
@@ -118,6 +129,7 @@ pub(crate) fn show(
             }
         }
     });
+    ctx.data_mut(|data| data.insert_temp(shown_id, pass));
     close_requested
 }
 
@@ -492,11 +504,12 @@ mod tests {
         );
     }
 
-    /// A window that closed and reopened keeps the geometry it had: the
-    /// caller's default size creates it, and the size and position the
-    /// platform last reported are what it returns to.
+    /// An open window owns its geometry: a frame while it stays open must not
+    /// write the previous size or position back, or a resize/drag fights the
+    /// platform every frame. A window that closed and reopened starts from the
+    /// geometry it last reported.
     #[test]
-    fn a_reopened_window_keeps_the_geometry_it_had() {
+    fn an_open_window_owns_its_geometry_and_a_reopened_window_restores_it() {
         const SIZE: egui::Vec2 = egui::Vec2 { x: 520.0, y: 333.0 };
         const POSITION: Pos2 = Pos2 { x: 300.0, y: 200.0 };
         let ctx = Context::default();
@@ -529,7 +542,13 @@ mod tests {
             });
             output.textures_delta.clear();
         };
+        let closed_frame = || {
+            let mut output = ctx.run_ui(RawInput::default(), |_ui| {});
+            output.textures_delta.clear();
+        };
         frame();
+        frame();
+        closed_frame();
         frame();
 
         let builders = builders.borrow();
@@ -539,12 +558,20 @@ mod tests {
             "the first open starts from the caller's default size"
         );
         assert_eq!(
-            builders[1].inner_size,
+            builders[1].inner_size, None,
+            "an open window must not write its size back every frame"
+        );
+        assert_eq!(
+            builders[1].position, None,
+            "an open window must not write its position back every frame"
+        );
+        assert_eq!(
+            builders[2].inner_size,
             Some(SIZE),
             "the reopened window keeps the size it had"
         );
         assert_eq!(
-            builders[1].position,
+            builders[2].position,
             Some(POSITION),
             "the reopened window keeps the position it had"
         );

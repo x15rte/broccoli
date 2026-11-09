@@ -3,21 +3,21 @@
 //! Bind NIC uses the TUN screen's outbound-interface selection and the same
 //! resolver the tunnel guard and the probe use; Native follows the OS stack,
 //! which the tunnel captures while it is up. SOCKS5 exists on the refresh
-//! path only. Bind NIC needs a live tunnel: while TUN mode is off the stored
-//! preference is kept, but the effective path reads as Native.
+//! Bind NIC is selectable while TUN mode is on; before the tunnel connects it
+//! and Native are the same OS path, so a probe or refresh simply follows the
+//! OS stack instead of failing.
 //!
-//! Every resolution that cannot produce its carrier fails loudly. Nothing
-//! here falls back to the OS stack, because a fetch that silently changed
-//! route would look like a working path while measuring or fetching through
-//! the tunnel.
+//! Every resolution that cannot produce its carrier fails loudly. The one
+//! equivalent fallback is Bind NIC before the live capture: with no TUN
+//! traffic to bypass it and Native are the same OS path.
 
 use crate::model::{ProbePath, RefreshPath, Socks5Cfg, TunCfg};
 use crate::sys::netif::{NetIf, ProbeUplink, resolve_probe_uplink};
 use crate::sys::subscription::FetchTransport;
 
-/// The two path vocabularies' shared degradation rule: Bind NIC needs the
-/// live tunnel, so it reads as Native when the tunnel is down; every other
-/// path stays as stored.
+/// The two path vocabularies' shared degradation rule: Bind NIC reads as
+/// Native when the tunnel cannot carry a bind; every other path stays as
+/// stored.
 trait PathDegrade: Copy {
     fn native() -> Self;
     fn is_bind_nic(self) -> bool;
@@ -43,8 +43,8 @@ impl PathDegrade for RefreshPath {
     }
 }
 
-fn effective_path<P: PathDegrade>(stored: P, tun_active: bool) -> P {
-    if stored.is_bind_nic() && !tun_active {
+fn effective_path<P: PathDegrade>(stored: P, tun_enabled: bool) -> P {
+    if stored.is_bind_nic() && !tun_enabled {
         P::native()
     } else {
         stored
@@ -52,22 +52,22 @@ fn effective_path<P: PathDegrade>(stored: P, tun_active: bool) -> P {
 }
 
 /// The effective probe path. Bind NIC binds the physical uplink to bypass the
-/// TUN capture, which only exists while the tunnel is up; with the tunnel off
-/// the stored preference is retained but the effective path is Native.
-pub fn effective_probe_path(stored: ProbePath, tun_active: bool) -> ProbePath {
-    effective_path(stored, tun_active)
+/// TUN capture, which only exists while the tunnel is up; when there is no
+/// live capture, or TUN mode is off, the effective path is Native.
+pub fn effective_probe_path(stored: ProbePath, tun_enabled: bool) -> ProbePath {
+    effective_path(stored, tun_enabled)
 }
 
 /// The effective refresh path. Bind NIC behaves as it does for the probe;
 /// Native and SOCKS5 stay as stored, because neither needs the tunnel.
-pub fn effective_refresh_path(stored: RefreshPath, tun_active: bool) -> RefreshPath {
-    effective_path(stored, tun_active)
+pub fn effective_refresh_path(stored: RefreshPath, tun_enabled: bool) -> RefreshPath {
+    effective_path(stored, tun_enabled)
 }
 
 /// The probe command's `tun_outbound_interface` argument: Bind NIC carries the
 /// TUN screen's outbound interface, Native carries none. The runtime still
-/// gates the binding on its live backend ownership, so a request built while
-/// the tunnel is off binds nothing.
+/// gates the binding on its live backend ownership; without that capture the
+/// bind is treated as Native, which is the same OS path.
 pub fn probe_interface_setting(path: ProbePath, tun: &TunCfg) -> Option<String> {
     match path {
         ProbePath::BindNic => Some(tun.auto_outbounds_interface.clone()),
@@ -98,18 +98,19 @@ pub enum PathError {
 
 /// Resolve the effective refresh path into the fetch client's transport.
 /// `path` and `socks5` are the values in force (the global setting or the
-/// group's override); `tun_active` is the live TUN ownership the caller
-/// observes; `interfaces` is the caller's adapter view. Bind NIC binds the
-/// resolved adapter's address; the SOCKS5 connection itself takes no bind, so
-/// the user's routing owns that leg.
+/// `tun_enabled` is the TUN mode switch and `tun_live` the live TUN ownership
+/// the caller observes. Bind NIC only binds while the live capture exists;
+/// before that it and Native are the same OS path, so the fetch follows the
+/// stack instead of failing. `interfaces` is the caller's adapter view.
 pub fn refresh_transport(
     path: RefreshPath,
     socks5: &Socks5Cfg,
     tun: &TunCfg,
-    tun_active: bool,
+    tun_enabled: bool,
+    tun_live: bool,
     interfaces: &[NetIf],
 ) -> Result<FetchTransport, PathError> {
-    match effective_refresh_path(path, tun_active) {
+    match effective_refresh_path(path, tun_enabled && tun_live) {
         RefreshPath::Native => Ok(FetchTransport::Native),
         RefreshPath::Socks5 => {
             let host = socks5.host.trim();
@@ -137,15 +138,15 @@ pub fn refresh_transport(
             })
         }
         RefreshPath::BindNic => {
-            // Effective Bind NIC only survives `tun_active`, so the resolver
-            // is asked for the same live gate the probe uses.
+            // The effective path says Bind NIC is selected and the live
+            // capture exists; resolve the adapter it names.
             let tun_self_index = interfaces
                 .iter()
                 .find(|iface| iface.name == tun.effective_name())
                 .map(|iface| iface.index);
             match resolve_probe_uplink(
                 Some(&tun.auto_outbounds_interface),
-                tun_active,
+                tun_live,
                 tun_self_index,
                 interfaces,
             ) {
@@ -170,6 +171,18 @@ pub fn refresh_transport(
 mod tests {
     use super::*;
     use crate::sys::netif::test_iface;
+
+    /// The pre-liveness call shape: a path test that is not about the
+    /// enabled/live split treats an enabled TUN as a live one.
+    fn refresh_transport(
+        path: RefreshPath,
+        socks5: &Socks5Cfg,
+        tun: &TunCfg,
+        tun_active: bool,
+        interfaces: &[NetIf],
+    ) -> Result<FetchTransport, PathError> {
+        super::refresh_transport(path, socks5, tun, tun_active, tun_active, interfaces)
+    }
 
     fn tun(setting: &str) -> TunCfg {
         TunCfg {
@@ -379,6 +392,24 @@ mod tests {
             ),
             Ok(FetchTransport::Native),
             "the stored preference is retained, but the fetch follows the OS stack"
+        );
+    }
+
+    #[test]
+    fn bind_nic_before_the_tunnel_connects_follows_native() {
+        let ethernet = test_iface("Ethernet", 2, false, true, &["10.0.0.7"]);
+        let result = super::refresh_transport(
+            RefreshPath::BindNic,
+            &Socks5Cfg::default(),
+            &tun("Ethernet"),
+            true,
+            false,
+            std::slice::from_ref(&ethernet),
+        );
+        assert_eq!(
+            result,
+            Ok(FetchTransport::Native),
+            "without a live capture Bind NIC and Native are the same path"
         );
     }
 

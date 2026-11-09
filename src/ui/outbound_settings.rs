@@ -30,9 +30,20 @@ pub struct OutboundSettingsSection {
     /// Transient reveal state of the SOCKS5 password. Leaving and returning to
     /// the screen masks it again.
     revealed_password: bool,
+    /// Whether a password being typed into the empty field stays editable until
+    /// the field loses focus; a stored password uses the masked stand-in.
+    socks5_password_editing: bool,
 }
 
 impl OutboundSettingsSection {
+    /// Mask the section's transient password state when the screen or the
+    /// Settings side is left. The stored value stays in the model; only the
+    /// reveal and in-progress editing state die with the visit.
+    pub(crate) fn reset_transient(&mut self) {
+        self.revealed_password = false;
+        self.socks5_password_editing = false;
+    }
+
     /// Render the latency-test section (probe URL, outbound path) and the
     /// subscription section (global User-Agent, outbound path, global SOCKS5
     /// fields). Every edit marks the settings dirty through `hooks`, so the
@@ -42,10 +53,10 @@ impl OutboundSettingsSection {
         ui: &mut Ui,
         settings: &mut Settings,
         hooks: &mut FrameHooks<'_>,
-        tun_active: bool,
+        tun_enabled: bool,
     ) {
         let lang = settings.language;
-        let tun_on = tun_active;
+        let tun_on = tun_enabled;
 
         widgets::section(ui, t(lang, Key::SettingsLatencyTest), |ui| {
             if widgets::noted(ui, t(lang, Key::SettingsLatencyTestNote), |ui| {
@@ -72,7 +83,14 @@ impl OutboundSettingsSection {
             }
             ui.label(RichText::new(t(lang, Key::SettingsSubscriptionUserAgentHint)).weak());
             self.subscription_path_control(ui, &mut *settings, tun_on, &mut *hooks);
-            self.socks5_fields(ui, &mut *settings, &mut *hooks);
+            if effective_refresh_path(settings.subscription_path, tun_on) == RefreshPath::Socks5 {
+                self.socks5_fields(ui, &mut *settings, &mut *hooks);
+            } else {
+                // The block is not in force, so its transient reveal and
+                // empty-field editing states must not survive a path switch.
+                self.revealed_password = false;
+                self.socks5_password_editing = false;
+            }
         });
     }
 
@@ -146,8 +164,9 @@ impl OutboundSettingsSection {
 
     /// The global SOCKS5 carrier the refresh's SOCKS5 path dials through.
     /// Address and port are required while the path is SOCKS5; the credentials
-    /// are optional and travel together. The password is a secret field and
-    /// only renders editable while revealed.
+    /// are optional and travel together. An empty password is editable, a
+    /// stored or newly typed one masks until revealed, and the reveal state
+    /// dies with the visit.
     fn socks5_fields(&mut self, ui: &mut Ui, settings: &mut Settings, hooks: &mut FrameHooks<'_>) {
         let lang = settings.language;
         let username = self.socks5_username_buf.begin(|| {
@@ -164,14 +183,37 @@ impl OutboundSettingsSection {
                 .clone()
                 .unwrap_or_default()
         });
+        // A draft seeded from a value the model no longer holds must not
+        // resurrect it as bullets: the model is the only source of truth.
+        if settings
+            .subscription_socks5
+            .username
+            .as_deref()
+            .is_none_or(str::is_empty)
+            && !username.is_empty()
+        {
+            username.clear();
+        }
+        if settings
+            .subscription_socks5
+            .password
+            .as_deref()
+            .is_none_or(str::is_empty)
+            && !password.is_empty()
+        {
+            password.clear();
+        }
         if socks5_editor(
             ui,
             lang,
             &mut settings.subscription_socks5.host,
             &mut settings.subscription_socks5.port,
             username,
-            password,
-            &mut self.revealed_password,
+            Socks5Password {
+                value: password,
+                revealed: &mut self.revealed_password,
+                editing: &mut self.socks5_password_editing,
+            },
         ) {
             settings.subscription_socks5.username = optional_field(username);
             settings.subscription_socks5.password = optional_field(password);
@@ -243,17 +285,25 @@ pub(crate) fn path_control<T: Copy + PartialEq>(
     picked
 }
 
+/// The password buffer and its two transient states, bundled so the shared
+/// editor keeps one slot for the value and one for what the user is doing with
+/// it.
+pub(crate) struct Socks5Password<'a> {
+    pub value: &'a mut String,
+    pub revealed: &'a mut bool,
+    pub editing: &'a mut bool,
+}
+
 /// The shared SOCKS5 editor for the global subscription settings and the
-/// per-subscription dialog. The caller supplies its own field buffers and
-/// reveal state; the labels, masking, and note live here once.
+/// per-subscription dialog. The caller supplies its own field buffers and the
+/// password's state; the labels, masking, and note live here once.
 pub(crate) fn socks5_editor(
     ui: &mut Ui,
     lang: Language,
     host: &mut String,
     port: &mut u16,
     username: &mut String,
-    password: &mut String,
-    revealed: &mut bool,
+    password: Socks5Password<'_>,
 ) -> bool {
     let mut changed = widgets::text_field(ui, t(lang, Key::SettingsSocks5Host), host, "127.0.0.1");
     changed |= widgets::port_field(ui, t(lang, Key::SettingsSocks5Port), port);
@@ -263,14 +313,42 @@ pub(crate) fn socks5_editor(
         username,
         "proxy user",
     );
-    changed |= widgets::masked_text_field(
-        ui,
-        t(lang, Key::SettingsSocks5Password),
-        password,
-        "proxy password",
-        !*revealed,
-    );
-    password_reveal(ui, lang, revealed);
+    // An absent password is an empty, editable field: there is no secret to
+    // hide, and the user must be able to type one. A new password stays
+    // editable while it is being typed (and loses focus), then follows the
+    // stored password's masked stand-in. An explicit reveal shows the value
+    // regardless.
+    if password.value.is_empty() || *password.editing || *password.revealed {
+        let response = ui
+            .horizontal(|ui| {
+                let label = ui.label(t(lang, Key::SettingsSocks5Password));
+                ui.add(
+                    egui::TextEdit::singleline(password.value)
+                        .hint_text("proxy password")
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(label.id)
+            })
+            .inner;
+        changed |= response.changed();
+        if response.has_focus() || response.changed() {
+            *password.editing = true;
+        }
+        if response.lost_focus() {
+            *password.editing = false;
+        }
+    } else {
+        changed |= widgets::masked_text_field(
+            ui,
+            t(lang, Key::SettingsSocks5Password),
+            password.value,
+            "proxy password",
+            true,
+        );
+    }
+    if !password.value.is_empty() && !*password.editing {
+        password_reveal(ui, lang, password.revealed);
+    }
     ui.label(
         RichText::new(t(lang, Key::SettingsSocks5Note))
             .small()
@@ -643,8 +721,123 @@ mod tests {
     }
 
     #[test]
+    fn socks5_fields_render_only_while_the_effective_path_is_socks5() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Off;
+        rig.settings.subscription_path = RefreshPath::Native;
+        let mut harness = harness(rig, OutboundSettingsSection::default());
+        harness.run();
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SettingsSocks5Host))
+                .is_none(),
+            "Native must not render the SOCKS5 block"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SettingsSocks5Password))
+                .is_none(),
+            "Native must not render the password row"
+        );
+
+        last_segment(&harness, t(Language::En, Key::SettingsPathSocks5)).click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SettingsSocks5Host))
+                .is_some(),
+            "the SOCKS5 path renders its block"
+        );
+    }
+
+    #[test]
+    fn an_empty_socks5_password_is_editable_without_a_reveal_button() {
+        let mut rig = UiTestRig::default();
+        rig.settings.subscription_path = RefreshPath::Socks5;
+        let mut harness = harness(rig, OutboundSettingsSection::default());
+        harness.run();
+
+        let password_label = t(Language::En, Key::SettingsSocks5Password);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SettingsSocks5RevealPassword))
+                .is_none(),
+            "an absent password has nothing to reveal"
+        );
+        let field = harness.get_by_role_and_label(egui::accesskit::Role::TextInput, password_label);
+        field.click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, password_label)
+            .type_text("hunter2");
+        harness.run_steps(4);
+
+        assert_eq!(
+            harness
+                .state()
+                .1
+                .settings
+                .subscription_socks5
+                .password
+                .as_deref(),
+            Some("hunter2"),
+            "the empty field accepts a new password"
+        );
+
+        // Leaving the field masks the freshly typed value and restores the
+        // explicit Reveal control.
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::TextInput,
+                t(Language::En, Key::SettingsSocks5Username),
+            )
+            .click();
+        harness.run();
+        assert!(
+            !harness
+                .get_all_by_role(egui::accesskit::Role::TextInput)
+                .any(|node| node.value().as_deref() == Some("hunter2")),
+            "a typed password masks after focus leaves"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SettingsSocks5RevealPassword))
+                .is_some(),
+            "the masked password offers Reveal again"
+        );
+    }
+
+    #[test]
+    fn clearing_the_model_password_resets_a_stale_draft() {
+        let mut rig = UiTestRig::default();
+        rig.settings.subscription_path = RefreshPath::Socks5;
+        rig.settings.subscription_socks5.password = Some("stale".into());
+        let mut harness = harness(rig, OutboundSettingsSection::default());
+        harness.run();
+
+        harness.state_mut().1.settings.subscription_socks5.password = None;
+        harness.run();
+
+        let password_label = t(Language::En, Key::SettingsSocks5Password);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SettingsSocks5RevealPassword))
+                .is_none(),
+            "an empty model value must not leave a revealable secret"
+        );
+        let field = harness.get_by_role_and_label(egui::accesskit::Role::TextInput, password_label);
+        assert_eq!(
+            field.value().as_deref(),
+            Some(""),
+            "the cleared model value must clear the seeded draft"
+        );
+    }
+
+    #[test]
     fn socks5_password_is_masked_until_revealed() {
         let mut rig = UiTestRig::default();
+        rig.settings.subscription_path = RefreshPath::Socks5;
         rig.settings.subscription_socks5.password = Some("hunter2".into());
         let mut harness = harness(rig, OutboundSettingsSection::default());
         harness.run();

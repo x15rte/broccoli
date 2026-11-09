@@ -40,7 +40,6 @@ struct InboundTexts {
 
 /// One latency-grid row's memoized lookups and formatted text.
 struct LatencyRow {
-    name: String,
     tag: String,
     cell: LatencyCell,
     /// The detail's headline: the observatory's last error, the keyed
@@ -759,17 +758,15 @@ impl DashboardScreen {
                 } else {
                     let grid = self.latency_rows(ctx);
                     egui::Grid::new("latency-grid")
-                        .num_columns(4)
+                        .num_columns(3)
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.strong(t(lang, Key::GridName));
                             ui.strong(t(lang, Key::GridTag));
                             ui.strong(t(lang, Key::GridLatency));
                             ui.strong(t(lang, Key::GridDetail));
                             ui.end_row();
                             let colors = status_colors_of(ui);
                             for row in grid {
-                                ui.label(&row.name);
                                 ui.monospace(&row.tag);
                                 latency_cell(ui, &row.cell, colors, lang);
                                 // The row's detail is pre-truncated to 60
@@ -906,7 +903,6 @@ fn build_latency_rows(ctx: &DashboardCtx<'_>) -> Vec<LatencyRow> {
             let (detail_short, detail_truncated) =
                 short_detail(lang, &detail_head, detail_tail.as_deref(), 60);
             LatencyRow {
-                name: p.name.clone(),
                 tag,
                 cell,
                 detail_head,
@@ -1684,21 +1680,17 @@ mod tests {
             )
     }
 
-    /// The latency grid's rows, as the profile names `names` in display
-    /// order: the labels are read top-to-bottom, so an assertion states the
-    /// order a user sees rather than the accessibility tree's traversal
-    /// order.
-    fn latency_row_names(
-        harness: &Harness<'static, DashboardScreen>,
-        names: &[&str],
-    ) -> Vec<String> {
+    /// The latency grid's rows, as the tags `tags` in display order: the
+    /// labels are read top-to-bottom, so an assertion states the order a user
+    /// sees rather than the accessibility tree's traversal order.
+    fn latency_row_tags(harness: &Harness<'static, DashboardScreen>, tags: &[&str]) -> Vec<String> {
         let mut rows: Vec<(f32, String)> = harness
             .query_all_by(|node| node.role() == egui::accesskit::Role::Label)
             .filter_map(|node| {
                 let value = node.accesskit_node().value()?;
                 Some((node.rect().top(), value))
             })
-            .filter(|(_, value)| names.contains(&value.as_str()))
+            .filter(|(_, value)| tags.contains(&value.as_str()))
             .collect();
         rows.sort_by(|a, b| a.0.total_cmp(&b.0));
         rows.into_iter().map(|(_, value)| value).collect()
@@ -2297,10 +2289,11 @@ mod tests {
 
         // A profile edit reaches its row.
         rig.borrow_mut().servers.profiles[1].name = "beta-renamed".into();
+        let renamed_tag = rig.borrow().servers.profiles[1].tag();
         rig.borrow_mut().edit();
         harness.run();
         harness
-            .get_all_by_label("beta-renamed")
+            .get_all_by_label(&renamed_tag)
             .next()
             .expect("a model change re-renders the row");
     }
@@ -2330,10 +2323,24 @@ mod tests {
         let mut harness = harness_for(Rc::clone(&rig));
         harness.run();
 
-        let names = ["Active", "First", "Second", "Disabled"];
+        let (active_tag, first_tag, second_tag, disabled_tag) = {
+            let rig = rig.borrow();
+            (
+                rig.servers.profiles[1].tag(),
+                rig.servers.profiles[0].tag(),
+                rig.servers.profiles[3].tag(),
+                rig.servers.profiles[2].tag(),
+            )
+        };
+        let tags = [
+            active_tag.as_str(),
+            first_tag.as_str(),
+            second_tag.as_str(),
+            disabled_tag.as_str(),
+        ];
         assert_eq!(
-            latency_row_names(&harness, &names),
-            ["Active", "First", "Second"],
+            latency_row_tags(&harness, &tags),
+            [active_tag.as_str(), first_tag.as_str(), second_tag.as_str()],
             "the active server leads, then the enabled servers in stored order"
         );
 
@@ -2342,8 +2349,8 @@ mod tests {
         rig.borrow_mut().edit();
         harness.run();
         assert_eq!(
-            latency_row_names(&harness, &names),
-            ["Active", "Second"],
+            latency_row_tags(&harness, &tags),
+            [active_tag.as_str(), second_tag.as_str()],
             "a switched-off server leaves the table"
         );
     }
@@ -2359,7 +2366,7 @@ mod tests {
         harness.run();
 
         harness
-            .get_all_by_label(t(Language::En, Key::GridName))
+            .get_all_by_label(t(Language::En, Key::GridTag))
             .next()
             .expect("the grid header renders for an empty emitted set");
         assert!(

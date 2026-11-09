@@ -151,7 +151,8 @@ impl Subscription {
     }
     /// The refresh outbound path this group's fetch uses: the custom path when
     /// the group enabled its override, the global path otherwise. The caller
-    /// then applies the live TUN gate, exactly as it does for the global value.
+    /// then applies the TUN mode gate, exactly as it does for the global value;
+    /// the live capture is checked separately when the fetch resolves.
     pub fn effective_refresh_path(&self, global: RefreshPath) -> RefreshPath {
         if self.outbound_custom {
             self.outbound_path

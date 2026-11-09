@@ -2358,16 +2358,10 @@ pub struct ServersScreen {
     /// The model generation the selection was last pruned against: a stale
     /// selection id can only come from a model change.
     selection_generation: Option<u64>,
-    /// Per-profile table cells (the protocol-and-security column and the
-    /// `address:port` column), rebuilt only when the model generation moves.
-    row_details: Option<(
-        u64,
-        std::rc::Rc<std::collections::HashMap<usize, RowDetail>>,
-    )>,
     /// The column widths fitted to the header and the cell text, rebuilt when
-    /// the model generation or the language moves. The table reads the
-    /// widths the user dragged from the settings and falls back to these.
-    adaptive_widths: Option<(u64, Language, ColumnWidths)>,
+    /// the language moves or the user asks to fit. The table reads the widths
+    /// the user dragged from the settings and falls back to these.
+    adaptive_widths: Option<(Language, ColumnWidths)>,
     /// The toolbar's "Fit columns" command, consumed by the table on the
     /// frame that set it.
     fit_columns: bool,
@@ -2549,6 +2543,9 @@ struct GroupDraft {
     socks5_password: String,
     /// The dialog's own password reveal, masked again every time it opens.
     reveal_password: bool,
+    /// Whether an empty or newly typed password stays editable until the
+    /// password field loses focus.
+    password_editing: bool,
 }
 
 impl GroupDraft {
@@ -2556,6 +2553,10 @@ impl GroupDraft {
     /// stored ones.
     fn editing(group: &crate::model::servers::Group) -> Self {
         let subscription = group.subscription.as_ref();
+        // A stored block belongs to the override; an override that is off has
+        // no fields in force, so seeding them would show a password the user
+        // is not using.
+        let custom = subscription.filter(|subscription| subscription.outbound_custom);
         Self {
             editing: Some(group.id.clone()),
             kind: group.kind(),
@@ -2572,19 +2573,20 @@ impl GroupDraft {
             outbound_path: subscription
                 .map(|subscription| subscription.outbound_path)
                 .unwrap_or_default(),
-            socks5_host: subscription
+            socks5_host: custom
                 .map(|subscription| subscription.socks5.host.clone())
                 .unwrap_or_default(),
-            socks5_port: subscription
+            socks5_port: custom
                 .map(|subscription| subscription.socks5.port)
                 .unwrap_or_default(),
-            socks5_username: subscription
+            socks5_username: custom
                 .and_then(|subscription| subscription.socks5.username.clone())
                 .unwrap_or_default(),
-            socks5_password: subscription
+            socks5_password: custom
                 .and_then(|subscription| subscription.socks5.password.clone())
                 .unwrap_or_default(),
             reveal_password: false,
+            password_editing: false,
         }
     }
 }
@@ -2660,6 +2662,7 @@ impl ServersScreen {
     /// the switch is a transient view of the screen rather than a route.
     pub(crate) fn enter(&mut self) {
         self.side = ServersSide::Table;
+        self.outbound_settings.reset_transient();
     }
 
     fn invalidate_import_preview(&mut self) {
@@ -2854,19 +2857,20 @@ impl ServersScreen {
         let user_agent = subscription.effective_user_agent(&uictx.settings.subscription_user_agent);
         // The override replaces the path and the SOCKS5 block as one unit; the
         // global values are the fallback when the group has none. The
-        // effective path then reads the live tunnel ownership: Bind NIC
-        // carries the adapter only while the tunnel actually owns the
-        // capture, and a path that cannot produce its carrier fails loudly
-        // instead of falling back to the OS stack.
+        // effective path reads TUN mode, while the transport resolution also
+        // receives the live ownership: with no live capture Bind NIC and
+        // Native are the same OS path.
         let path = subscription.effective_refresh_path(uictx.settings.subscription_path);
         let socks5 = subscription.effective_socks5(&uictx.settings.subscription_socks5);
-        let tun_active = uictx.settings.mode == Mode::Tun && uictx.core_running;
+        let tun_enabled = uictx.settings.mode == Mode::Tun;
+        let tun_live = tun_enabled && uictx.tun_live;
         let interfaces = crate::sys::netif::list_all();
         let transport = match crate::sys::outbound_path::refresh_transport(
             path,
             socks5,
             &uictx.settings.tun,
-            tun_active,
+            tun_enabled,
+            tun_live,
             &interfaces,
         ) {
             Ok(transport) => transport,
@@ -3903,9 +3907,7 @@ impl ServersScreen {
     pub(crate) fn mask_secrets(&mut self) {
         self.revealed_existing = false;
         self.revealed_list = false;
-        // The memoized row details hold the masked or revealed endpoint; a
-        // reset must not survive in the cache after the screen is left.
-        self.row_details = None;
+        self.outbound_settings.reset_transient();
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
@@ -3975,14 +3977,16 @@ impl ServersScreen {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            self.show_header(ui, ctx);
+            self.show_header(ui, lang);
             match self.side {
                 ServersSide::Table => self.show_table(ui, ctx),
                 ServersSide::Settings => {
                     // The Settings screen's shell owns the scroll; the
                     // Servers screen's table does, so the mounted section
-                    // scrolls here.
-                    let tun_active = ctx.settings.mode == Mode::Tun && ctx.core_running;
+                    // scrolls here. TUN mode, not the live connection, enables
+                    // the Bind NIC choice: the path is a preference, and with
+                    // no live capture it behaves as Native.
+                    let tun_enabled = ctx.settings.mode == Mode::Tun;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
@@ -3990,7 +3994,7 @@ impl ServersScreen {
                                 ui,
                                 &mut *ctx.settings,
                                 &mut ctx.hooks,
-                                tun_active,
+                                tun_enabled,
                             );
                         });
                 }
@@ -3999,47 +4003,35 @@ impl ServersScreen {
         self.show_dialogs(ui.ctx(), ctx);
     }
 
-    /// The screen's header line: its title, the fixed `Table | Settings`
-    /// switch at the right, and the list's reveal control when Hide server
-    /// information masks the endpoints. The switch lives in this row rather
-    /// than a band of its own, so the table keeps its vertical room.
-    fn show_header(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
-        let lang = ctx.settings.language;
+    /// The screen's header line: its title and the fixed `Table | Settings`
+    /// switch beside it. The list's Reveal control lives in the table
+    /// toolbar, where it masks the rows it belongs to. The switch shares the
+    /// title row rather than taking a band of its own, so the table keeps its
+    /// vertical room.
+    fn show_header(&mut self, ui: &mut egui::Ui, lang: Language) {
         ui.add_space(4.0);
-        let mut reveal_changed = false;
+        let was_settings = self.side == ServersSide::Settings;
         ui.horizontal(|ui| {
             ui.heading(t(lang, Key::ScreenServers));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Right to left: Settings is the rightmost segment, so the
-                // pair reads `Table | Settings` like the Routing switch.
-                ui.selectable_value(
-                    &mut self.side,
-                    ServersSide::Settings,
-                    t(lang, Key::SrvHeaderSettings),
-                )
-                .on_hover_text(t(lang, Key::SrvHeaderSettingsHint));
-                ui.selectable_value(
-                    &mut self.side,
+            let options = [
+                (
                     ServersSide::Table,
                     t(lang, Key::SrvHeaderTable),
-                )
-                .on_hover_text(t(lang, Key::SrvHeaderTableHint));
-                // The reveal sits in front of the list, beside its title:
-                // while Hide server information masks the endpoints, the list
-                // offers the same control the editor does, so reading an
-                // address does not require opening a profile.
-                if ctx.settings.hide_server_info {
-                    let before = self.revealed_list;
-                    widgets::reveal_toggle(ui, lang, &mut self.revealed_list);
-                    reveal_changed = before != self.revealed_list;
-                }
-            });
+                    t(lang, Key::SrvHeaderTableHint),
+                ),
+                (
+                    ServersSide::Settings,
+                    t(lang, Key::SrvHeaderSettings),
+                    t(lang, Key::SrvHeaderSettingsHint),
+                ),
+            ];
+            widgets::side_switch(ui, &mut self.side, &options);
         });
-        if reveal_changed {
-            // The row details memo runs on the model generation; the reveal
-            // is not part of the model, so drop the memo to repaint them.
-            self.row_details = None;
+        if was_settings && self.side != ServersSide::Settings {
+            self.outbound_settings.reset_transient();
         }
+        // Clear the selected segment's underline before the table begins.
+        ui.add_space(4.0);
     }
 
     // ---------- tab bar ----------
@@ -4276,9 +4268,10 @@ impl ServersScreen {
     /// The subscription card between the tab bar and the table: one row with
     /// the feed's quota and expiry on the left and Refresh plus the overflow
     /// menu on the right. The overflow menu carries Raw, Edit, Report and the
-    /// separated Delete group; the provider update hint is a hover. Only a
-    /// subscription group's tab owns a feed, so the three views and a manual
-    /// group render nothing here.
+    /// separated Delete group; the provider update hint shows inline when the
+    /// left region has room and truncates with a hover. Only a subscription
+    /// group's tab owns a feed, so the three views and a manual group render
+    /// nothing here.
     ///
     /// The quota and expiry lines allocate to format, and the card paints
     /// every frame its tab is open, so they are memoized for one group, model
@@ -4395,8 +4388,21 @@ impl ServersScreen {
                         if has_info || title_fallback {
                             ui.add_space(8.0);
                         }
-                        ui.add(egui::Label::new(RichText::new("?").weak()).selectable(false))
-                            .on_hover_text(hint);
+                        // The provider's update hint is information, not a
+                        // hidden command: show it inline while the left
+                        // region can hold it. A narrow card truncates it and
+                        // keeps the full text on hover; only a region with no
+                        // room at all falls back to the `?` marker.
+                        let response = if ui.available_width() >= 8.0 {
+                            ui.add(
+                                egui::Label::new(RichText::new(hint).weak())
+                                    .truncate()
+                                    .selectable(false),
+                            )
+                        } else {
+                            ui.add(egui::Label::new(RichText::new("?").weak()).selectable(false))
+                        };
+                        response.on_hover_text(hint);
                     }
                 },
             );
@@ -4630,18 +4636,26 @@ impl ServersScreen {
                 {
                     action = Some(ListAction::SetActive(id.clone()));
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text(t(lang, Key::SrvSearch))
-                            .desired_width(220.0),
-                    );
-                    if !self.search.is_empty() && ui.small_button("✕").clicked() {
-                        self.search.clear();
-                    }
-                });
             });
         }
+        // The filter row is its own line: the command row above is already
+        // full, and the search and Reveal must never overlap its buttons. It
+        // stays mounted while a probe or refresh runs, so the list keeps its
+        // filter and its reveal affordance.
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text(t(lang, Key::SrvSearch))
+                    .desired_width(220.0),
+            );
+            if !self.search.is_empty() && ui.small_button("✕").clicked() {
+                self.search.clear();
+            }
+            if ctx.settings.hide_server_info {
+                widgets::reveal_toggle(ui, lang, &mut self.revealed_list);
+            }
+        });
+        ui.add_space(4.0);
         if let Some(protocol) = add_proto {
             self.draft_tab = EditorTab::Basic;
             let mut profile = ServerProfile::new(
@@ -4706,29 +4720,37 @@ impl ServersScreen {
         };
         let generation = ctx.hooks.model_generation();
         // The toolbar's fit command takes effect on the frame that asked for
-        // it, before the columns are laid out.
-        if std::mem::take(&mut self.fit_columns) && ctx.settings.server_table_columns.is_some() {
+        // it, before the columns are laid out. The fit measures every
+        // profile, so it must not ride the model generation: a switch or a
+        // sort would otherwise re-measure a long subscription.
+        let fit_requested = std::mem::take(&mut self.fit_columns);
+        if fit_requested && ctx.settings.server_table_columns.is_some() {
             ctx.settings.server_table_columns = None;
             ctx.hooks.mark_dirty();
         }
-        if self
-            .adaptive_widths
-            .as_ref()
-            .map(|(cached, language, _)| (*cached, *language))
-            != Some((generation, lang))
+        let manual = ctx.settings.server_table_columns.map(sanitized_widths);
+        if manual.is_none()
+            && (fit_requested
+                || self.adaptive_widths.as_ref().map(|(language, _)| *language) != Some(lang))
         {
-            self.adaptive_widths = Some((generation, lang, adaptive_widths(ui, lang, ctx.servers)));
+            self.adaptive_widths = Some((lang, adaptive_widths(ui, lang, ctx.servers)));
         }
         let fitted = self
             .adaptive_widths
             .as_ref()
-            .map_or(TABLE_DEFAULT_WIDTHS, |(_, _, widths)| *widths);
-        let manual = ctx.settings.server_table_columns.map(sanitized_widths);
+            .map_or(TABLE_DEFAULT_WIDTHS, |(_, widths)| *widths);
+        let fitting = manual.is_none();
         let widths = manual.unwrap_or(fitted);
-        // The adaptive fit puts every column at its measured width: the tag
-        // keeps its own width and the spare band stays to the right of the
-        // table instead of being absorbed by the tag.
-        let columns = table_columns(shape, widths);
+        // The fitted layout gives the visible spare to the address column,
+        // leaving only the narrow strip the solid scroll bar owns. A table
+        // the user sized by hand keeps the widths they chose.
+        let mut columns = table_columns(shape, widths);
+        if fitting {
+            fill_table_width(
+                &mut columns,
+                (ui.available_width() - TABLE_TRAILING_GAP).max(0.0),
+            );
+        }
         // The header's band is reserved here and painted after the rows: the
         // rows own the horizontal scroll bar, and the header is translated by
         // the offset they report on this same frame, so the two can never
@@ -4856,26 +4878,20 @@ impl ServersScreen {
         // label asks which selected rows are locked, and the route is one of
         // the two locks.
         let active_id = ctx.servers.active.clone();
-        if self.row_details.as_ref().map(|(cached, _)| *cached) != Some(generation) {
-            let hide = ctx.settings.hide_server_info && !self.revealed_list;
-            let details: std::collections::HashMap<usize, RowDetail> = profiles
-                .iter()
-                .enumerate()
-                .map(|(index, profile)| (index, row_detail(profile, hide)))
-                .collect();
-            self.row_details = Some((generation, std::rc::Rc::new(details)));
-        }
-        let row_details = std::rc::Rc::clone(
-            &self
-                .row_details
-                .as_ref()
-                .expect("the row details were cached above")
-                .1,
-        );
+        let endpoint_hidden = ctx.settings.hide_server_info && !self.revealed_list;
         // Whether a row took the pointer's primary click this frame: a click
         // the rows did not take falls to the empty space below them and
         // clears the selection.
         let mut row_hit = false;
+        // The table's background takes a click the rows and controls did
+        // not. Added before the rows so every interactive child sits above
+        // it; a click anywhere in the table's blank area — not only the band
+        // below a short list — clears the selection.
+        let blank_click = ui.interact(
+            ui.available_rect_before_wrap(),
+            ui.scope_id().with("servers.list.blank"),
+            egui::Sense::click(),
+        );
         // Solid scroll bars allocate their own strip, so the horizontal bar
         // cannot float over the last row's cells.
         // The scroll state keeps a constant salt: a sibling above the table
@@ -5023,14 +5039,18 @@ impl ServersScreen {
                                 if lifted == Some(display) {
                                     ui.multiply_opacity(DRAGGED_ROW_OPACITY);
                                 }
-                                let detail = row_details.get(&index);
+                                // Only the visible band is laid out, so the
+                                // two formatted cells are computed for the
+                                // rows on screen, not for every profile.
+                                let detail = row_detail(p);
                                 let clicks = server_list_row(
                                     ui,
                                     lang,
                                     columns,
                                     RowCells {
                                         name: &p.name,
-                                        detail: detail.unwrap_or(&EMPTY_ROW_DETAIL),
+                                        detail: &detail,
+                                        endpoint_hidden,
                                         verdict: p.verdict.as_ref(),
                                         extras: RowExtras {
                                             order: shape.order.then_some(display + 1),
@@ -5345,13 +5365,19 @@ impl ServersScreen {
             ctx.hooks.mark_ui_dirty();
         }
 
-        // A click in the empty band below a short list clears the selection.
-        if !probe_pending && !row_hit && self.delete_pending.is_none() {
-            let blank = ui.allocate_response(
+        // A click in the table's blank area clears the selection. The second
+        // response covers the band below a short list, where the scroll area
+        // ends before the panel does.
+        if !probe_pending
+            && !row_hit
+            && self.delete_pending.is_none()
+            && self.group_delete_pending.is_none()
+        {
+            let below = ui.allocate_response(
                 egui::vec2(ui.available_width(), ui.available_height().max(0.0)),
                 egui::Sense::click(),
             );
-            if blank.clicked() {
+            if blank_click.clicked() || below.clicked() {
                 action = Some(ListAction::ClearSelection);
             }
         }
@@ -6459,24 +6485,13 @@ impl RowClicks {
 }
 
 /// One row's two formatted table cells: the protocol-and-security column and
-/// the `address:port` column. Formatted once per model generation, because
-/// both are functions of the profile alone.
+/// the `address:port` column. Formatted for the rows on screen, because both
+/// are functions of the profile alone.
 #[derive(Clone)]
 struct RowDetail {
     protocol: String,
     endpoint: String,
-    /// Whether the Privacy setting hid the endpoint, as opposed to the
-    /// profile carrying none.
-    endpoint_hidden: bool,
 }
-
-/// The cell text a row renders when the memo has no entry for it (the
-/// impossible index-after-rebuild case): both columns empty.
-const EMPTY_ROW_DETAIL: RowDetail = RowDetail {
-    protocol: String::new(),
-    endpoint: String::new(),
-    endpoint_hidden: false,
-};
 
 /// The widths a table starts from before the fit has run: the wide address
 /// column and the room a checkbox and a latency badge need. The fit lets the
@@ -6491,6 +6506,10 @@ const TABLE_DEFAULT_WIDTHS: ColumnWidths = ColumnWidths {
     address: 240.0,
     group: 160.0,
 };
+/// The strip the solid vertical scroll bar owns on the right. A fitted table
+/// stops short of it, so the bar never forces an unnecessary horizontal
+/// scroll bar; the visible blank is this narrow strip, not a spare band.
+const TABLE_TRAILING_GAP: f32 = 12.0;
 /// The smallest width the tag column keeps; a fit or a drag may not go under
 /// it. The table scrolls sideways past the viewport, so the floor protects the
 /// header from collapsing, not the window from overflowing.
@@ -6632,6 +6651,8 @@ struct RowExtras<'a> {
 struct RowCells<'a> {
     name: &'a str,
     detail: &'a RowDetail,
+    /// Whether the address column paints the mask instead of the endpoint.
+    endpoint_hidden: bool,
     /// The live verdict behind the latency cell; the hover reads its time and
     /// error, which the memoized badge does not keep.
     verdict: Option<&'a ProbeVerdict>,
@@ -6662,6 +6683,17 @@ fn table_columns(shape: TableShape, widths: ColumnWidths) -> TableColumns {
         protocol: widths.protocol,
         address: widths.address,
         group,
+    }
+}
+
+/// Give the visible spare to the address column. That column carries the
+/// variable-width `address:port` value; the tag and the other columns stay at
+/// their measured widths. A table already wider than the target is left for
+/// the horizontal scroll bar.
+fn fill_table_width(columns: &mut TableColumns, target: f32) {
+    let spare = target - columns.total();
+    if spare > 0.0 {
+        columns.address += spare;
     }
 }
 
@@ -6717,7 +6749,7 @@ fn adaptive_widths(ui: &egui::Ui, lang: Language, servers: &ServersFile) -> Colu
         widths.name = widths.name.max(cell(name, &button));
         widths.protocol = widths
             .protocol
-            .max(cell(&row_detail(profile, false).protocol, &body));
+            .max(cell(&row_detail(profile).protocol, &body));
         widths.address = widths
             .address
             .max(cell(&profile.server_address().unwrap_or_default(), &mono));
@@ -6745,12 +6777,14 @@ fn drag_divider(widths: ColumnWidths, column: Column, dx: f32) -> ColumnWidths {
 }
 
 /// The widths a divider drag starts from: every stored width as it stood at
-/// the press, with the tag column frozen at the width it had on screen. The
-/// fit lets the tag take the slack, so a drag that starts from the fit must
-/// capture that width before the first stored layout replaces it.
+/// the press, with the display-only tag and address widths frozen at the
+/// widths they had on screen. The fit widens the address with the spare and
+/// floors the tag, so a drag that starts from the fit must capture both
+/// before the first stored layout replaces it.
 fn frozen_widths(widths: ColumnWidths, columns: TableColumns) -> ColumnWidths {
     let mut frozen = widths;
     frozen.name = columns.name;
+    frozen.address = columns.address;
     frozen
 }
 
@@ -7139,9 +7173,9 @@ fn drag_scroll_delta(viewport: egui::Rect, pos: egui::Pos2, dt: f32) -> f32 {
 
 /// One row's two formatted table cells. The protocol column pairs the
 /// protocol with its transport security when the security is not plain; the
-/// endpoint column is empty while the user hid server information, because
-/// the address is exactly what that setting hides.
-fn row_detail(profile: &crate::model::ServerProfile, hide_server_info: bool) -> RowDetail {
+/// endpoint column carries the address regardless of the Privacy setting.
+/// Hiding is a render-time decision, so Reveal does not rebuild every row.
+fn row_detail(profile: &crate::model::ServerProfile) -> RowDetail {
     let protocol = profile.outbound.protocol.as_str();
     let security = profile.outbound.stream.security.as_str();
     let protocol = if security == "none" {
@@ -7149,15 +7183,9 @@ fn row_detail(profile: &crate::model::ServerProfile, hide_server_info: bool) -> 
     } else {
         format!("{protocol} · {security}")
     };
-    let endpoint = if hide_server_info {
-        String::new()
-    } else {
-        profile.server_address().unwrap_or_default()
-    };
     RowDetail {
         protocol,
-        endpoint,
-        endpoint_hidden: hide_server_info,
+        endpoint: profile.server_address().unwrap_or_default(),
     }
 }
 
@@ -7578,6 +7606,7 @@ fn server_list_row(
     let RowCells {
         name,
         detail,
+        endpoint_hidden,
         verdict,
         extras,
     } = cells;
@@ -7685,7 +7714,7 @@ fn server_list_row(
             ui.add(egui::Label::new(RichText::new(&detail.protocol).weak()).truncate());
         });
         table_cell(ui, columns.address, |ui| {
-            if detail.endpoint_hidden {
+            if endpoint_hidden {
                 // Masked like the editor's fields: the column reads as a
                 // deliberate redaction, not as a server with no address.
                 widgets::masked_stand_in(ui, true, "");
@@ -12004,7 +12033,7 @@ impl ServersScreen {
                             &mut draft.outbound_custom,
                             t(lang, Key::SrvOutboundOverride),
                         );
-                        let tun_on = uictx.settings.mode == Mode::Tun && uictx.core_running;
+                        let tun_on = uictx.settings.mode == Mode::Tun;
                         let global_path = uictx.settings.subscription_path;
                         let effective = if draft.outbound_custom {
                             crate::sys::outbound_path::effective_refresh_path(
@@ -12037,15 +12066,26 @@ impl ServersScreen {
                                 .small()
                                 .weak(),
                             );
-                            crate::ui::outbound_settings::socks5_editor(
-                                ui,
-                                lang,
-                                &mut draft.socks5_host,
-                                &mut draft.socks5_port,
-                                &mut draft.socks5_username,
-                                &mut draft.socks5_password,
-                                &mut draft.reveal_password,
-                            );
+                            if effective == RefreshPath::Socks5 {
+                                crate::ui::outbound_settings::socks5_editor(
+                                    ui,
+                                    lang,
+                                    &mut draft.socks5_host,
+                                    &mut draft.socks5_port,
+                                    &mut draft.socks5_username,
+                                    crate::ui::outbound_settings::Socks5Password {
+                                        value: &mut draft.socks5_password,
+                                        revealed: &mut draft.reveal_password,
+                                        editing: &mut draft.password_editing,
+                                    },
+                                );
+                            } else {
+                                draft.reveal_password = false;
+                                draft.password_editing = false;
+                            }
+                        } else {
+                            draft.reveal_password = false;
+                            draft.password_editing = false;
                         }
                         let path_label = refresh_path_label(effective, lang);
                         let effective_line = if draft.outbound_custom {
@@ -12145,12 +12185,11 @@ impl ServersScreen {
                 .unwrap_or_default();
             let mut confirm = false;
             let mut cancel = false;
-            let close_requested = popup::show(
+            let declined = popup::modal(
                 ctx,
                 "servers.delete-group",
                 t(lang, Key::SrvDeleteGroupTitle),
-                [440.0, 150.0],
-                false,
+                440.0,
                 |ui| {
                     ui.label(t_fmt(lang, Key::SrvDeleteGroupConfirm, &[&title]));
                     ui.horizontal(|ui| {
@@ -12173,7 +12212,7 @@ impl ServersScreen {
                     uictx.hooks.mark_dirty();
                 }
                 self.group_delete_pending = None;
-            } else if cancel || close_requested {
+            } else if cancel || declined {
                 self.group_delete_pending = None;
             }
         }
@@ -15205,8 +15244,8 @@ Authentication: ML-KEM-768, Post-Quantum
         };
         let viewport = harness.ctx.input(|input| input.viewport_rect());
         assert!(
-            settings_rect.right() > viewport.right() - 40.0,
-            "the switch must sit at the header's right edge \
+            settings_rect.right() < viewport.right() - 200.0,
+            "the switch belongs with the title, not at the right edge \
              (settings right {} vs viewport right {})",
             settings_rect.right(),
             viewport.right()
@@ -15214,6 +15253,10 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(
             table_rect.left() < settings_rect.left(),
             "the segments must read Table | Settings"
+        );
+        assert!(
+            (table_rect.top() - settings_rect.top()).abs() < 4.0,
+            "both segments must share the title line"
         );
 
         // The Table side keeps the table's toolbar and mounts no settings.
@@ -15303,6 +15346,65 @@ Authentication: ML-KEM-768, Post-Quantum
             harness
                 .query_by_label(t(lang, Key::SettingsLatencyTest))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_servers_settings_enables_bind_nic_while_tun_mode_is_on_but_the_core_is_stopped() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.phase = crate::rt::CorePhase::Stopped;
+        rig.settings.latency_test_path = crate::model::settings::ProbePath::BindNic;
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::BindNic;
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        let lang = Language::En;
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SrvHeaderSettings),
+            )
+            .click();
+        harness.run();
+        let bind_nic = t(lang, Key::SettingsPathBindNic);
+        let segments: Vec<_> = harness
+            .get_all_by_role_and_label(egui::accesskit::Role::Button, bind_nic)
+            .collect();
+        assert_eq!(segments.len(), 2, "both path controls must render");
+        for node in segments {
+            assert!(
+                !node.accesskit_node().is_disabled(),
+                "TUN mode, not the live connection, enables Bind NIC"
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_reveal_belongs_to_the_toolbar_not_the_header() {
+        let mut rig = UiTestRig::default();
+        rig.settings.hide_server_info = true;
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        let lang = Language::En;
+        let header = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, t(lang, Key::SrvHeaderTable))
+            .rect();
+        let add = harness.get_by_label(t(lang, Key::SrvAddServer)).rect();
+        let search = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+        let reveal = harness.get_by_label(t(lang, Key::SrvRevealSecrets)).rect();
+        assert!(
+            reveal.top() > header.bottom(),
+            "Reveal must not sit in the header switch row"
+        );
+        assert!(
+            reveal.top() > add.bottom(),
+            "Reveal must not overlap the command row"
+        );
+        assert!(
+            reveal.left() >= search.right(),
+            "Reveal and the search share the filter row without overlapping"
         );
     }
 
@@ -15442,6 +15544,88 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
+    fn an_override_that_was_off_does_not_seed_a_stale_socks5_password() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        rig.settings.mode = Mode::Tun;
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = false;
+            subscription.outbound_path = crate::model::settings::RefreshPath::Socks5;
+            subscription.socks5.password = Some("stale".into());
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::CheckBox,
+            t(lang, Key::SrvOutboundOverride),
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsSocks5Host))
+                .is_some(),
+            "the enabled override shows the SOCKS5 path"
+        );
+        let password = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::TextInput,
+                t(lang, Key::SettingsSocks5Password),
+            )
+            .value();
+        assert_eq!(
+            password.as_deref(),
+            Some(""),
+            "an override that was off must not revive the stored password"
+        );
+        assert!(
+            harness
+                .query_by_label(t(lang, Key::SettingsSocks5RevealPassword))
+                .is_none(),
+            "an empty password has nothing to reveal"
+        );
+    }
+
+    #[test]
+    fn choosing_native_hides_the_subscription_socks5_fields() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        rig.settings.mode = Mode::Tun;
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::Socks5;
+            subscription.socks5.host = "proxy.example".into();
+            subscription.socks5.password = Some("secret".into());
+        }
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        let host = t(lang, Key::SettingsSocks5Host);
+        let password = t(lang, Key::SettingsSocks5Password);
+        assert!(
+            harness.query_by_label(host).is_some(),
+            "the SOCKS5 path shows its fields"
+        );
+        scroll_and_click(
+            &mut harness,
+            egui::accesskit::Role::Button,
+            t(lang, Key::SettingsPathNative),
+        );
+        assert!(
+            harness.query_by_label(host).is_none(),
+            "Native hides the SOCKS5 host"
+        );
+        assert!(
+            harness.query_by_label(password).is_none(),
+            "Native hides the SOCKS5 password"
+        );
+    }
+
+    #[test]
     fn the_override_disables_bind_nic_while_tun_is_off_and_replaces_it_with_native() {
         let (mut rig, feed, _at) = subscription_view_rig(None, false);
         rig.settings.mode = Mode::Off;
@@ -15533,6 +15717,7 @@ Authentication: ML-KEM-768, Post-Quantum
             let subscription = feed_subscription_mut(&mut rig, &feed);
             subscription.outbound_custom = true;
             subscription.outbound_path = crate::model::settings::RefreshPath::Socks5;
+            subscription.socks5.password = Some("secret".into());
         }
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
@@ -16151,20 +16336,9 @@ Authentication: ML-KEM-768, Post-Quantum
             harness.query_by_label_contains("30%").is_some(),
             "the card shows the quota use"
         );
-        // The provider hint is a hover, not a row.
-        assert!(
-            harness.query_by_label_contains("12 h").is_none(),
-            "the provider hint must not occupy the card row"
-        );
-        harness
-            .query_by_label("?")
-            .expect("the update hint icon")
-            .hover();
-        harness.run();
-        harness.run();
         assert!(
             harness.query_by_label_contains("12 h").is_some(),
-            "the update hint icon carries the provider hint"
+            "the provider hint must render in the card row when there is room"
         );
 
         harness
@@ -16206,8 +16380,14 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.run();
 
-        // The commands sit above the table, and the search field ends the
-        // toolbar row.
+        // The commands sit above the table; the search has its own filter row
+        // beneath them so it cannot be squeezed under a command.
+        let add = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(Language::En, Key::SrvAddServer),
+            )
+            .rect();
         for label in [
             t(Language::En, Key::SrvAddServer),
             t(Language::En, Key::SrvNewGroup),
@@ -16228,8 +16408,12 @@ Authentication: ML-KEM-768, Post-Quantum
             .next()
             .expect("the toolbar must render the search field");
         assert!(
-            search.rect().center().x > DEFAULT_TEST_VIEWPORT.x / 2.0,
-            "search must sit at the toolbar's end, on the right of its commands"
+            search.rect().top() > add.bottom(),
+            "search must sit on the filter row under the command row"
+        );
+        assert!(
+            search.rect().left() < DEFAULT_TEST_VIEWPORT.x / 2.0,
+            "the filter row starts with the search"
         );
 
         // The table names its columns: switch, name, latency, protocol,
@@ -16547,10 +16731,15 @@ Authentication: ML-KEM-768, Post-Quantum
         let flex = table_columns(TableShape::default(), fitted);
         let anchor = frozen_widths(fitted, flex);
         assert!((anchor.name - flex.name).abs() < 0.01);
+        assert!((anchor.address - flex.address).abs() < 0.01);
         let resized = drag_divider(anchor, Column::Protocol, 12.0);
         assert!(
             (resized.name - flex.name).abs() < 0.01,
             "the fit's tag width must be frozen by the first drag"
+        );
+        assert!(
+            (resized.address - flex.address).abs() < 0.01,
+            "the fit's address width must be frozen by the first drag"
         );
     }
 
@@ -16762,7 +16951,7 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         let fitted = column_width(&harness);
         assert!(
-            (fitted - measured).abs() < 1.5,
+            fitted >= measured - 1.5,
             "the fitted address must hold its measured text width ({fitted:.1} vs {measured:.1})"
         );
         assert!(
@@ -16771,10 +16960,10 @@ Authentication: ML-KEM-768, Post-Quantum
         );
     }
 
-    /// The fit leaves the tag at its measured width; the width the viewport
-    /// has left over stays after the table instead of stretching the tag.
+    /// The fitted table gives the spare width to the address column; the
+    /// visible blank is only the narrow strip the scroll bar owns.
     #[test]
-    fn fit_columns_leaves_the_spare_width_after_the_table() {
+    fn fit_columns_gives_the_spare_width_to_the_address_column() {
         let mut rig = UiTestRig::default();
         rig.servers.profiles.push(ServerProfile::new(
             "Tokyo",
@@ -16783,21 +16972,41 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut harness = wide_table_harness(rig);
         harness.run();
 
-        // The fit measures every column; the tag no longer absorbs what the
-        // viewport has left, so the table ends before the right edge and the
-        // empty band sits after it instead of between the tag and latency.
-        let address_right = harness
+        let address = harness
             .query_all_by_label(t(Language::En, Key::SrvColAddress))
             .next()
             .expect("the table must render its Address header")
             .rect()
-            .right();
-        let viewport = harness.ctx.input(|i| i.viewport_rect().right());
+            .left();
+        let group = harness
+            .query_all_by_label(t(Language::En, Key::SrvColGroup))
+            .next()
+            .expect("the emitted table must render its Group header")
+            .rect()
+            .left();
         assert!(
-            viewport - address_right > 40.0,
-            "the spare width must stay to the right of the table ({:.1})",
-            viewport - address_right
+            group - address > 200.0,
+            "the address column must absorb the visible spare ({:.1})",
+            group - address
         );
+    }
+
+    #[test]
+    fn filling_the_table_width_only_widens_the_address_column() {
+        let mut columns = table_columns(TableShape::default(), TABLE_DEFAULT_WIDTHS);
+        let before = columns;
+        super::fill_table_width(&mut columns, 1200.0);
+        assert!(
+            (columns.total() - 1200.0).abs() < 0.01,
+            "the table must fill the fitted band"
+        );
+        assert!(
+            columns.address > before.address,
+            "the spare width belongs to the address column"
+        );
+        assert_eq!(columns.name, before.name);
+        assert_eq!(columns.protocol, before.protocol);
+        assert_eq!(columns.latency, before.latency);
     }
 
     /// A drag on a header divider follows the pointer and resizes only the
@@ -17019,7 +17228,6 @@ Authentication: ML-KEM-768, Post-Quantum
         RowDetail {
             protocol: "vless · tls".into(),
             endpoint: "203.0.113.7:443".into(),
-            endpoint_hidden: false,
         }
     }
 
@@ -17046,6 +17254,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     RowCells {
                         name: long_name,
                         detail: &row_detail_fixture(),
+                        endpoint_hidden: false,
                         verdict: None,
                         extras: RowExtras::default(),
                     },
@@ -17119,6 +17328,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 RowCells {
                     name: "A server",
                     detail: &row_detail_fixture(),
+                    endpoint_hidden: false,
                     verdict: None,
                     extras: RowExtras::default(),
                 },
@@ -17164,6 +17374,7 @@ Authentication: ML-KEM-768, Post-Quantum
                     RowCells {
                         name: "A server",
                         detail: &row_detail_fixture(),
+                        endpoint_hidden: false,
                         verdict: None,
                         extras: RowExtras::default(),
                     },
@@ -17216,6 +17427,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 RowCells {
                     name: "A server",
                     detail: &row_detail_fixture(),
+                    endpoint_hidden: false,
                     verdict: None,
                     extras: RowExtras::default(),
                 },

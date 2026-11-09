@@ -699,27 +699,29 @@ impl RoutingScreen {
             .show(ui, |ui| self.body(ui, ctx, lang));
     }
 
-    /// The fixed switch sits at the right of the header line, not in a
-    /// full-width band: Rules keeps the routing rules, Settings mounts
-    /// the geodata settings that serve them. It is drawn outside the body
-    /// scroll so it never leaves view.
+    /// The fixed switch shares the title line with the screen heading: Rules
+    /// keeps the routing rules, Settings mounts the geodata settings that
+    /// serve them. It is drawn outside the body scroll so it never leaves
+    /// view, and the title keeps the switch from reading as a row of its own.
     fn header(&mut self, ui: &mut Ui, lang: Language) {
         ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.selectable_value(
-                    &mut self.tab,
-                    RoutingTab::Settings,
-                    t(lang, Key::RoutingTabSettings),
-                )
-                .on_hover_text(t(lang, Key::RoutingTabSettingsHint));
-                ui.selectable_value(
-                    &mut self.tab,
+            ui.heading(t(lang, Key::ScreenRouting));
+            let options = [
+                (
                     RoutingTab::Rules,
                     t(lang, Key::RoutingTabRules),
-                )
-                .on_hover_text(t(lang, Key::RoutingTabRulesHint));
-            });
+                    t(lang, Key::RoutingTabRulesHint),
+                ),
+                (
+                    RoutingTab::Settings,
+                    t(lang, Key::RoutingTabSettings),
+                    t(lang, Key::RoutingTabSettingsHint),
+                ),
+            ];
+            widgets::side_switch(ui, &mut self.tab, &options);
         });
+        // Clear the selected segment's underline before the body begins.
+        ui.add_space(4.0);
     }
 
     /// The scrolling body: whichever side the fixed header switch selects.
@@ -7576,12 +7578,23 @@ mod routing_settings_tab_tests {
             (rules, settings)
         };
         let viewport = harness.ctx.input(|input| input.viewport_rect());
+        let heading = harness
+            .get_by_role_and_label(egui::accesskit::Role::Label, t(lang, Key::ScreenRouting))
+            .rect();
         assert!(
-            settings_rect.right() > viewport.right() - 40.0,
-            "the switch must sit at the header's right edge \
+            settings_rect.right() < viewport.right() - 200.0,
+            "the switch belongs with the title, not at the right edge \
              (settings right {} vs viewport right {})",
             settings_rect.right(),
             viewport.right()
+        );
+        assert!(
+            settings_rect.left() > heading.right(),
+            "the switch must follow the Routing title on the same line"
+        );
+        assert!(
+            (settings_rect.top() - heading.top()).abs() < 4.0,
+            "the title and switch must share one line"
         );
         assert!(
             rules_rect.left() < settings_rect.left(),
