@@ -2922,7 +2922,7 @@ mod tests {
         ] {
             let verdict = with_secrets(secrets.clone());
             let issue = finding(&verdict, &ValidationCode::XdriveS3SecretsInvalid)
-                .unwrap_or_else(|| panic!("{secrets:?} must be refused: {verdict:#?}"));
+                .unwrap_or_else(|| panic!("a secrets list must be refused: {verdict:#?}"));
             assert_eq!(issue.path.as_deref(), Some("stream.xdriveSettings.secrets"));
         }
         for secrets in [
@@ -2936,9 +2936,9 @@ mod tests {
             let verdict = with_secrets(secrets.clone());
             assert!(
                 finding(&verdict, &ValidationCode::XdriveS3SecretsInvalid).is_none(),
-                "{secrets:?}: {verdict:#?}"
+                "{verdict:#?}"
             );
-            assert!(!verdict.has_blocking(), "{secrets:?}: {verdict:#?}");
+            assert!(!verdict.has_blocking(), "{verdict:#?}");
         }
     }
 
