@@ -13749,7 +13749,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness
             .get_by_label(t(Language::En, Key::SrvRawSubscription))
             .click();
-        harness.run();
+        harness.run_steps(10);
     }
 
     /// Open the feed group's tab, which mounts the subscription card.
@@ -14176,7 +14176,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness
             .get_by_label(t(Language::En, Key::SrvRawSubscription))
             .click();
-        harness.run();
+        harness.run_steps(10);
         assert!(harness.query_by_label("Feed raw view").is_some());
     }
 
