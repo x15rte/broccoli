@@ -165,6 +165,13 @@ user-id = 95389
 user-login = "tauri-bot"
 user-name = "tauri"
 
+[[publisher.typed-path]]
+version = "0.13.0"
+when = "2026-10-20"
+user-id = 67779
+user-login = "chipsenkbeil"
+user-name = "Chip Senkbeil"
+
 [[publisher.unicode-segmentation]]
 version = "1.13.3"
 when = "2026-06-01"
@@ -194,8 +201,8 @@ user-login = "KodrAus"
 user-name = "Ashley Mannix"
 
 [[publisher.zip]]
-version = "9.0.5"
-when = "2026-10-17"
+version = "9.1.2"
+when = "2026-10-26"
 trusted-publisher = "github:zip-rs/zip2"
 
 [[publisher.zvariant]]
