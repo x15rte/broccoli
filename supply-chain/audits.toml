@@ -2244,6 +2244,13 @@ end = "2027-09-16"
 [[wildcard-audits.tonic]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
+trusted-publisher = "github:grpc/grpc-rust"
+start = "2026-10-27"
+end = "2027-10-27"
+
+[[wildcard-audits.tonic]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
 trusted-publisher = "github:hyperium/tonic"
 start = "2026-05-07"
 end = "2027-09-16"
