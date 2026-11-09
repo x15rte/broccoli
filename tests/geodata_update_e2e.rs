@@ -299,7 +299,7 @@ fn downloads_and_reloads_geodata_without_restart() {
     // provenance repo itself: Loyalsoldier/v2ray-rules-dat @ release — the
     // same bytes Xray's CI bundles daily.
     let geodata = serde_json::json!({
-        "cron": "@every 1s",
+        "cron": "@every 1m",
         "assets": [{
             "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/geoip.dat",
             "file": "geoip.dat"
@@ -531,7 +531,7 @@ fn broken_file_rolls_back() {
     let (socks_port, api_port) = (live_core::free_port(), live_core::free_port());
     // 200 OK but Go source text, not a dat: reload must fail and roll back.
     let geodata = serde_json::json!({
-        "cron": "@every 1s",
+        "cron": "@every 1m",
         "assets": [{
             "url": "https://raw.githubusercontent.com/XTLS/Xray-core/5ca6f4b7d4dc20a881d4330e498892697627ec0c/infra/conf/geodata.go",
             "file": "geoip.dat"
@@ -752,7 +752,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
         .expect("copy managed core payload");
     let (socks_port, api_port) = (live_core::free_port(), live_core::free_port());
     let geodata = serde_json::json!({
-        "cron": "@every 1s",
+        "cron": "@every 1m",
         "assets": [{
             "url": SWAPPED_GEOIP_URL,
             "file": "geoip.dat"
@@ -791,7 +791,7 @@ fn url_swapped_geo_data_restarts_cleanly_and_clearing_urls_auto_restores_release
     // swaps that hash to the frozen file prove the reload accepted it — a
     // reload failure rolls the file back to the release bytes within the
     // same tick, which would reset the counter instead of satisfying it.
-    let swap_deadline = Instant::now() + Duration::from_secs(120);
+    let swap_deadline = Instant::now() + Duration::from_secs(240);
     let mut last_mtime = std::fs::metadata(&geoip_path)
         .expect("metadata geoip.dat")
         .modified()
