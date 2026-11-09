@@ -2370,7 +2370,7 @@ end = "2027-09-16"
 [[wildcard-audits.typed-path]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 67779
+user-id = 67779 # Chip Senkbeil (chipsenkbeil)
 start = "2026-09-16"
 end = "2027-09-16"
 
