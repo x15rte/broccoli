@@ -453,7 +453,7 @@ pub struct Settings {
     pub tun: TunCfg,
     pub mode: Mode,
     /// An absent key loads as the empty level — the value the generator emits
-    /// as `loglevel` — never as the fresh-install `warning`.
+    /// as `logLevel` — never as the fresh-install `warning`.
     #[serde(default, skip_serializing_if = "skip_empty_str")]
     pub log_level: String,
     /// xray per-connection access log lines ("from … accepted …"); on =

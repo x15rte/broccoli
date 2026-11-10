@@ -239,7 +239,7 @@ fn generate_on_defaults() {
         "the emitted services are the compiled list"
     );
     assert_eq!(cfg["policy"]["system"]["statsOutboundUplink"], json!(true));
-    assert_eq!(cfg["log"], json!({"loglevel": "warning", "access": "none"}));
+    assert_eq!(cfg["log"], json!({"logLevel": "warning", "access": "none"}));
     // Seeded DNS module: 1.1.1.1 and 8.8.8.8 plain
     // UDP general servers raced in parallel, serveStale on with a 1-day
     // stale window, 8s per-server timeout default. UDP is seeded over DoH:
@@ -295,7 +295,7 @@ fn generate_on_defaults() {
 
 #[test]
 fn access_log_toggle_controls_the_xray_access_channel() {
-    // The per-connection access channel is not gated by loglevel ("from …
+    // The per-connection access channel is not gated by logLevel ("from …
     // accepted …" lines), so the GUI pins it off unless the user enables it:
     // off → `access: "none"`, on → the key is omitted (xray defaults the
     // absent key to console).
@@ -306,7 +306,7 @@ fn access_log_toggle_controls_the_xray_access_channel() {
     let off_cfg = generate_deterministic(&servers, &settings).expect("generate config");
     assert_eq!(
         off_cfg["log"],
-        json!({"loglevel": "warning", "access": "none"}),
+        json!({"logLevel": "warning", "access": "none"}),
         "default settings must pin the access channel off"
     );
 
@@ -314,7 +314,7 @@ fn access_log_toggle_controls_the_xray_access_channel() {
     let on_cfg = generate_deterministic(&servers, &settings).expect("generate config");
     assert_eq!(
         on_cfg["log"],
-        json!({"loglevel": "warning"}),
+        json!({"logLevel": "warning"}),
         "enabling access logging must omit the access key (xray defaults it to console)"
     );
 }
@@ -939,7 +939,7 @@ fn latency_probe_generator_is_minimal_and_preserves_profile_chains() {
     );
     assert_eq!(
         cfg["log"],
-        json!({"loglevel": "warning", "access": "none"}),
+        json!({"logLevel": "warning", "access": "none"}),
         "probe stdout feeds failure diagnostics; its access channel must stay pinned off"
     );
     assert_eq!(

@@ -61,7 +61,7 @@
   ],
   "log": {
     "access": "none",
-    "loglevel": "warning"
+    "logLevel": "warning"
   },
   "outbounds": [
     {

@@ -543,7 +543,7 @@ pub fn generate_latency_probe(
     ControlPlane {
         api_port,
         // Access log pinned off: the probe's stdout feeds failure
-        // diagnostics, and the access channel is not gated by loglevel.
+        // diagnostics, and the access channel is not gated by `logLevel`.
         log_level: "warning",
         access_log: false,
         services: vec!["ObservatoryService"],
@@ -694,7 +694,7 @@ struct ControlPlane<'a> {
     api_port: u16,
     log_level: &'a str,
     /// Whether the core may write its access log. The GUI captures stdout for
-    /// diagnostics; access logging is a separate channel `loglevel` cannot
+    /// diagnostics; access logging is a separate channel `logLevel` cannot
     /// gate, so it is pinned off unless the user enabled it.
     access_log: bool,
     /// The gRPC services the document registers.
@@ -712,10 +712,11 @@ struct ControlPlane<'a> {
 impl ControlPlane<'_> {
     /// Whether the core may write its access log.
     fn log(&self) -> Value {
+        // `LogConfig.LogLevel` and `LogConfig.AccessLog` (infra/conf/log.go:19-21).
         if self.access_log {
-            json!({ "loglevel": self.log_level })
+            json!({ "logLevel": self.log_level })
         } else {
-            json!({ "loglevel": self.log_level, "access": "none" })
+            json!({ "logLevel": self.log_level, "access": "none" })
         }
     }
 
