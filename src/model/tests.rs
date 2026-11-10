@@ -457,6 +457,60 @@ fn reality_fingerprint_outside_the_editor_options_survives_a_profile_round_trip(
     }
 }
 
+/// The pinned core registers `hellochrome_155` (transport/internet/tls/
+/// tls.go), so a profile that stores it in the TLS block passes the model
+/// pass and keeps the exact string through load and save.
+#[test]
+fn stored_hellochrome_155_passes_the_model_pass_and_survives_a_profile_round_trip() {
+    let mut profile = ServerProfile::new("chrome-155", OutboundModel::new(Protocol::Vless));
+    profile.outbound.stream = StreamModel {
+        network: Network::Raw,
+        security: Security::Tls,
+        tls_settings: Some(TlsModel {
+            server_name: "tls.example.com".into(),
+            fingerprint: "hellochrome_155".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(
+        !crate::model::validation::validate_outbound(&profile.outbound)
+            .blocking()
+            .any(|issue| issue.code
+                == crate::model::validation::ValidationCode::TlsFingerprintUnsupported),
+        "the pinned core registers hellochrome_155 as a TLS fingerprint"
+    );
+    let file = ServersFile {
+        version: 1,
+        active: Some(profile.id.clone()),
+        profiles: vec![profile],
+        ..Default::default()
+    };
+    let stored = serde_json::to_value(&file).unwrap();
+    assert_eq!(
+        stored["profiles"][0]["outbound"]["streamSettings"]["tlsSettings"]["fingerprint"],
+        json!("hellochrome_155"),
+        "a save must keep the stored fingerprint"
+    );
+    let reloaded: ServersFile = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(
+        reloaded.profiles[0]
+            .outbound
+            .stream
+            .tls_settings
+            .as_ref()
+            .unwrap()
+            .fingerprint,
+        "hellochrome_155",
+        "a load must keep the stored fingerprint"
+    );
+    assert_eq!(
+        serde_json::to_value(&reloaded).unwrap(),
+        stored,
+        "the reloaded profile set must serialize unchanged"
+    );
+}
+
 #[test]
 fn roundtrip_outbound_envelope() {
     // The retired `proxySettings` key is deliberately absent: a stored value

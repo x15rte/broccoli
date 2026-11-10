@@ -4318,6 +4318,22 @@ mod tests {
         }
     }
 
+    /// The pinned core registers `hellochrome_155`, so the TLS grammar
+    /// accepts it and a link naming it imports and re-exports unchanged.
+    #[test]
+    fn tls_import_accepts_the_pinned_core_added_fingerprint() {
+        let link = format!(
+            "vless://{UUID}@tls.example.com:443?security=tls&sni=tls.example.com&fp=hellochrome_155&type=tcp#Pinned"
+        );
+        let (profile, canonical) = round_trip(&link);
+        let tls = profile.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.fingerprint, "hellochrome_155");
+        assert!(
+            canonical.contains("fp=hellochrome_155"),
+            "the exported link must keep the fingerprint: {canonical}"
+        );
+    }
+
     #[test]
     fn reality_without_sni_materializes_endpoint_host_and_canonicalizes() {
         let public_key = reality_public_key();

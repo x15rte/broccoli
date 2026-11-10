@@ -74,6 +74,7 @@ pub const FINGERPRINTS: &[&str] = &[
     "hellochrome_120",
     "hellochrome_131",
     "hellochrome_133",
+    "hellochrome_155",
     "helloios_13",
     "helloios_14",
     "helloedge_106",
@@ -242,6 +243,35 @@ mod tests {
             assert!(!reality_import_supported(rejected));
         }
         assert!(!reality_wire_supported("not-a-fingerprint"));
+    }
+
+    /// The pinned core registers `hellochrome_155` directly after
+    /// `hellochrome_133` (transport/internet/tls/tls.go), so the editor table
+    /// carries it once, between `hellochrome_133` and `helloios_13`.
+    #[test]
+    fn editor_table_carries_the_pinned_core_added_fingerprint_in_registration_order() {
+        let index = FINGERPRINTS
+            .iter()
+            .position(|name| *name == "hellochrome_155")
+            .expect("the pinned core registers hellochrome_155");
+        assert_eq!(
+            FINGERPRINTS[index - 1],
+            "hellochrome_133",
+            "the pinned core registers hellochrome_155 directly after hellochrome_133"
+        );
+        assert_eq!(
+            FINGERPRINTS[index + 1],
+            "helloios_13",
+            "the pinned core registers hellochrome_155 directly before helloios_13"
+        );
+        assert_eq!(
+            FINGERPRINTS
+                .iter()
+                .filter(|name| **name == "hellochrome_155")
+                .count(),
+            1,
+            "the editor table carries hellochrome_155 exactly once"
+        );
     }
 
     /// The REALITY combo is the one context trimmed to a positive option

@@ -1685,6 +1685,7 @@ keys! {
     SrvTlsServerNameEmptyNote 0,
     SrvRealityServerNameEmptyNote 0,
     SrvTlsFingerprintNote 0,
+    SrvFingerprintChromeNote 0,
     SrvTlsUseSystemCaNote 0,
     SrvRealityFingerprintNote 0,
     SrvVisionUdp443Note 0,
@@ -5216,6 +5217,10 @@ mod en {
             Key::SrvTlsFingerprintNote => {
                 "empty (the default) = the uTLS Chrome_Auto preset, an imitation like the browser \
                  names. unsafe = native Go TLS, no imitation"
+            }
+            Key::SrvFingerprintChromeNote => {
+                "chrome follows the default fingerprint of the Xray-core release that this app \
+                 pins, currently 155"
             }
             Key::SrvTlsUseSystemCaNote => {
                 "off (the default) = the root certificates bundled with the core verify the \

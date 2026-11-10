@@ -348,7 +348,8 @@ fn fingerprint_allowed(name: &str, reality: bool) -> bool {
 /// the model about a loaded value. The REALITY context additionally shows
 /// the `RealityFingerprintUntested` advisory for a wire-valid value outside
 /// the known-good set the combo offers — amber, never a gate, with the same
-/// message the editor's warnings list renders.
+/// message the editor's warnings list renders. The `chrome` option carries a
+/// hover note naming the fingerprint of the pinned core's default preset.
 fn fingerprint_editor(
     ui: &mut egui::Ui,
     lang: Language,
@@ -367,7 +368,19 @@ fn fingerprint_editor(
             .show_ui(ui, |ui| {
                 for option in FINGERPRINTS.iter().copied().filter(|name| allowed(name)) {
                     let text = if option.is_empty() { default } else { option };
-                    changed |= ui.selectable_value(v, option.to_string(), text).changed();
+                    let response = ui.selectable_value(v, option.to_string(), text);
+                    // `chrome` is the uTLS Chrome_Auto preset
+                    // (transport/internet/tls/tls.go), and the pinned uTLS
+                    // revision defines HelloChrome_Auto as Chrome 155
+                    // (u_common.go). The option therefore follows the pinned
+                    // core's default fingerprint, which the note states so a
+                    // bump does not change the handshake silently.
+                    let response = if option == "chrome" {
+                        response.on_hover_text(t(lang, Key::SrvFingerprintChromeNote))
+                    } else {
+                        response
+                    };
+                    changed |= response.changed();
                 }
             });
     });
@@ -13195,7 +13208,7 @@ Authentication: ML-KEM-768, Post-Quantum
         for &name in FINGERPRINTS {
             assert!(fingerprint_allowed(name, false), "TLS combo hides {name:?}");
         }
-        for name in ["ios", "edge", "qq", "randomized"] {
+        for name in ["ios", "edge", "qq", "randomized", "hellochrome_155"] {
             assert!(fingerprint_allowed(name, false));
             assert!(
                 !fingerprint_allowed(name, true),
@@ -13314,6 +13327,55 @@ Authentication: ML-KEM-768, Post-Quantum
                 "the REALITY popup offers {name:?} outside the trimmed option set"
             );
         }
+    }
+
+    /// The `chrome` option in the fingerprint combo carries the note that it
+    /// follows the pinned core's default fingerprint — on the option row, not
+    /// as a permanent line — and its sibling options carry no such note.
+    #[test]
+    fn fingerprint_combo_notes_the_chrome_default_on_its_option_row() {
+        let note = t(Language::En, Key::SrvFingerprintChromeNote);
+        let stream = Rc::new(RefCell::new(StreamModel {
+            security: Security::Tls,
+            tls_settings: Some(crate::model::stream::TlsModel::default()),
+            ..Default::default()
+        }));
+        let stream_for_ui = Rc::clone(&stream);
+        let screen = Rc::new(RefCell::new(ServersScreen::default()));
+        let screen_for_ui = Rc::clone(&screen);
+        let mut harness = harness_builder().build_ui(move |ui| {
+            let _ = screen_for_ui.borrow_mut().security_tab(
+                ui,
+                Language::En,
+                None,
+                &mut stream_for_ui.borrow_mut(),
+                None,
+                &[],
+            );
+        });
+        harness.run();
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "the note must not render as a permanent line"
+        );
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .next()
+            .expect("the TLS fingerprint combo")
+            .click();
+        harness.run();
+        harness.get_by_label("chrome").hover();
+        harness.run_steps(4);
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "the chrome option must carry the pinned core default note"
+        );
+        harness.get_by_label("firefox").hover();
+        harness.run_steps(4);
+        assert!(
+            harness.query_all_by_label(note).next().is_none(),
+            "only the chrome option carries the note"
+        );
     }
 
     #[test]
