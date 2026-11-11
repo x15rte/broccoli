@@ -713,9 +713,27 @@ pub const XDRIVE_DEFAULT_POLL_INTERVAL_MS: u32 = 50;
 pub const XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS: u32 = 500;
 pub const XDRIVE_DEFAULT_SESSION_TTL_SECONDS: u32 = 300;
 pub const XDRIVE_DEFAULT_CONCURRENCY: u32 = 8;
-pub const XDRIVE_MAX_CONCURRENCY: u32 = 64;
+pub const XDRIVE_MAX_CONCURRENCY: u32 = 256;
 pub const XDRIVE_DEFAULT_EAGER_WINDOW_MS: u32 = 2000;
 pub const XDRIVE_DEFAULT_HOLE_TIMEOUT_MS: u32 = 30_000;
+
+/// The Google Drive backend's slot-path defaults: the one storage that
+/// implements the core's slot store (`transport/internet/xdrive/drive.go:
+/// 840-905`) gets these for the fields its config leaves at zero
+/// (`transport/internet/xdrive/params.go:71-87`). The wal-based `local`,
+/// `template` and `s3` backends keep the transport defaults above.
+pub const XDRIVE_DRIVE_DEFAULT_CONCURRENCY: u32 = 64;
+pub const XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS: u32 = 10;
+pub const XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS: u32 = 200;
+
+/// True when the service's storage is the core's slot store, whose zero
+/// fields take [`XDRIVE_DRIVE_DEFAULT_CONCURRENCY`],
+/// [`XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS`] and
+/// [`XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS`] instead of the transport
+/// defaults (`transport/internet/xdrive/params.go:71-87`).
+pub fn xdrive_slot_store(service: &str) -> bool {
+    matches!(service, XDRIVE_SERVICE_DRIVE | XDRIVE_SERVICE_DRIVE_RETIRED)
+}
 
 /// The template backend's own concurrency default and cap
 /// (`transport/internet/xdrive/template.go:89-95`, `:104`).

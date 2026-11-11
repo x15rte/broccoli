@@ -24,11 +24,12 @@ use crate::model::outbound::{
 };
 use crate::model::stream::{
     Network, Security, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-    XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
-    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_DRIVE_RETIRED, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3,
-    XDRIVE_SERVICE_TEMPLATE, XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate,
-    XdriveTransport, xdrive_folder_required, xdrive_names_regex_supported,
-    xdrive_service_supported, xdrive_template_auth_type_supported,
+    XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+    XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES, XDRIVE_SERVICE_DRIVE,
+    XDRIVE_SERVICE_DRIVE_RETIRED, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE,
+    XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XdriveTransport,
+    xdrive_folder_required, xdrive_names_regex_supported, xdrive_service_supported,
+    xdrive_slot_store, xdrive_template_auth_type_supported,
 };
 use crate::model::{fold_eq, fold_lower, go_std_base64_decodes, parse_range_go, vocabulary_holds};
 use base64::Engine as _;
@@ -777,17 +778,22 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
     }
     if xdrive.concurrency > XDRIVE_MAX_CONCURRENCY {
         issues.push(warning(
-            ValidationCode::XdriveScalarClamped,
+            ValidationCode::XdriveConcurrencyClamped(XDRIVE_MAX_CONCURRENCY),
             Some("stream.xdriveSettings.concurrency".into()),
         ));
     }
     // Zero keeps the core's default, so the comparison uses the effective
-    // values the runtime compares (params.go:65-67).
+    // values the runtime compares (params.go:69-71). The Drive slot store
+    // fills its own max poll default before the comparison
+    // (params.go:71-87).
     let effective = |value: u32, default: u32| if value == 0 { default } else { value };
-    if effective(
-        xdrive.max_poll_interval_ms,
-        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-    ) < effective(xdrive.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
+    let max_poll_default = if xdrive_slot_store(&xdrive.service) {
+        XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
+    } else {
+        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
+    };
+    if effective(xdrive.max_poll_interval_ms, max_poll_default)
+        < effective(xdrive.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
     {
         issues.push(warning(
             ValidationCode::XdriveScalarClamped,
@@ -3088,6 +3094,57 @@ mod tests {
         );
     }
 
+    /// The concurrency ceiling follows the pinned core: 256 runs verbatim
+    /// and any higher value is rewritten to the ceiling
+    /// (transport/internet/xdrive/params.go:16,44-52).
+    #[test]
+    fn xdrive_concurrency_ceiling_is_256() {
+        let advisory_paths = |concurrency: u32| -> Vec<Option<String>> {
+            validate_outbound(&xdrive_outbound(XdriveTransport {
+                concurrency,
+                ..local_xdrive_settings()
+            }))
+            .advisory()
+            .map(|issue| issue.path.clone())
+            .collect()
+        };
+
+        let ceiling = advisory_paths(256);
+        assert!(
+            !ceiling.contains(&Some("stream.xdriveSettings.concurrency".into())),
+            "256 is the core's cap and must not warn: {ceiling:#?}"
+        );
+        let above = advisory_paths(257);
+        assert!(
+            above.contains(&Some("stream.xdriveSettings.concurrency".into())),
+            "257 is rewritten to the cap: {above:#?}"
+        );
+    }
+
+    /// The advisory above the ceiling names the ceiling the core applies.
+    #[test]
+    fn xdrive_concurrency_advisory_names_the_ceiling() {
+        let verdict = validate_outbound(&xdrive_outbound(XdriveTransport {
+            concurrency: 257,
+            ..local_xdrive_settings()
+        }));
+        let issue = verdict
+            .advisory()
+            .find(|issue| matches!(issue.code, ValidationCode::XdriveConcurrencyClamped(_)))
+            .expect("257 is above the core's cap");
+        assert_eq!(
+            issue.code,
+            ValidationCode::XdriveConcurrencyClamped(super::XDRIVE_MAX_CONCURRENCY)
+        );
+        assert_eq!(
+            issue.path.as_deref(),
+            Some("stream.xdriveSettings.concurrency")
+        );
+        let message =
+            crate::i18n::validation_message(&issue.code, crate::model::settings::Language::En);
+        assert!(message.contains("256"), "{message:?}");
+    }
+
     /// The scalars the runtime rewrites are advisory: the value is legal and
     /// the core caps or raises it while the transport is built.
     #[test]
@@ -3125,6 +3182,20 @@ mod tests {
             max_poll_interval_ms: 10,
             ..Default::default()
         }));
+        assert!(
+            paths.contains(&Some("stream.xdriveSettings.maxPollIntervalMs".into())),
+            "{paths:#?}"
+        );
+
+        // The Drive slot store fills its own 200 ms max poll default before
+        // the comparison, so an unset max with a poll above it is raised.
+        let paths = advisory_paths(XdriveTransport {
+            service: super::XDRIVE_SERVICE_DRIVE.into(),
+            remote_folder: "folder-id".into(),
+            secrets: vec!["id".into(), "secret".into(), "refresh".into()],
+            poll_interval_ms: 300,
+            ..Default::default()
+        });
         assert!(
             paths.contains(&Some("stream.xdriveSettings.maxPollIntervalMs".into())),
             "{paths:#?}"

@@ -1571,6 +1571,7 @@ keys! {
     SrvXdriveTokenUrlRequired 0,
     SrvXdriveHeaderValues 0,
     SrvXdriveScalarClamped 0,
+    SrvXdriveConcurrencyClamped 1,
     SrvXdriveRequiresVless 0,
     SrvXdriveVlessFlow 0,
     SrvXdriveVlessEncryption 0,
@@ -2874,6 +2875,10 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         XdriveTemplateTokenUrlRequired => (Key::SrvXdriveTokenUrlRequired, Vec::new()),
         XdriveTemplateHeaderValuesNotStrings => (Key::SrvXdriveHeaderValues, Vec::new()),
         XdriveScalarClamped => (Key::SrvXdriveScalarClamped, Vec::new()),
+        XdriveConcurrencyClamped(limit) => (
+            Key::SrvXdriveConcurrencyClamped,
+            vec![Count(*limit as usize)],
+        ),
         XdriveRequiresVless => (Key::SrvXdriveRequiresVless, Vec::new()),
         XdriveVlessFlowUnsupported => (Key::SrvXdriveVlessFlow, Vec::new()),
         XdriveVlessEncryptionRequired => (Key::SrvXdriveVlessEncryption, Vec::new()),
@@ -5099,6 +5104,7 @@ mod en {
             Key::SrvXdriveScalarClamped => {
                 "The core overrides this value while it builds the transport"
             }
+            Key::SrvXdriveConcurrencyClamped => "The core caps concurrency at {}",
             Key::SrvXdriveRequiresVless => "The xdrive transport can only be used by VLESS",
             Key::SrvXdriveVlessFlow => "The xdrive transport does not support a VLESS flow",
             Key::SrvXdriveVlessEncryption => {

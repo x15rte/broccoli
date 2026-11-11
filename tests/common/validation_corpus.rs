@@ -334,6 +334,7 @@ pub(crate) fn all_codes() -> Vec<ValidationCode> {
         XdriveTemplateTokenUrlRequired,
         XdriveTemplateHeaderValuesNotStrings,
         XdriveScalarClamped,
+        XdriveConcurrencyClamped(256),
         XdriveRequiresVless,
         XdriveVlessFlowUnsupported,
         XdriveVlessEncryptionRequired,
@@ -475,7 +476,8 @@ validation_codes! {
         XdriveS3SecretsInvalid, XdriveS3RegionEmpty, XdriveS3EndpointNotHttps,
         XdriveTemplateNamesRegexInvalid,
         XdriveTemplateTokenUrlRequired, XdriveTemplateHeaderValuesNotStrings,
-        XdriveScalarClamped, XdriveRequiresVless, XdriveVlessFlowUnsupported,
+        XdriveScalarClamped, XdriveRequiresVless,
+        XdriveVlessFlowUnsupported,
         XdriveVlessEncryptionRequired, XdriveMuxRequired, XdriveMuxConcurrencyNegative,
         XdriveMuxXudpProxyUdp443Skip, XdriveVlessTestpreUnsupported,
         XdriveDriveServiceRenamed, XdriveH3CongestionBrutal,
@@ -518,6 +520,6 @@ validation_codes! {
         FakeDnsPoolCidrInvalid, FakeDnsPoolSizeInvalid, FakeDnsPoolCapacityExceeded,
         GeodataUrlInvalid, XhttpExtraShadowsSettings, MasqueHeaderInvalid, MasqueReservedHeader,
         XdriveServiceUnsupported, XdriveTemplateOperationUrlRequired,
-        XdriveTemplateAuthTypeUnsupported, XdriveH3MaskNotNoise,
+        XdriveTemplateAuthTypeUnsupported, XdriveH3MaskNotNoise, XdriveConcurrencyClamped,
     }
 }

@@ -1642,6 +1642,42 @@ fn golden_xdrive_drive() {
     );
 }
 
+/// A Drive block that leaves the scalars unset emits no concurrency, flush or
+/// poll key: the app writes only the user's decisions, and the core fills its
+/// slot-store defaults (transport/internet/xdrive/params.go:71-87).
+#[test]
+fn xdrive_unset_scalars_stay_out_of_the_document() {
+    let mut ob = xdrive_vless_outbound();
+    {
+        let xdrive = ob
+            .stream
+            .xdrive_settings
+            .as_mut()
+            .expect("selecting xdrive materializes its block");
+        xdrive.service = crate::model::stream::XDRIVE_SERVICE_DRIVE.into();
+        xdrive.remote_folder = "drive-folder-id".into();
+        xdrive.secrets = vec![
+            "client-id".into(),
+            "client-secret".into(),
+            "refresh-token".into(),
+        ];
+    }
+    let cfg = generate_deterministic(&single_server(ob), &base_settings())
+        .expect("the profile generates");
+    let xdrive = &cfg["outbounds"][0]["streamSettings"]["xdriveSettings"];
+    for key in [
+        "concurrency",
+        "flushIntervalMs",
+        "pollIntervalMs",
+        "maxPollIntervalMs",
+    ] {
+        assert!(
+            xdrive.get(key).is_none(),
+            "{key} must stay out of the document: {xdrive}"
+        );
+    }
+}
+
 /// An xdrive transport over the template backend: the authorization flow,
 /// the four operations and the retry rules nest as the JSON object the
 /// runtime unmarshals, and the pinned core accepts the document.

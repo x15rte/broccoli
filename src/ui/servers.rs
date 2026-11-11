@@ -21,11 +21,13 @@ use crate::model::stream::{
     XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
     XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
     XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
-    XDRIVE_DEFAULT_SESSION_TTL_SECONDS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
-    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE,
-    XDRIVE_SERVICES, XDRIVE_TEMPLATE_AUTH_TYPES, XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY,
-    XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XdriveTemplateAuth,
-    XdriveTemplateOp, xdrive_folder_required,
+    XDRIVE_DEFAULT_SESSION_TTL_SECONDS, XDRIVE_DRIVE_DEFAULT_CONCURRENCY,
+    XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS, XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+    XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES, XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL,
+    XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE, XDRIVE_SERVICES, XDRIVE_TEMPLATE_AUTH_TYPES,
+    XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY, XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation,
+    XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp, xdrive_folder_required,
+    xdrive_slot_store,
 };
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
@@ -971,7 +973,7 @@ struct KvScratch {
 }
 
 /// One xdrive numeric scalar: zero keeps the core's own default
-/// (transport/internet/xdrive/params.go:28-50), so the field spans `0..=max`
+/// (transport/internet/xdrive/params.go:6-16), so the field spans `0..=max`
 /// and names the default it falls back to. `max` is the runtime's cap where
 /// it has one, and `u32::MAX` otherwise.
 fn xdrive_scalar(
@@ -9768,6 +9770,25 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveServiceUnset),
                         false,
                     );
+                    // The slot store fills its zero scalars with the Drive
+                    // defaults; every wal-based backend keeps the transport
+                    // defaults (transport/internet/xdrive/params.go:71-87).
+                    let slot_store = xdrive_slot_store(&s.service);
+                    let flush_default = if slot_store {
+                        XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS
+                    } else {
+                        XDRIVE_DEFAULT_FLUSH_INTERVAL_MS
+                    };
+                    let max_poll_default = if slot_store {
+                        XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
+                    } else {
+                        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
+                    };
+                    let concurrency_default = if slot_store {
+                        XDRIVE_DRIVE_DEFAULT_CONCURRENCY
+                    } else {
+                        XDRIVE_DEFAULT_CONCURRENCY
+                    };
                     // The service decides what the folder names, so the hint
                     // follows the choice and the field is required exactly where
                     // the core refuses an empty one at start.
@@ -9860,7 +9881,7 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveFlushInterval),
                         &mut s.flush_interval_ms,
                         u32::MAX,
-                        XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
+                        flush_default,
                     );
                     changed |= xdrive_scalar(
                         ui,
@@ -9876,15 +9897,15 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveMaxPollInterval),
                         &mut s.max_poll_interval_ms,
                         u32::MAX,
-                        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+                        max_poll_default,
                     );
                     // The core raises a max poll interval below the min poll
-                    // interval (transport/internet/xdrive/params.go:65-67); the
+                    // interval (transport/internet/xdrive/params.go:69-71); the
                     // model warns for the same pair, so the editor shows it here
                     // where both fields are visible.
                     let effective =
                         |value: u32, default: u32| if value == 0 { default } else { value };
-                    if effective(s.max_poll_interval_ms, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS)
+                    if effective(s.max_poll_interval_ms, max_poll_default)
                         < effective(s.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
                     {
                         ui.colored_label(
@@ -9906,7 +9927,7 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveConcurrency),
                         &mut s.concurrency,
                         XDRIVE_MAX_CONCURRENCY,
-                        XDRIVE_DEFAULT_CONCURRENCY,
+                        concurrency_default,
                     );
                     changed |= xdrive_scalar(
                         ui,
@@ -20888,6 +20909,17 @@ Authentication: ML-KEM-768, Post-Quantum
             Some(128),
             "xdrive also seeds the effective concurrency"
         );
+        // The core's xdrive gate: mux enabled, both concurrency knobs
+        // non-negative, and xudpProxyUDP443 other than `skip`
+        // (infra/conf/xray.go:292-294).
+        let gate_holds = mux.enabled
+            && mux.concurrency.is_none_or(|value| value >= 0)
+            && mux.xudp_concurrency.is_none_or(|value| value >= 0)
+            && mux.xudp_proxy_udp443.as_deref() != Some("skip");
+        assert!(
+            gate_holds,
+            "the seeded mux must satisfy the core's xdrive gate: {mux:?}"
+        );
     }
 
     /// Leaving VLESS while xdrive is selected resets the transport to raw and
@@ -21074,6 +21106,74 @@ Authentication: ML-KEM-768, Post-Quantum
             5,
             "each substitution site lists the variables it expands"
         );
+    }
+
+    /// The Google Drive backend's scalar hints name the slot-store defaults
+    /// the pinned core uses for fields the config leaves zero — concurrency
+    /// 64, flush 10 ms, max poll 200 ms — while the wal-based backends keep
+    /// the transport defaults (transport/internet/xdrive/params.go:6-16,
+    /// :71-87).
+    #[test]
+    fn xdrive_drive_hints_name_the_slot_store_defaults() {
+        let hints = |service: &'static str| -> Vec<String> {
+            let mut stream = StreamModel {
+                network: Network::Xdrive,
+                xdrive_settings: Some(Box::new(crate::model::stream::XdriveTransport {
+                    service: service.into(),
+                    remote_folder: "folder".into(),
+                    secrets: vec!["a".into(), "b".into(), "c".into()],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let mut screen = ServersScreen::default();
+            let harness = harness_builder().build_ui(|ui| {
+                let _ = screen.transport_tab(
+                    ui,
+                    Language::En,
+                    &mut stream,
+                    0,
+                    TransportTabCtx {
+                        target: None,
+                        masked: false,
+                        protocol: Protocol::Vless,
+                        mux: None,
+                    },
+                );
+            });
+            harness
+                .query_all_by_label_contains("core default")
+                .filter_map(|node| node.value())
+                .collect()
+        };
+
+        let drive = hints(crate::model::stream::XDRIVE_SERVICE_DRIVE);
+        for expected in ["core default 64", "core default 10", "core default 200"] {
+            assert!(
+                drive.iter().any(|hint| hint == expected),
+                "the Drive hints must name {expected:?}: {drive:#?}"
+            );
+        }
+        for old in ["core default 8", "core default 20", "core default 500"] {
+            assert!(
+                !drive.iter().any(|hint| hint == old),
+                "the Drive hints must not keep {old:?}: {drive:#?}"
+            );
+        }
+
+        let local = hints(crate::model::stream::XDRIVE_SERVICE_LOCAL);
+        for expected in ["core default 8", "core default 20", "core default 500"] {
+            assert!(
+                local.iter().any(|hint| hint == expected),
+                "the wal-based backends keep {expected:?}: {local:#?}"
+            );
+        }
+        for drive_only in ["core default 64", "core default 10", "core default 200"] {
+            assert!(
+                !local.iter().any(|hint| hint == drive_only),
+                "the wal-based backends must not take {drive_only:?}: {local:#?}"
+            );
+        }
     }
 
     /// The xdrive transport settings carry the shared XMUX section: the enable

@@ -1258,14 +1258,19 @@ pub enum ValidationCode {
     /// tier.
     XdriveTemplateHeaderValuesNotStrings,
     /// Configuration warning (Severity::Warning): an `xdriveSettings` scalar
-    /// outside the range the runtime honours. `segmentBytes` above 16 MiB and
-    /// `concurrency` above 64 are capped while the transport is built
-    /// (transport/internet/xdrive/params.go:13-16, :43-50), a template
+    /// outside the range the runtime honours. `segmentBytes` above 16 MiB is
+    /// capped while the transport is built
+    /// (transport/internet/xdrive/params.go:13-16, :44-52), a template
     /// `concurrency` above 256 is capped (template.go:89-95, :104), and
     /// `maxPollIntervalMs` below `pollIntervalMs` is raised to it
-    /// (params.go:65-67). The value is legal and the core silently rewrites
+    /// (params.go:69-71). The value is legal and the core silently rewrites
     /// it, so the rule advises instead of gating.
     XdriveScalarClamped,
+    /// Configuration warning (Severity::Warning): `xdriveSettings.concurrency`
+    /// above the runtime's cap, which `capped` runs at the cap
+    /// (transport/internet/xdrive/params.go:16, :44-52). The payload is the
+    /// cap, so the message names the value the core applies. Advisory tier.
+    XdriveConcurrencyClamped(u32),
     /// The `xdrive` transport on any outbound whose protocol is not VLESS:
     /// the core's outbound build refuses every other account type
     /// (`the xdrive transport can only be used by VLESS`,
