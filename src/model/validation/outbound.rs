@@ -37,19 +37,19 @@ use std::borrow::Cow;
 
 /// Mux/vision predicate (shared with the editor's targeted-inline hints, so
 /// the model and the UI can never disagree): true when a VLESS profile
-/// combines a vision flow with TCP-carrying mux:
-/// Xray's XRV servers reject TCP frames over mux (breaking the whole mux
-/// connection on the first one), so such a profile cannot work. `concurrency
-/// = -1` is the TCP-direct escape hatch — XUDP stays available, so it never
-/// warns; the XUDP knobs (`xudpConcurrency`/`xudpProxyUDP443`) do NOT
-/// suppress the warning, because TCP rides smux whenever mux is enabled with
-/// a non-negative concurrency.
+/// combines a vision flow with TCP-carrying mux. A Vision mux connection
+/// carries UDP only, and the server closes it on the first TCP session, so
+/// such a profile cannot work. Any negative `concurrency` keeps TCP direct
+/// (XUDP stays available), so it never warns; the XUDP knobs
+/// (`xudpConcurrency`/`xudpProxyUDP443`) do NOT suppress the warning,
+/// because TCP rides smux whenever mux is enabled with a zero or positive
+/// concurrency (app/proxyman/outbound/handler.go).
 pub fn mux_conflicts_with_vision_flow(
     flow: &str,
     mux_enabled: bool,
     mux_concurrency: Option<i16>,
 ) -> bool {
-    is_vision_flow(flow) && mux_enabled && mux_concurrency != Some(-1)
+    is_vision_flow(flow) && mux_enabled && !mux_concurrency.is_some_and(|c| c < 0)
 }
 
 /// The `xudpProxyUDP443` vocabulary: the three modes Xray's mux Build
@@ -67,24 +67,43 @@ fn xudp_proxy_udp443_supported(value: &str) -> bool {
     value.is_empty() || XUDP_PROXY_UDP443_MODES.contains(&value)
 }
 
-/// Concurrency reinterpretation: true when mux is
-/// enabled with a `concurrency` value Xray silently changes the meaning
-/// of — `0` runs as 8, values above 128 clamp to 128, and any negative
-/// other than the documented `-1` TCP-direct escape disables mux entirely
-/// (proxy outbound handler; outbound docs
-/// https://xtls.github.io/config/outbound.html#muxobject, MuxObject bounds
-/// [1, 128]).
-/// Disabled blocks never fire: Xray reads `concurrency` only inside the
-/// `Enabled` branch, so an out-of-band value there is a dead knob, not a
-/// reinterpretation. `-1` and 1..=128 never fire.
-fn mux_concurrency_reinterpreted(mux_enabled: bool, concurrency: Option<i16>) -> bool {
-    mux_enabled && concurrency.is_some_and(|c| c == 0 || !(-1..=128).contains(&c))
+/// Concurrency rewrite: true when mux is enabled with a `concurrency` the
+/// pinned core raises to 128 at run time — every value from 0 through 128
+/// becomes 128, and an absent value is the zero value, so 0..=127 (and
+/// `None`) warn. Values of 129 and above pass through verbatim, and any
+/// negative value keeps TCP direct (app/proxyman/outbound/handler.go).
+/// Disabled blocks never fire: the core reads `concurrency` only inside the
+/// `Enabled` branch.
+fn mux_concurrency_raised(mux_enabled: bool, concurrency: Option<i16>) -> bool {
+    mux_enabled && concurrency.is_none_or(|c| (0..=127).contains(&c))
+}
+
+/// TCP-mux-off state note: true when mux is enabled with a negative
+/// `concurrency` — TCP goes direct, but XUDP and the UDP/443 policy still
+/// apply because the whole block rides the `Enabled` branch
+/// (app/proxyman/outbound/handler.go).
+fn mux_tcp_mux_disabled(m: &MuxModel) -> bool {
+    m.enabled && m.concurrency.is_some_and(|c| c < 0)
+}
+
+/// UDP/443 refusal: true when XUDP is on (`xudpConcurrency` > 0) and
+/// `xudpProxyUDP443` keeps the default `reject` (unset and empty are the
+/// same policy). The core refuses every UDP flow to port 443 with `XUDP
+/// rejected UDP/443 traffic` (app/proxyman/outbound/handler.go).
+fn mux_udp443_rejected(m: &MuxModel) -> bool {
+    m.enabled
+        && m.xudp_concurrency.is_some_and(|c| c > 0)
+        && matches!(
+            m.xudp_proxy_udp443.as_deref(),
+            None | Some("") | Some("reject")
+        )
 }
 
 /// Dead XUDP knobs: true when an XUDP knob is set
-/// while `mux.enabled` is off — Xray reads `xudpConcurrency` /
-/// `xudpProxyUDP443` only inside the `Enabled` block (proxy outbound
-/// handler), so the whole XUDP side is silently ignored.
+/// while `mux.enabled` is off — the core reads `xudpConcurrency` /
+/// `xudpProxyUDP443` only inside the `Enabled` branch (app/proxyman/outbound/
+/// handler.go), so the whole block stays inert and TCP, UDP, and the
+/// UDP/443 policy all go direct.
 fn mux_xudp_knobs_inert(m: &MuxModel) -> bool {
     !m.enabled && (m.xudp_concurrency.is_some() || m.xudp_proxy_udp443.is_some())
 }
@@ -1658,10 +1677,22 @@ pub fn validate_outbound_with_blocks(o: &OutboundModel) -> (Verdict, StreamBlock
             Some("mux.xudpProxyUDP443".into()),
         ));
     }
-    if mux_concurrency_reinterpreted(o.mux.enabled, o.mux.concurrency) {
+    if mux_concurrency_raised(o.mux.enabled, o.mux.concurrency) {
         issues.push(warning(
             ValidationCode::MuxConcurrencyReinterpreted,
             Some("mux.concurrency".into()),
+        ));
+    }
+    if mux_tcp_mux_disabled(&o.mux) {
+        issues.push(warning(
+            ValidationCode::MuxTcpMuxDisabled,
+            Some("mux.concurrency".into()),
+        ));
+    }
+    if mux_udp443_rejected(&o.mux) {
+        issues.push(warning(
+            ValidationCode::MuxUdp443Rejected,
+            Some("mux.xudpProxyUDP443".into()),
         ));
     }
     if mux_xudp_knobs_inert(&o.mux) {
@@ -2505,6 +2536,7 @@ mod tests {
         account.encryption =
             "mlkem768x25519plus.native.1rtt.AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA".into();
         outbound.mux.enabled = true;
+        outbound.mux.concurrency = Some(128);
         outbound.stream.network = Network::Xdrive;
         outbound.stream.xdrive_settings = Some(Box::new(settings));
         outbound
@@ -4566,24 +4598,26 @@ mod tests {
         };
         settings.flow = "xtls-rprx-vision".into();
         outbound.mux.enabled = true;
-        // concurrency unset (None → Xray's default 8) and an explicit
-        // positive value both carry TCP over smux — both must warn.
-        let issues = validate_outbound(&outbound);
-        let finding = mux_finding(&issues).expect("vision + enabled mux must warn");
-        assert_eq!(finding.path.as_deref(), Some("mux"));
-        assert_eq!(finding.severity, Severity::Warning);
+        // An absent concurrency and every zero or positive value still carry
+        // TCP over smux under the pinned core, so all of them warn.
+        for concurrency in [None, Some(0), Some(8)] {
+            outbound.mux.concurrency = concurrency;
+            let issues = validate_outbound(&outbound);
+            let finding = mux_finding(&issues)
+                .unwrap_or_else(|| panic!("vision + enabled mux must warn: {issues:#?}"));
+            assert_eq!(finding.path.as_deref(), Some("mux"));
+            assert_eq!(finding.severity, Severity::Warning);
+        }
 
-        outbound.mux.concurrency = Some(8);
-        let issues = validate_outbound(&outbound);
-        assert!(mux_finding(&issues).is_some(), "{issues:#?}");
-
-        // concurrency -1 is the TCP-direct escape hatch (XUDP stays
-        // available): the combination must not warn.
-        outbound.mux.concurrency = Some(-1);
-        assert!(
-            mux_finding(&validate_outbound(&outbound)).is_none(),
-            "concurrency -1 keeps TCP direct; no warning may fire"
-        );
+        // Any negative concurrency keeps TCP direct (XUDP stays available):
+        // the combination must not warn.
+        for concurrency in [Some(-1), Some(-2), Some(-32768)] {
+            outbound.mux.concurrency = concurrency;
+            assert!(
+                mux_finding(&validate_outbound(&outbound)).is_none(),
+                "concurrency {concurrency:?} keeps TCP direct; no warning may fire"
+            );
+        }
     }
 
     #[test]
@@ -4707,9 +4741,11 @@ mod tests {
         // the config at load, so the model refuses it too (Error tier).
         for value in ["Reject", "ALLOW", "reject-udp", "skip ", "auto", "0"] {
             let mut outbound = vless_over_tls();
-            // Enabled block: the 1.24 dead-knob rule stays off, isolating
-            // the whitelist Error under test.
+            // Enabled block at the effective concurrency: the rewrite and
+            // dead-knob rules stay off, isolating the whitelist Error under
+            // test.
             outbound.mux.enabled = true;
+            outbound.mux.concurrency = Some(128);
             outbound.mux.xudp_proxy_udp443 = Some(value.into());
             let issues = validate_outbound(&outbound);
             assert_eq!(
@@ -4739,6 +4775,7 @@ mod tests {
         for value in [None, Some(""), Some("reject"), Some("allow"), Some("skip")] {
             let mut outbound = vless_over_tls();
             outbound.mux.enabled = true;
+            outbound.mux.concurrency = Some(128);
             outbound.mux.xudp_proxy_udp443 = value.map(str::to_string);
             let issues = validate_outbound(&outbound);
             assert!(
@@ -4749,10 +4786,12 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_outside_documented_bounds_warns_only_while_mux_is_enabled() {
-        // Reinterpreted values over an enabled block: 0 → 8, > 128 →
-        // clamp 128, negatives other than -1 → mux off (TCP direct).
-        for value in [Some(0), Some(-2), Some(-100), Some(129), Some(1024)] {
+    fn concurrency_from_0_through_127_warns_only_while_mux_is_enabled() {
+        // The pinned core rewrites every value from 0 through 128 to 128
+        // when it builds the handler, so an enabled block with a value
+        // below 128 runs as 128. An absent value is the zero value and
+        // behaves the same.
+        for value in [None, Some(0), Some(1), Some(8), Some(127)] {
             let mut outbound = vless_over_tls();
             outbound.mux.enabled = true;
             outbound.mux.concurrency = value;
@@ -4767,9 +4806,8 @@ mod tests {
             assert_eq!(finding.path.as_deref(), Some("mux.concurrency"));
         }
 
-        // Documented values never warn: unset (the wire default 8), the
-        // -1 TCP-direct escape, and 1..=128.
-        for value in [None, Some(-1), Some(1), Some(8), Some(128)] {
+        // 128 and above pass through verbatim; no rule fires on them.
+        for value in [Some(128), Some(129), Some(1024), Some(32767)] {
             let mut outbound = vless_over_tls();
             outbound.mux.enabled = true;
             outbound.mux.concurrency = value;
@@ -4780,10 +4818,29 @@ mod tests {
             );
         }
 
+        // Negatives keep TCP direct: the rewrite warning never fires (the
+        // separate TCP-mux-off state note does).
+        for value in [Some(-1), Some(-2), Some(-32768)] {
+            let mut outbound = vless_over_tls();
+            outbound.mux.enabled = true;
+            outbound.mux.concurrency = value;
+            let issues = validate_outbound(&outbound);
+            assert!(
+                finding(&issues, &ValidationCode::MuxConcurrencyReinterpreted).is_none(),
+                "concurrency {value:?} over enabled mux must not warn about a rewrite: \
+                 {issues:#?}"
+            );
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::MuxTcpMuxDisabled],
+                "concurrency {value:?} carries only the TCP-mux-off note: {issues:#?}"
+            );
+        }
+
         // Disabled block: Xray never reads `concurrency` (the whole mux
-        // block is inert), so nothing is reinterpreted and nothing warns —
-        // an out-of-band value there is dead, not changed in meaning.
-        for value in [Some(0), Some(-2), Some(300)] {
+        // block is inert), so nothing warns — an out-of-band value there is
+        // dead, not rewritten.
+        for value in [None, Some(0), Some(-2), Some(300)] {
             let mut outbound = vless_over_tls();
             outbound.mux.enabled = false;
             outbound.mux.concurrency = value;
@@ -4791,6 +4848,99 @@ mod tests {
             assert!(
                 issues.is_empty(),
                 "concurrency {value:?} on a disabled mux block must stay silent: {issues:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_concurrency_with_enabled_mux_warns_that_tcp_mux_is_off() {
+        for value in [Some(-1), Some(-2), Some(-32768)] {
+            let mut outbound = vless_over_tls();
+            outbound.mux.enabled = true;
+            outbound.mux.concurrency = value;
+            let issues = validate_outbound(&outbound);
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::MuxTcpMuxDisabled],
+                "concurrency {value:?} must raise the TCP-mux-off note: {issues:#?}"
+            );
+            let finding = finding(&issues, &ValidationCode::MuxTcpMuxDisabled).unwrap();
+            assert_eq!(finding.severity, Severity::Warning);
+            assert_eq!(finding.path.as_deref(), Some("mux.concurrency"));
+        }
+
+        // Zero and positive values keep TCP mux on, and a disabled block is
+        // fully inert.
+        for (enabled, value) in [
+            (true, None),
+            (true, Some(0)),
+            (true, Some(128)),
+            (false, Some(-1)),
+        ] {
+            let mut outbound = vless_over_tls();
+            outbound.mux.enabled = enabled;
+            outbound.mux.concurrency = value;
+            let issues = validate_outbound(&outbound);
+            assert!(
+                finding(&issues, &ValidationCode::MuxTcpMuxDisabled).is_none(),
+                "enabled {enabled} with concurrency {value:?} must not raise the TCP-mux-off \
+                 note: {issues:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xudp_with_the_default_udp443_policy_warns_that_udp443_is_refused() {
+        // XUDP enabled with the unset, empty, or explicit default policy
+        // refuses every UDP/443 flow (`XUDP rejected UDP/443 traffic`).
+        for mode in [None, Some(""), Some("reject")] {
+            let mut outbound = vless_over_tls();
+            outbound.mux.enabled = true;
+            outbound.mux.concurrency = Some(128);
+            outbound.mux.xudp_concurrency = Some(8);
+            outbound.mux.xudp_proxy_udp443 = mode.map(str::to_string);
+            let issues = validate_outbound(&outbound);
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::MuxUdp443Rejected],
+                "xudpProxyUDP443 {mode:?} with XUDP enabled must warn exactly once: {issues:#?}"
+            );
+            let finding = finding(&issues, &ValidationCode::MuxUdp443Rejected).unwrap();
+            assert_eq!(finding.severity, Severity::Warning);
+            assert_eq!(finding.path.as_deref(), Some("mux.xudpProxyUDP443"));
+        }
+
+        // `allow` and `skip` lift the refusal.
+        for mode in ["allow", "skip"] {
+            let mut outbound = vless_over_tls();
+            outbound.mux.enabled = true;
+            outbound.mux.concurrency = Some(128);
+            outbound.mux.xudp_concurrency = Some(8);
+            outbound.mux.xudp_proxy_udp443 = Some(mode.into());
+            let issues = validate_outbound(&outbound);
+            assert!(
+                issues.is_empty(),
+                "xudpProxyUDP443 {mode:?} must stay silent: {issues:#?}"
+            );
+        }
+
+        // No XUDP (unset, zero, or negative) and a disabled block never
+        // raise it.
+        for (enabled, xudp_concurrency) in [
+            (true, None),
+            (true, Some(0)),
+            (true, Some(-1)),
+            (false, Some(8)),
+        ] {
+            let mut outbound = vless_over_tls();
+            outbound.mux.enabled = enabled;
+            outbound.mux.concurrency = Some(128);
+            outbound.mux.xudp_concurrency = xudp_concurrency;
+            let issues = validate_outbound(&outbound);
+            assert!(
+                finding(&issues, &ValidationCode::MuxUdp443Rejected).is_none(),
+                "enabled {enabled} with xudpConcurrency {xudp_concurrency:?} must not warn about \
+                 UDP/443: {issues:#?}"
             );
         }
     }
@@ -4820,19 +4970,24 @@ mod tests {
         }
 
         // Canonical: the knobs with mux enabled — including the XUDP-only
-        // wire shape (concurrency -1) — stay silent, and a bare enabled
-        // block with no knobs stays silent.
-        for (enabled, concurrency) in [(true, None), (true, Some(-1)), (true, Some(8))] {
+        // wire shape (negative concurrency) — stay silent apart from the
+        // TCP-mux-off state note that a negative concurrency carries.
+        for (concurrency, expected) in [
+            (Some(128), vec![]),
+            (Some(1024), vec![]),
+            (Some(-1), vec![ValidationCode::MuxTcpMuxDisabled]),
+        ] {
             let mut outbound = vless_over_tls();
-            outbound.mux.enabled = enabled;
+            outbound.mux.enabled = true;
             outbound.mux.concurrency = concurrency;
             outbound.mux.xudp_concurrency = Some(8);
             outbound.mux.xudp_proxy_udp443 = Some("allow".into());
             let issues = validate_outbound(&outbound);
-            assert!(
-                issues.is_empty(),
-                "XUDP knobs over enabled mux (concurrency {concurrency:?}) must stay silent: \
-                 {issues:#?}"
+            assert_eq!(
+                codes(&issues),
+                expected,
+                "XUDP knobs over enabled mux (concurrency {concurrency:?}) must carry only the \
+                 state note: {issues:#?}"
             );
         }
         let issues = validate_outbound(&vless_over_tls());
@@ -4840,25 +4995,49 @@ mod tests {
     }
 
     #[test]
+    fn mux_on_an_outbound_without_a_mux_peer_stays_silent() {
+        // The core builds mux for every protocol, and whether a server
+        // understands the mux domain is a server property, so an outbound
+        // with no mux peer must not raise a mux warning of its own.
+        let mut outbound = freedom_canonical();
+        outbound.mux.enabled = true;
+        outbound.mux.concurrency = Some(128);
+        outbound.mux.xudp_concurrency = Some(16);
+        outbound.mux.xudp_proxy_udp443 = Some("allow".into());
+        let issues = validate_outbound(&outbound);
+        assert!(issues.is_empty(), "{issues:#?}");
+    }
+
+    #[test]
     fn mux_warnings_coexist_with_the_vision_warning_and_never_suppress() {
-        // The concurrency warning and the vision warning apply to the same
-        // enabled block (concurrency -2 is a reinterpreted negative AND
-        // carries TCP over smux under a vision flow): both render.
+        // The rewrite warning and the vision warning apply to the same
+        // enabled block (concurrency 0 runs as 128 AND carries TCP over
+        // smux under a vision flow): both render.
         let mut outbound = vless_over_tls();
         let ProtocolSettings::Vless(settings) = &mut outbound.settings else {
             unreachable!()
         };
         settings.flow = "xtls-rprx-vision".into();
         outbound.mux.enabled = true;
-        outbound.mux.concurrency = Some(-2);
+        outbound.mux.concurrency = Some(0);
         let issues = validate_outbound(&outbound);
-        let found = codes(&issues);
-        assert!(
-            found.contains(&ValidationCode::MuxWithVisionFlow),
+        assert_eq!(
+            codes(&issues),
+            vec![
+                ValidationCode::MuxWithVisionFlow,
+                ValidationCode::MuxConcurrencyReinterpreted,
+            ],
             "{issues:#?}"
         );
-        assert!(
-            found.contains(&ValidationCode::MuxConcurrencyReinterpreted),
+
+        // A negative concurrency keeps TCP direct: the vision warning and
+        // the rewrite warning stay silent, and only the TCP-mux-off note
+        // renders.
+        outbound.mux.concurrency = Some(-2);
+        let issues = validate_outbound(&outbound);
+        assert_eq!(
+            codes(&issues),
+            vec![ValidationCode::MuxTcpMuxDisabled],
             "{issues:#?}"
         );
 
@@ -4878,8 +5057,9 @@ mod tests {
         );
 
         // The sanctioned XUDP-only vision profile — enabled, concurrency
-        // -1, XUDP knobs, vision-udp443 flow — trips none of the mux rules
-        // (escape semantics intact end to end).
+        // negative, XUDP knobs, vision-udp443 flow — keeps the vision
+        // warning silent while the TCP-mux-off note names what still
+        // applies.
         let mut xudp_only = vless_over_tls();
         let ProtocolSettings::Vless(settings) = &mut xudp_only.settings else {
             unreachable!()
@@ -4890,9 +5070,23 @@ mod tests {
         xudp_only.mux.xudp_concurrency = Some(8);
         xudp_only.mux.xudp_proxy_udp443 = Some("allow".into());
         let issues = validate_outbound(&xudp_only);
-        assert!(
-            issues.is_empty(),
-            "the XUDP-only vision profile must stay clean: {issues:#?}"
+        assert_eq!(
+            codes(&issues),
+            vec![ValidationCode::MuxTcpMuxDisabled],
+            "the XUDP-only vision profile must keep the vision warning silent: {issues:#?}"
+        );
+
+        // The default UDP/443 policy adds its own warning on the same
+        // enabled block, alongside the TCP-mux-off note.
+        xudp_only.mux.xudp_proxy_udp443 = Some("reject".into());
+        let issues = validate_outbound(&xudp_only);
+        assert_eq!(
+            codes(&issues),
+            vec![
+                ValidationCode::MuxTcpMuxDisabled,
+                ValidationCode::MuxUdp443Rejected,
+            ],
+            "{issues:#?}"
         );
     }
 

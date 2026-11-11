@@ -1305,6 +1305,7 @@ keys! {
     SrvHttpCamouflageHeader 0,
     SrvRequestCamouflage 0,
     SrvResponseCamouflage 0,
+    SrvEnableMux 0,
     SrvEnableXmux 0,
     SrvSeparateDownlinkStream 0,
     SrvConnectionLimit 0,
@@ -1595,7 +1596,7 @@ keys! {
     SrvUseAuto 0,
     SrvCookieHeaderNeedsPacketUp 0,
     SrvSendThroughInvalid 0,
-    SrvMuxDeprecatedNote 0,
+    SrvMuxNote 0,
     SrvRulesColon 0,
     SrvNoisesUdpObfuscation 0,
     SrvRemoveNoise 0,
@@ -1794,11 +1795,13 @@ keys! {
     XhttpServerMaxHeaderBytesInvalid 0,
     GrpcNegativeClamp 0,
     // Mux-block rules (outbound `mux` model rules; the xudpProxyUDP443
-    // whitelist Error, plus the concurrency-reinterpretation and
-    // xudp-knobs-without-enabled configuration warnings).
+    // whitelist Error, plus the concurrency rewrite, dead-knob,
+    // TCP-mux-off, and UDP/443-refusal configuration warnings).
     OutboundMuxXudpProxyUdp443Unsupported 0,
     OutboundMuxConcurrencyReinterpreted 0,
     OutboundMuxXudpKnobsInert 0,
+    OutboundMuxTcpMuxDisabled 0,
+    OutboundMuxUdp443Rejected 0,
     FinalmaskQuicCongestionInvalid 0,
     FinalmaskQuicBbrProfileInvalid 0,
     FinalmaskQuicBandwidthTooSmall 0,
@@ -2928,6 +2931,8 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         MuxXudpProxyUdp443Unsupported => (Key::OutboundMuxXudpProxyUdp443Unsupported, Vec::new()),
         MuxConcurrencyReinterpreted => (Key::OutboundMuxConcurrencyReinterpreted, Vec::new()),
         MuxXudpKnobsInert => (Key::OutboundMuxXudpKnobsInert, Vec::new()),
+        MuxTcpMuxDisabled => (Key::OutboundMuxTcpMuxDisabled, Vec::new()),
+        MuxUdp443Rejected => (Key::OutboundMuxUdp443Rejected, Vec::new()),
         TrojanFlowRemoved => (Key::OutboundTrojanFlowRemoved, Vec::new()),
         KcpSeedHeaderRemoved => (Key::KcpSeedHeaderRemoved, Vec::new()),
         KcpHeaderTypeIgnored => (Key::KcpHeaderTypeIgnored, Vec::new()),
@@ -4708,6 +4713,7 @@ mod en {
             Key::SrvHttpCamouflageHeader => "HTTP camouflage header",
             Key::SrvRequestCamouflage => "request camouflage",
             Key::SrvResponseCamouflage => "response camouflage",
+            Key::SrvEnableMux => "enable mux (Mux.Cool)",
             Key::SrvEnableXmux => "enable xmux",
             Key::SrvSeparateDownlinkStream => "separate downlink stream",
             Key::SrvConnectionLimit => "connection limit:",
@@ -5122,9 +5128,9 @@ mod en {
             Key::SrvSendThroughInvalid => {
                 "sendThrough must be an IP address, CIDR, origin, or srcip."
             }
-            Key::SrvMuxDeprecatedNote => {
-                "Mux is deprecated for XHTTP. Use xmux instead. Keep concurrency 8 for TCP-era \
-                 configs."
+            Key::SrvMuxNote => {
+                "Mux.Cool carries TCP and UDP traffic for the outbound over one connection. \
+                 XMUX is a separate transport-level block that reuses connections."
             }
             Key::SrvRulesColon => "rules:",
             Key::SrvNoisesUdpObfuscation => "noises (UDP obfuscation):",
@@ -5173,7 +5179,7 @@ mod en {
             Key::SrvMaxVersion => "max version",
             Key::SrvShowDebug => "show (debug)",
             Key::SrvOfficialSourceToken => "official source token",
-            Key::SrvConcurrencyLegacy => "concurrency (-1 = legacy single-stream)",
+            Key::SrvConcurrencyLegacy => "concurrency (negative disables TCP mux)",
             Key::SrvDelayMs => "delay (ms)",
             Key::SrvIntervalS => "interval (s)",
             Key::SrvReverseTag => "reverse tag",
@@ -5331,10 +5337,12 @@ mod en {
             // name the incompatibility, the fix, and the XUDP exception /
             // per-block plausible-value guidance.
             Key::OutboundMuxWithVisionFlow => {
-                "VLESS Vision flow rejects TCP carried over mux. The server tears the whole mux \
-                 connection down on the first TCP frame, so traffic dies with an EOF. Disable mux, \
-                 or set concurrency to -1 to keep TCP direct. The XUDP options \
-                 (xudpConcurrency/xudpProxyUDP443) remain compatible."
+                "VLESS Vision carries only UDP over Mux.Cool. The server closes the mux \
+                 connection on the first TCP session, so TCP keeps redialing and failing. \
+                 Disable mux with enabled false, or set concurrency to any negative value to \
+                 keep TCP direct. XUDP (xudpConcurrency above 0) still works on that connection. \
+                 The flow must match on both sides. A Vision client fails against a server \
+                 without Vision, and over mux a server rejects a client without the flow."
             }
             Key::OutboundServerNameImplausible => {
                 "serverName cannot be a real DNS name or IP. UUID-shaped values and characters like \
@@ -5493,17 +5501,29 @@ mod en {
                  value when it builds the mux block. Empty goes out as reject"
             }
             Key::OutboundMuxConcurrencyReinterpreted => {
-                "Xray silently reinterprets concurrency. A value of 0 runs as 8. Values above 128 \
-                 clamp to 128. Any negative other than the documented -1 disables mux (TCP direct). \
-                 Use -1 or a value from 1 through 128"
+                "Xray replaces concurrency values from 0 through 128 with 128, so the value \
+                 runs as 128. Values of 129 and above run as given, and a count above 1024 gains \
+                 nothing because one mux connection retires after 1024 sessions. Any negative \
+                 value turns TCP mux off."
             }
             Key::OutboundMuxXudpKnobsInert => {
-                "Xray reads xudpConcurrency and xudpProxyUDP443 only while mux.enabled is on. With \
-                 mux off, UDP still works, but mux does not multiplex it. A Vision flow always \
-                 frames UDP as XUDP. To use the two options, enable mux and set xudpConcurrency to \
-                 1-128. Keep concurrency at -1 so TCP stays direct. A Vision-flow server rejects mux \
-                 connections that carry TCP. xudpProxyUDP443 defaults to reject, which refuses \
-                 UDP/443 (QUIC) over mux. Set it to allow if you use QUIC"
+                "Xray reads xudpConcurrency and xudpProxyUDP443 only while mux.enabled is on. \
+                 With mux off the whole block does nothing: TCP and UDP both go direct, and the \
+                 UDP/443 policy stops too. With mux on, xudpConcurrency 0 or unset keeps XUDP \
+                 off and sends UDP through the normal mux. A negative value sends UDP direct, and \
+                 1 or more installs a separate XUDP manager. The default reject policy refuses \
+                 UDP/443 whenever the mux block is on, and skip is the only per-packet escape."
+            }
+            Key::OutboundMuxTcpMuxDisabled => {
+                "TCP mux is off because concurrency is negative. The UDP/443 policy still \
+                 applies, and XUDP still runs when xudpConcurrency is above 0. Disable the mux \
+                 block to turn all of it off."
+            }
+            Key::OutboundMuxUdp443Rejected => {
+                "This profile runs XUDP (xudpConcurrency above 0) with the default reject policy. \
+                 Every UDP flow to port 443 (QUIC and HTTP/3) fails with \"XUDP rejected UDP/443 \
+                 traffic\". Set xudpProxyUDP443 to allow to let QUIC through, or to skip to send \
+                 UDP/443 outside mux."
             }
             Key::FinalmaskQuicCongestionInvalid => "choose reno, bbr, brutal, or force-brutal",
             Key::FinalmaskQuicBbrProfileInvalid => "choose conservative, standard, or aggressive",
@@ -7499,9 +7519,9 @@ mod tests {
         );
     }
 
-    /// Configuration-warning pins: the two Severity::Warning codes
-    /// render through the same seam, prefixed by their wire path, and name
-    /// the incompatibility, the fix, and the XUDP exception / per-block
+    /// Configuration-warning pins: the Severity::Warning codes render
+    /// through the same seam, prefixed by their wire path, and name the
+    /// incompatibility, the fix, and the XUDP exception / per-block
     /// plausible-value guidance.
     #[test]
     fn configuration_warning_messages_name_the_incompatibility_and_the_fix() {
@@ -7515,17 +7535,48 @@ mod tests {
         };
         assert_eq!(
             validation_message(&mux_issue.code, Language::En),
-            "VLESS Vision flow rejects TCP carried over mux. The server tears the whole mux \
-             connection down on the first TCP frame, so traffic dies with an EOF. Disable mux, \
-             or set concurrency to -1 to keep TCP direct. The XUDP options \
-             (xudpConcurrency/xudpProxyUDP443) remain compatible."
+            "VLESS Vision carries only UDP over Mux.Cool. The server closes the mux connection \
+             on the first TCP session, so TCP keeps redialing and failing. Disable mux with \
+             enabled false, or set concurrency to any negative value to keep TCP direct. XUDP \
+             (xudpConcurrency above 0) still works on that connection. The flow must match on \
+             both sides. A Vision client fails against a server without Vision, and over mux \
+             a server rejects a client without the flow."
         );
         assert_eq!(
             validation_issue_message(&mux_issue, Language::En),
-            "mux: VLESS Vision flow rejects TCP carried over mux. The server tears the whole \
-             mux connection down on the first TCP frame, so traffic dies with an EOF. \
-             Disable mux, or set concurrency to -1 to keep TCP direct. The XUDP options \
-             (xudpConcurrency/xudpProxyUDP443) remain compatible."
+            "mux: VLESS Vision carries only UDP over Mux.Cool. The server closes the mux \
+             connection on the first TCP session, so TCP keeps redialing and failing. Disable \
+             mux with enabled false, or set concurrency to any negative value to keep TCP \
+             direct. XUDP (xudpConcurrency above 0) still works on that connection. The flow \
+             must match on both sides. A Vision client fails against a server without Vision, \
+             and over mux a server rejects a client without the flow."
+        );
+
+        let tcp_off = ValidationIssue {
+            code: ValidationCode::MuxTcpMuxDisabled,
+            path: Some("mux.concurrency".into()),
+            severity: Severity::Warning,
+            target: crate::model::validation::FindingTarget::Document,
+        };
+        assert_eq!(
+            validation_issue_message(&tcp_off, Language::En),
+            "mux.concurrency: TCP mux is off because concurrency is negative. The UDP/443 \
+             policy still applies, and XUDP still runs when xudpConcurrency is above 0. \
+             Disable the mux block to turn all of it off."
+        );
+
+        let udp443 = ValidationIssue {
+            code: ValidationCode::MuxUdp443Rejected,
+            path: Some("mux.xudpProxyUDP443".into()),
+            severity: Severity::Warning,
+            target: crate::model::validation::FindingTarget::Document,
+        };
+        assert_eq!(
+            validation_issue_message(&udp443, Language::En),
+            "mux.xudpProxyUDP443: This profile runs XUDP (xudpConcurrency above 0) with the \
+             default reject policy. Every UDP flow to port 443 (QUIC and HTTP/3) fails with \
+             \"XUDP rejected UDP/443 traffic\". Set xudpProxyUDP443 to allow to let QUIC \
+             through, or to skip to send UDP/443 outside mux."
         );
 
         for (path, guidance) in [

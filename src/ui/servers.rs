@@ -9105,11 +9105,12 @@ impl ServersScreen {
                         let _ = st.select_security(Security::Tls);
                     }
                     // xdrive needs one mux connection; seeding the switch
-                    // leaves the rest of the mux knobs editable.
+                    // and its effective concurrency leaves the rest of the
+                    // mux knobs editable.
                     if n == Network::Xdrive
                         && let Some(mux) = mux.as_deref_mut()
                     {
-                        mux.enabled = true;
+                        enable_mux(mux);
                     }
                     changed = true;
                 }
@@ -12707,12 +12708,34 @@ fn vless_flow(settings: &ProtocolSettings) -> Option<&str> {
     }
 }
 
+/// The concurrency the pinned core runs for a mux block that carries no value
+/// of its own: `NewHandler` raises every count from 0 through 128 to 128
+/// (app/proxyman/outbound/handler.go).
+const MUX_SEED_CONCURRENCY: i16 = 128;
+
+/// A positive `xudpConcurrency` installs the separate XUDP manager
+/// (app/proxyman/outbound/handler.go), so its switch starts above zero.
+const XUDP_SEED_CONCURRENCY: i16 = 16;
+
+/// Turn the mux block on and seed the concurrency the pinned core runs when
+/// the block carries no value of its own. An explicit value stays as typed.
+fn enable_mux(m: &mut MuxModel) {
+    m.enabled = true;
+    if m.concurrency.is_none() {
+        m.concurrency = Some(MUX_SEED_CONCURRENCY);
+    }
+}
+
 fn mux_tab(ui: &mut egui::Ui, lang: Language, m: &mut MuxModel, flow: Option<&str>) -> bool {
     let mut changed = false;
+    let was_enabled = m.enabled;
     changed |= ui
-        .checkbox(&mut m.enabled, t(lang, Key::SrvEnableXmux))
-        .on_hover_text(t(lang, Key::SrvMuxDeprecatedNote))
+        .checkbox(&mut m.enabled, t(lang, Key::SrvEnableMux))
+        .on_hover_text(t(lang, Key::SrvMuxNote))
         .changed();
+    if m.enabled && !was_enabled {
+        enable_mux(m);
+    }
     // Warn inline at the mux trigger when a
     // vision flow would ride TCP over smux — same shared predicate as the
     // validation sweep, same i18n message as the editor's warning list.
@@ -12722,22 +12745,37 @@ fn mux_tab(ui: &mut egui::Ui, lang: Language, m: &mut MuxModel, flow: Option<&st
             validation_message(&ValidationCode::MuxWithVisionFlow, lang),
         );
     }
-    changed |= widgets::opt_num(
+    changed |= widgets::opt_num_with(
         ui,
         t(lang, Key::SrvConcurrencyLegacy),
         &mut m.concurrency,
         -1..=1024,
+        MUX_SEED_CONCURRENCY,
+        None,
+        1.0,
     );
-    changed |= widgets::opt_num(ui, "xudpConcurrency", &mut m.xudp_concurrency, -1..=1024);
-    changed |= widgets::noted(ui, t(lang, Key::SrvXudpProxyUdp443Note), |ui| {
-        opt_combo_str(
-            ui,
-            lang,
-            "xudpProxyUDP443",
-            &mut m.xudp_proxy_udp443,
-            XUDP_PROXY_UDP443_MODES,
-        )
-    });
+    changed |= widgets::opt_num_with(
+        ui,
+        "xudpConcurrency",
+        &mut m.xudp_concurrency,
+        -1..=1024,
+        XUDP_SEED_CONCURRENCY,
+        None,
+        1.0,
+    );
+    changed |= widgets::noted(
+        ui,
+        m.enabled.then(|| t(lang, Key::SrvXudpProxyUdp443Note)),
+        |ui| {
+            opt_combo_str(
+                ui,
+                lang,
+                "xudpProxyUDP443",
+                &mut m.xudp_proxy_udp443,
+                XUDP_PROXY_UDP443_MODES,
+            )
+        },
+    );
     changed
 }
 
@@ -19865,6 +19903,7 @@ Authentication: ML-KEM-768, Post-Quantum
             codes_of(&findings.advisory),
             vec![
                 ValidationCode::MuxWithVisionFlow,
+                ValidationCode::MuxConcurrencyReinterpreted,
                 ValidationCode::ServerNameImplausible
             ],
             "{:#?}",
@@ -19877,25 +19916,36 @@ Authentication: ML-KEM-768, Post-Quantum
             Some("stream.tlsSettings.serverName"),
         );
 
-        // The concurrency -1 escape hatch clears the mux warning only.
+        // The concurrency -1 escape hatch clears the mux warning and leaves
+        // the TCP-mux-off state note, because the block still applies XUDP
+        // and the UDP/443 policy.
         profile.outbound.mux.concurrency = Some(-1);
         let findings = editor_validation_findings(&profile);
         assert!(findings.blocking.is_empty());
         assert_eq!(
             codes_of(&findings.advisory),
-            vec![ValidationCode::ServerNameImplausible],
+            vec![
+                ValidationCode::MuxTcpMuxDisabled,
+                ValidationCode::ServerNameImplausible
+            ],
             "{:#?}",
             findings.advisory
         );
 
-        // A plausible serverName clears the last warning.
+        // A plausible serverName clears the remaining server-name warning;
+        // the state note stays while the block is enabled.
         profile.outbound.stream.tls_settings = Some(TlsModel {
             server_name: "example.com".into(),
             ..Default::default()
         });
         let findings = editor_validation_findings(&profile);
         assert!(findings.blocking.is_empty());
-        assert!(findings.advisory.is_empty());
+        assert_eq!(
+            codes_of(&findings.advisory),
+            vec![ValidationCode::MuxTcpMuxDisabled],
+            "{:#?}",
+            findings.advisory
+        );
 
         // A blocking finding still lands in the error half while a warning
         // stays advisory in its own half.
@@ -19920,6 +19970,7 @@ Authentication: ML-KEM-768, Post-Quantum
             codes_of(&findings.advisory),
             vec![
                 ValidationCode::MuxWithVisionFlow,
+                ValidationCode::MuxConcurrencyReinterpreted,
                 ValidationCode::ServerNameImplausible
             ],
             "{:#?}",
@@ -19954,6 +20005,18 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(harness.query_by_label(warning).is_none());
         drop(harness);
 
+        // Any other negative value keeps TCP direct just the same.
+        mux.concurrency = Some(-2);
+        let mut harness = harness_builder().build_ui(|ui| {
+            mux_tab(ui, Language::En, &mut mux, Some("xtls-rprx-vision"));
+        });
+        harness.run();
+        assert!(
+            harness.query_by_label(warning).is_none(),
+            "concurrency -2 also keeps TCP direct"
+        );
+        drop(harness);
+
         // Mux without mux, or a non-VLESS profile context, never warns.
         mux.concurrency = Some(8);
         mux.enabled = false;
@@ -19970,6 +20033,162 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         harness.run();
         assert!(harness.query_by_label(warning).is_none());
+    }
+
+    /// Ticking the mux switch starts TCP mux at the concurrency the pinned
+    /// core runs for a block with no value of its own.
+    #[test]
+    fn mux_tab_seeds_the_effective_concurrency_when_the_switch_turns_on() {
+        let mut mux = crate::model::outbound::MuxModel::default();
+        let mut harness = harness_builder().build_ui(|ui| {
+            mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableMux))
+            .click();
+        harness.run();
+        drop(harness);
+        assert!(mux.enabled, "the click turns the block on");
+        assert_eq!(
+            mux.concurrency,
+            Some(128),
+            "a fresh block starts at the effective concurrency"
+        );
+        assert_eq!(
+            serde_json::to_value(&mux).unwrap(),
+            json!({"enabled": true, "concurrency": 128}),
+            "the emitted document carries the seeded value"
+        );
+    }
+
+    /// Both concurrency fields offer every value that has an effect: a
+    /// negative value for TCP-direct, then 0 through 1024.
+    #[test]
+    fn mux_tab_bounds_both_concurrency_fields_at_the_effective_range() {
+        let mut mux = crate::model::outbound::MuxModel::default();
+        let harness = harness_builder().build_ui(|ui| {
+            let _ = mux_tab(ui, Language::En, &mut mux, None);
+        });
+        let bounds: Vec<_> = harness
+            .query_all_by_role(egui::accesskit::Role::SpinButton)
+            .map(|node| {
+                let node = node.accesskit_node();
+                (node.min_numeric_value(), node.max_numeric_value())
+            })
+            .collect();
+        assert_eq!(
+            bounds,
+            vec![(Some(-1.0), Some(1024.0)), (Some(-1.0), Some(1024.0))],
+            "concurrency and xudpConcurrency both span -1 through 1024"
+        );
+    }
+
+    /// XUDP needs a positive concurrency to install its own manager, so its
+    /// switch starts at a usable value instead of a negative one.
+    #[test]
+    fn mux_tab_seeds_xudp_at_a_usable_concurrency() {
+        let mut mux = crate::model::outbound::MuxModel {
+            enabled: true,
+            concurrency: Some(128),
+            ..Default::default()
+        };
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ = mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness.get_by_label("xudpConcurrency").click();
+        harness.run();
+        drop(harness);
+        assert_eq!(mux.xudp_concurrency, Some(16));
+    }
+
+    /// The UDP/443 policy only exists while the mux block is on, so its note
+    /// follows the switch.
+    #[test]
+    fn mux_tab_shows_the_udp443_note_only_while_mux_is_enabled() {
+        let note = t(Language::En, Key::SrvXudpProxyUdp443Note);
+        let mut mux = crate::model::outbound::MuxModel::default();
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ = mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness.get_by_label("xudpProxyUDP443").hover();
+        harness.run_steps(4);
+        assert!(
+            harness.query_by_label(note).is_none(),
+            "a disabled block must not describe the UDP/443 policy"
+        );
+        drop(harness);
+
+        mux.enabled = true;
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ = mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness.get_by_label("xudpProxyUDP443").hover();
+        harness.run_steps(4);
+        assert!(
+            harness.query_all_by_label(note).next().is_some(),
+            "an enabled block explains the UDP/443 policy"
+        );
+    }
+
+    /// The mux tab's switch names Mux.Cool, and the transport XMUX block
+    /// keeps its own distinct label.
+    #[test]
+    fn mux_tab_names_the_switch_as_mux_cool() {
+        let mut mux = crate::model::outbound::MuxModel::default();
+        let harness = harness_builder().build_ui(|ui| {
+            let _ = mux_tab(ui, Language::En, &mut mux, None);
+        });
+        let label = t(Language::En, Key::SrvEnableMux);
+        assert!(label.contains("Mux.Cool"), "the switch names Mux.Cool");
+        assert_ne!(label, t(Language::En, Key::SrvEnableXmux));
+        assert!(
+            harness.query_by_label(label).is_some(),
+            "the mux tab renders the Mux.Cool switch"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvEnableXmux))
+                .is_none(),
+            "the transport XMUX switch keeps its own label"
+        );
+    }
+
+    /// The mux help text separates Mux.Cool from the transport XMUX block
+    /// and carries no deprecation advice.
+    #[test]
+    fn mux_help_text_distinguishes_mux_cool_from_xmux() {
+        let help = t(Language::En, Key::SrvMuxNote);
+        assert!(help.contains("Mux.Cool"), "the help names Mux.Cool");
+        assert!(
+            help.contains("XMUX"),
+            "the help names the separate XMUX block"
+        );
+        assert!(
+            !help.to_lowercase().contains("deprecated"),
+            "the pinned core deprecates nothing here"
+        );
+        assert!(
+            !help.contains("concurrency 8"),
+            "the help must not keep the old concurrency advice"
+        );
+
+        let mut mux = crate::model::outbound::MuxModel::default();
+        let mut harness = harness_builder().build_ui(|ui| {
+            let _ = mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableMux))
+            .hover();
+        harness.run_steps(4);
+        assert!(
+            harness.query_all_by_label(help).next().is_some(),
+            "the switch carries the help text"
+        );
     }
 
     #[test]
@@ -20664,6 +20883,11 @@ Authentication: ML-KEM-768, Post-Quantum
         drop(harness);
         assert_eq!(stream.network, Network::Xdrive);
         assert!(mux.enabled, "selecting xdrive seeds the mux switch");
+        assert_eq!(
+            mux.concurrency,
+            Some(128),
+            "xdrive also seeds the effective concurrency"
+        );
     }
 
     /// Leaving VLESS while xdrive is selected resets the transport to raw and

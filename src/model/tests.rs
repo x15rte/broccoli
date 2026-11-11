@@ -357,6 +357,9 @@ fn roundtrip_stream() {
     check::<MuxModel>(
         json!({"enabled": true, "concurrency": 8, "xudpConcurrency": 16, "xudpProxyUDP443": "skip"}),
     );
+    // The editor's sliders stop at 1024, but an imported value keeps the
+    // core's full `int16` domain.
+    check::<MuxModel>(json!({"enabled": true, "concurrency": 32767, "xudpConcurrency": -32768}));
 
     check::<StreamModel>(json!({"network": "raw"}));
     check::<StreamModel>(json!({

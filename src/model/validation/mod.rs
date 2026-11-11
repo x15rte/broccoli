@@ -812,9 +812,11 @@ pub enum ValidationCode {
     /// A geodata cron that is not the five-field shape.
     GeodataCronInvalid,
     // ---- advisory warnings (Severity::Warning, never gate) ----
-    /// VLESS vision flow over enabled TCP mux: the server tears the whole
-    /// mux connection down on the first TCP frame — deterministic breakage
-    /// that stays xray-legal, so it warns instead of blocking.
+    /// VLESS vision flow over enabled TCP mux: a Vision mux connection
+    /// carries UDP only, and the server closes it on the first TCP session
+    /// — deterministic breakage that stays xray-legal, so it warns instead
+    /// of blocking. Any negative `concurrency`, or `enabled:false`, keeps
+    /// TCP direct and silences the rule.
     MuxWithVisionFlow,
     /// TLS/REALITY `serverName` that cannot be a real DNS name or IP
     /// literal (UUID-shaped, or carrying impossible characters) — the SNI
@@ -947,27 +949,38 @@ pub enum ValidationCode {
     // it and the editor combo/slider are keystroke constraints that cannot
     // see deserialized values — so this model pass is the single
     // validation seam. Error tier where Xray refuses the config at load,
-    // Warning tier where Xray silently reinterprets or ignores the value.
+    // Warning tier where Xray rewrites a value at run time or leaves part
+    // of the block in force.
     /// Mux `xudpProxyUDP443` outside {`reject`, `allow`, `skip`}: Xray's
     /// mux Build refuses unknown values at conf load (infra/conf/xray.go
     /// MuxConfig.Build — an exact, case-sensitive switch). Empty is legal
     /// and defaults to `reject` on the wire, so only non-empty
     /// out-of-vocabulary values fire.
     MuxXudpProxyUdp443Unsupported,
-    /// Mux `concurrency`, while `mux.enabled`, naming a value Xray
-    /// silently reinterprets: `0` runs as 8, values above 128 clamp to
-    /// 128, and any negative other than the documented `-1` TCP-direct
-    /// escape disables mux entirely (proxy outbound handler; outbound docs
-    /// https://xtls.github.io/config/outbound.html#muxobject, MuxObject
-    /// bounds [1, 128]). The config loads and the wire works — advisory
+    /// Mux `concurrency` in 0..=127 while `mux.enabled`: the pinned core
+    /// rewrites every value from 0 through 128 to 128 when it builds the
+    /// outbound handler (app/proxyman/outbound/handler.go), so a value
+    /// below 128 runs as 128. Values of 129 and above pass through
+    /// verbatim, and a count above 1024 gains nothing because a mux
+    /// connection retires after 1024 sessions. Any negative value keeps
+    /// TCP direct. The config loads and the wire works — advisory
     /// (Severity::Warning); the message names the effective behavior.
     MuxConcurrencyReinterpreted,
     /// Mux XUDP knobs (`xudpConcurrency` / `xudpProxyUDP443`) set while
-    /// `mux.enabled` is false: Xray reads the knobs only inside the
-    /// `Enabled` block, so the whole XUDP side is silently ignored (proxy
-    /// outbound handler) — dead-knob class E, advisory
-    /// (Severity::Warning).
+    /// `mux.enabled` is false: Xray reads the whole block only inside the
+    /// `Enabled` branch, so TCP, UDP, and the UDP/443 policy all stay
+    /// inert (app/proxyman/outbound/handler.go) — a dead knob,
+    /// advisory (Severity::Warning).
     MuxXudpKnobsInert,
+    /// Mux `concurrency` negative while `mux.enabled`: TCP mux is off, but
+    /// the block is not inert — XUDP and the UDP/443 policy still apply
+    /// (app/proxyman/outbound/handler.go). Advisory (Severity::Warning).
+    MuxTcpMuxDisabled,
+    /// Mux XUDP enabled (`xudpConcurrency` > 0) with `xudpProxyUDP443`
+    /// unset, empty, or `reject`: the pinned core refuses every UDP flow
+    /// to port 443 with `XUDP rejected UDP/443 traffic`
+    /// (app/proxyman/outbound/handler.go). Advisory (Severity::Warning).
+    MuxUdp443Rejected,
     // ---- extra-passthrough scans (validate_outbound per-settings extras +
     //      validate_stream transport extras) ----
     //

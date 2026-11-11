@@ -877,8 +877,7 @@ impl Default for HysteriaSettings {
 }
 
 /// MASQUE outbound (infra/conf/masque.go:13-39). The outbound runs only over
-/// the `masque` transport with `security: tls`, and the pinned core refuses
-/// `mux` on it.
+/// the `masque` transport with `security: tls`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MasqueSettings {
@@ -908,12 +907,14 @@ where
 
 // ---------- mux (xray.go:102-124) ----------
 
-/// Xray's mux block (`MuxConfig`). The wire semantics that used to live
-/// only in a comment here — Xray reinterprets `concurrency` outside
-/// `-1`/1..=128 and reads the XUDP knobs only while `enabled` is true —
-/// are now enforced and rendered by the model rules in
-/// `crate::model::validation` (`MuxXudpProxyUdp443Unsupported`,
-/// `MuxConcurrencyReinterpreted`, `MuxXudpKnobsInert`).
+/// Xray's mux block (`MuxConfig`). The wire semantics live in the model
+/// rules at `crate::model::validation` (`MuxXudpProxyUdp443Unsupported`,
+/// `MuxConcurrencyReinterpreted`, `MuxXudpKnobsInert`,
+/// `MuxTcpMuxDisabled`, `MuxUdp443Rejected`): the core raises every
+/// concurrency from 0 through 128 to 128, keeps 129 and above verbatim,
+/// treats any negative value as TCP direct while XUDP and the UDP/443
+/// policy still apply, and reads the XUDP knobs only while `enabled` is
+/// true.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MuxModel {
