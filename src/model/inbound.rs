@@ -1078,6 +1078,17 @@ pub const DNS_LEAK_ENTRIES: [&str; 5] = [
 pub static DNS_LEAK_ENTRY_LIST: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| DNS_LEAK_ENTRIES.join(", "));
 
+/// The single ports [`DNS_LEAK_ENTRIES`] closes, derived from that table so a
+/// port filter's coverage cannot drift from the alias it stands for.
+static DNS_LEAK_PORTS: std::sync::LazyLock<Vec<u16>> = std::sync::LazyLock::new(|| {
+    DNS_LEAK_ENTRIES
+        .iter()
+        .filter_map(|entry| parse_leak(entry))
+        .filter(|leak| leak.low != 0 && leak.low == leak.high)
+        .map(|leak| leak.low)
+        .collect()
+});
+
 /// The leak-block entries a fresh install runs: everything `dns` stands for,
 /// then the unrouted family. A TUN session keeps the system's DNS and the
 /// unrouted family inside the tunnel until the user removes an entry.
@@ -1127,11 +1138,6 @@ impl LeakPort {
     /// The last port the row names, equal to [`Self::low`] for one port.
     pub fn high(self) -> u16 {
         self.high
-    }
-
-    /// Whether the row names more than one port.
-    pub fn is_range(self) -> bool {
-        self.high != self.low
     }
 }
 
@@ -1278,17 +1284,17 @@ fn mask_address(address: IpAddr, bits: u8) -> IpAddr {
 /// or port range for both protocols, any of them behind a
 /// [`LeakPrefix`] (`parseLeak`, proxy/tun/wfp_leak.go).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Leak {
+struct Leak<'a> {
     prefix: Option<LeakPrefix>,
     /// Empty for the bare port form, which applies to TCP and UDP.
-    name: &'static str,
+    name: &'a str,
     /// Both zero for a named value and for a protocol that stands for all
     /// ports.
     low: u16,
     high: u16,
 }
 
-impl Leak {
+impl Leak<'_> {
     /// The core's own rendering (`leak.String`): the name, then `/low` or
     /// `/low-high` for some ports, the whole value behind the masked prefix,
     /// with an IPv6 one in brackets.
@@ -1336,7 +1342,7 @@ impl Leak {
 /// `udp` with an optional `/<port>` or `/<low>-<high>`, or a bare port or
 /// range for both protocols. Ports run `1..=65535`, low not above high, and
 /// `tcp/1-65535` stands for the bare protocol token.
-fn parse_leak(value: &str) -> Option<Leak> {
+fn parse_leak(value: &str) -> Option<Leak<'_>> {
     let ipv6 = value.starts_with('[');
     let (cidr, rest) = if ipv6 {
         match value[1..].split_once("]:") {
@@ -1366,20 +1372,13 @@ fn parse_leak(value: &str) -> Option<Leak> {
     };
     match name {
         "tcp" | "udp" => {
-            leak.name = if name == "tcp" { "tcp" } else { "udp" };
+            leak.name = name;
             if ports.is_none() {
                 return Some(leak);
             }
         }
         "dns" | "windnsclient" | "misconfigtun" | "all" | "allexceptlan" | "icmp" => {
-            leak.name = match name {
-                "dns" => "dns",
-                "windnsclient" => "windnsclient",
-                "misconfigtun" => "misconfigtun",
-                "all" => "all",
-                "allexceptlan" => "allexceptlan",
-                _ => "icmp",
-            };
+            leak.name = name;
             return ports.is_none().then_some(leak);
         }
         _ => {
@@ -1462,7 +1461,7 @@ fn canonicalize_leak_block(entries: &[String]) -> (Vec<String>, bool) {
 /// The canonical entries one parsed leak value stores: its own spelling, or
 /// every entry the `dns` alias stands for under the alias's own prefix
 /// (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go).
-fn leak_canonical_entries(leak: Leak) -> Vec<String> {
+fn leak_canonical_entries(leak: Leak<'_>) -> Vec<String> {
     if leak.name != DNS_LEAK_ALIAS {
         return vec![leak.canonical()];
     }
@@ -1563,9 +1562,9 @@ fn leak_block_holds(entries: &[String], value: &str) -> bool {
 }
 
 /// Whether `allexceptlan` already contains the value: the DNS entries it
-/// stands for, and ICMP. A port filter counts only when it names port 53 or
-/// 853 alone, so a range or a protocol-wide filter that reaches other ports
-/// stays editable.
+/// stands for, and ICMP. A port filter counts only when it names one of the
+/// ports [`DNS_LEAK_ENTRIES`] closes alone, so a range or a protocol-wide
+/// filter that reaches other ports stays editable.
 fn leak_entry_is_dns_or_icmp(value: &str) -> bool {
     let Some(leak) = parse_leak(value) else {
         return false;
@@ -1573,7 +1572,7 @@ fn leak_entry_is_dns_or_icmp(value: &str) -> bool {
     match leak.name {
         TUN_LEAK_WINDNS_CLIENT | DNS_LEAK_ALIAS | TUN_LEAK_ICMP => true,
         TUN_LEAK_ALL | TUN_LEAK_ALL_EXCEPT_LAN | TUN_LEAK_MISCONFIG_TUN => false,
-        _ => leak.low != 0 && leak.low == leak.high && matches!(leak.low, 53 | 853),
+        _ => leak.low != 0 && leak.low == leak.high && DNS_LEAK_PORTS.contains(&leak.low),
     }
 }
 

@@ -17,17 +17,13 @@ use crate::model::outbound::{
 };
 use crate::model::settings::{ColumnWidths, Language, SortColumn, ViewSort};
 use crate::model::stream::{
-    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueWarp, MasqueradeCfg, XDRIVE_DEFAULT_CONCURRENCY,
-    XDRIVE_DEFAULT_EAGER_WINDOW_MS, XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
-    XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-    XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
-    XDRIVE_DEFAULT_SESSION_TTL_SECONDS, XDRIVE_DRIVE_DEFAULT_CONCURRENCY,
-    XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS, XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-    XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES, XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL,
-    XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE, XDRIVE_SERVICES, XDRIVE_TEMPLATE_AUTH_TYPES,
-    XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY, XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation,
-    XdriveTemplate, XdriveTemplateAuth, XdriveTemplateOp, xdrive_folder_required,
-    xdrive_slot_store,
+    MAX_XHTTP_DOWNLOAD_DEPTH, MasqueWarp, MasqueradeCfg, XDRIVE_DEFAULT_EAGER_WINDOW_MS,
+    XDRIVE_DEFAULT_HOLE_TIMEOUT_MS, XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DEFAULT_SEGMENT_BYTES,
+    XDRIVE_DEFAULT_SESSION_TTL_SECONDS, XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES,
+    XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE,
+    XDRIVE_SERVICES, XDRIVE_TEMPLATE_AUTH_TYPES, XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY,
+    XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XdriveTemplateAuth,
+    XdriveTemplateOp, xdrive_folder_required, xdrive_scalar_defaults,
 };
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
@@ -9773,22 +9769,7 @@ impl ServersScreen {
                     // The slot store fills its zero scalars with the Drive
                     // defaults; every wal-based backend keeps the transport
                     // defaults (transport/internet/xdrive/params.go:71-87).
-                    let slot_store = xdrive_slot_store(&s.service);
-                    let flush_default = if slot_store {
-                        XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS
-                    } else {
-                        XDRIVE_DEFAULT_FLUSH_INTERVAL_MS
-                    };
-                    let max_poll_default = if slot_store {
-                        XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
-                    } else {
-                        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
-                    };
-                    let concurrency_default = if slot_store {
-                        XDRIVE_DRIVE_DEFAULT_CONCURRENCY
-                    } else {
-                        XDRIVE_DEFAULT_CONCURRENCY
-                    };
+                    let defaults = xdrive_scalar_defaults(&s.service);
                     // The service decides what the folder names, so the hint
                     // follows the choice and the field is required exactly where
                     // the core refuses an empty one at start.
@@ -9881,7 +9862,7 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveFlushInterval),
                         &mut s.flush_interval_ms,
                         u32::MAX,
-                        flush_default,
+                        defaults.flush_interval_ms,
                     );
                     changed |= xdrive_scalar(
                         ui,
@@ -9897,7 +9878,7 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveMaxPollInterval),
                         &mut s.max_poll_interval_ms,
                         u32::MAX,
-                        max_poll_default,
+                        defaults.max_poll_interval_ms,
                     );
                     // The core raises a max poll interval below the min poll
                     // interval (transport/internet/xdrive/params.go:69-71); the
@@ -9905,7 +9886,7 @@ impl ServersScreen {
                     // where both fields are visible.
                     let effective =
                         |value: u32, default: u32| if value == 0 { default } else { value };
-                    if effective(s.max_poll_interval_ms, max_poll_default)
+                    if effective(s.max_poll_interval_ms, defaults.max_poll_interval_ms)
                         < effective(s.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
                     {
                         ui.colored_label(
@@ -9927,7 +9908,7 @@ impl ServersScreen {
                         t(lang, Key::SrvXdriveConcurrency),
                         &mut s.concurrency,
                         XDRIVE_MAX_CONCURRENCY,
-                        concurrency_default,
+                        defaults.concurrency,
                     );
                     changed |= xdrive_scalar(
                         ui,
@@ -12928,15 +12909,15 @@ mod tests {
         AdvancedTabCtx, Column, DRAG_HANDLE, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline,
         DraftKind, DraftTarget, EditorTab, EditorValidationCache, EditorValidationFindings,
         EditorValidationRender, FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language,
-        LatencyBadge, LeaveAction, ProfileDraft, RawField, ReportView, Request, RowCells,
-        RowDetail, RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers,
-        ServerProfile, ServerTab, ServersScreen, ServersSide, StatusLine, SubscriptionFetchResult,
-        TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe, TransportTabCtx,
-        basic_tab_inline_verdict, column_bounds, drag_divider, drag_scroll_delta,
-        ech_sockopt_editor, editor_validation_findings, feedback_preview, final_rules_editor,
-        finalmask_udp_settings_editor, fingerprint_allowed, frozen_widths, mux_tab, noises_editor,
-        reorder_target, sanitized_widths, server_list_row, status_colors_of, status_toast_expired,
-        tab_order, table_columns, xmux_section,
+        LatencyBadge, LeaveAction, MUX_SEED_CONCURRENCY, ProfileDraft, RawField, ReportView,
+        Request, RowCells, RowDetail, RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR,
+        SeededBuffers, ServerProfile, ServerTab, ServersScreen, ServersSide, StatusLine,
+        SubscriptionFetchResult, TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe,
+        TransportTabCtx, XUDP_SEED_CONCURRENCY, basic_tab_inline_verdict, column_bounds,
+        drag_divider, drag_scroll_delta, ech_sockopt_editor, editor_validation_findings,
+        feedback_preview, final_rules_editor, finalmask_udp_settings_editor, fingerprint_allowed,
+        frozen_widths, mux_tab, noises_editor, reorder_target, sanitized_widths, server_list_row,
+        status_colors_of, status_toast_expired, tab_order, table_columns, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
     use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
@@ -20073,12 +20054,12 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(mux.enabled, "the click turns the block on");
         assert_eq!(
             mux.concurrency,
-            Some(128),
+            Some(MUX_SEED_CONCURRENCY),
             "a fresh block starts at the effective concurrency"
         );
         assert_eq!(
             serde_json::to_value(&mux).unwrap(),
-            json!({"enabled": true, "concurrency": 128}),
+            json!({"enabled": true, "concurrency": MUX_SEED_CONCURRENCY}),
             "the emitted document carries the seeded value"
         );
     }
@@ -20111,7 +20092,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn mux_tab_seeds_xudp_at_a_usable_concurrency() {
         let mut mux = crate::model::outbound::MuxModel {
             enabled: true,
-            concurrency: Some(128),
+            concurrency: Some(MUX_SEED_CONCURRENCY),
             ..Default::default()
         };
         let mut harness = harness_builder().build_ui(|ui| {
@@ -20121,7 +20102,7 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.get_by_label("xudpConcurrency").click();
         harness.run();
         drop(harness);
-        assert_eq!(mux.xudp_concurrency, Some(16));
+        assert_eq!(mux.xudp_concurrency, Some(XUDP_SEED_CONCURRENCY));
     }
 
     /// The UDP/443 policy only exists while the mux block is on, so its note
@@ -20906,7 +20887,7 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(mux.enabled, "selecting xdrive seeds the mux switch");
         assert_eq!(
             mux.concurrency,
-            Some(128),
+            Some(MUX_SEED_CONCURRENCY),
             "xdrive also seeds the effective concurrency"
         );
         // The core's xdrive gate: mux enabled, both concurrency knobs

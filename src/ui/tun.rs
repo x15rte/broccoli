@@ -132,7 +132,8 @@ impl LeakDraft {
 /// an unprefixed `all` or `allexceptlan` already covers renders disabled and
 /// stays in the list.
 fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
-    if let Some(covering) = leak_covering_entry(entries) {
+    let covering = leak_covering_entry(entries);
+    if let Some(covering) = covering {
         ui.label(
             egui::RichText::new(t_fmt(lang, Key::TunLeakCoveredNote, &[&covering]))
                 .small()
@@ -147,11 +148,14 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
     }
 
     // The rows come from the list, so each row's coverage is read before the
-    // loop borrows the list mutably.
-    let covered: Vec<bool> = entries
-        .iter()
-        .map(|entry| leak_entry_covered(entries, entry))
-        .collect();
+    // loop borrows the list mutably. Only a covering entry can cover a row, so
+    // the common case allocates nothing.
+    let covered: Option<Vec<bool>> = covering.map(|_| {
+        entries
+            .iter()
+            .map(|entry| leak_entry_covered(entries, entry))
+            .collect()
+    });
     let mut remove = None;
     let mut replace = None;
     for (index, entry) in entries.iter_mut().enumerate() {
@@ -160,7 +164,7 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
         if NAMED_LEAKS.iter().any(|named| fold_eq(entry, named.value)) {
             continue;
         }
-        let enabled = !covered[index];
+        let enabled = !covered.as_ref().is_some_and(|covered| covered[index]);
         ui.horizontal(|ui| {
             if let Some(port) = leak_port(entry) {
                 changed |= leak_port_row(ui, lang, index, port, entry, enabled);

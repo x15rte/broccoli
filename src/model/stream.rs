@@ -735,6 +735,35 @@ pub fn xdrive_slot_store(service: &str) -> bool {
     matches!(service, XDRIVE_SERVICE_DRIVE | XDRIVE_SERVICE_DRIVE_RETIRED)
 }
 
+/// The zero-valued scalar defaults the service's storage fills in
+/// (`transport/internet/xdrive/params.go:71-87`). The Drive slot store takes
+/// its own three values; every wal-based backend keeps the transport
+/// defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XdriveScalarDefaults {
+    pub concurrency: u32,
+    pub flush_interval_ms: u32,
+    pub max_poll_interval_ms: u32,
+}
+
+/// The [`XdriveScalarDefaults`] for `service`, read by the editor's hints and
+/// the validation pass so both compare against the runtime's effective value.
+pub fn xdrive_scalar_defaults(service: &str) -> XdriveScalarDefaults {
+    if xdrive_slot_store(service) {
+        XdriveScalarDefaults {
+            concurrency: XDRIVE_DRIVE_DEFAULT_CONCURRENCY,
+            flush_interval_ms: XDRIVE_DRIVE_DEFAULT_FLUSH_INTERVAL_MS,
+            max_poll_interval_ms: XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+        }
+    } else {
+        XdriveScalarDefaults {
+            concurrency: XDRIVE_DEFAULT_CONCURRENCY,
+            flush_interval_ms: XDRIVE_DEFAULT_FLUSH_INTERVAL_MS,
+            max_poll_interval_ms: XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
+        }
+    }
+}
+
 /// The template backend's own concurrency default and cap
 /// (`transport/internet/xdrive/template.go:89-95`, `:104`).
 pub const XDRIVE_TEMPLATE_DEFAULT_CONCURRENCY: u32 = 32;

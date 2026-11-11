@@ -23,13 +23,12 @@ use crate::model::outbound::{
     vless_encryption_supported, wireguard_remote_dns_entry_supported,
 };
 use crate::model::stream::{
-    Network, Security, StreamModel, XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-    XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS,
-    XDRIVE_MAX_CONCURRENCY, XDRIVE_MAX_SEGMENT_BYTES, XDRIVE_SERVICE_DRIVE,
-    XDRIVE_SERVICE_DRIVE_RETIRED, XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE,
+    Network, Security, StreamModel, XDRIVE_DEFAULT_POLL_INTERVAL_MS, XDRIVE_MAX_CONCURRENCY,
+    XDRIVE_MAX_SEGMENT_BYTES, XDRIVE_SERVICE_DRIVE, XDRIVE_SERVICE_DRIVE_RETIRED,
+    XDRIVE_SERVICE_LOCAL, XDRIVE_SERVICE_S3, XDRIVE_SERVICE_TEMPLATE,
     XDRIVE_TEMPLATE_MAX_CONCURRENCY, XdriveOperation, XdriveTemplate, XdriveTransport,
-    xdrive_folder_required, xdrive_names_regex_supported, xdrive_service_supported,
-    xdrive_slot_store, xdrive_template_auth_type_supported,
+    xdrive_folder_required, xdrive_names_regex_supported, xdrive_scalar_defaults,
+    xdrive_service_supported, xdrive_template_auth_type_supported,
 };
 use crate::model::{fold_eq, fold_lower, go_std_base64_decodes, parse_range_go, vocabulary_holds};
 use base64::Engine as _;
@@ -787,12 +786,8 @@ pub(super) fn validate_xdrive_stream(stream: &StreamModel, issues: &mut Vec<Vali
     // fills its own max poll default before the comparison
     // (params.go:71-87).
     let effective = |value: u32, default: u32| if value == 0 { default } else { value };
-    let max_poll_default = if xdrive_slot_store(&xdrive.service) {
-        XDRIVE_DRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
-    } else {
-        XDRIVE_DEFAULT_MAX_POLL_INTERVAL_MS
-    };
-    if effective(xdrive.max_poll_interval_ms, max_poll_default)
+    let defaults = xdrive_scalar_defaults(&xdrive.service);
+    if effective(xdrive.max_poll_interval_ms, defaults.max_poll_interval_ms)
         < effective(xdrive.poll_interval_ms, XDRIVE_DEFAULT_POLL_INTERVAL_MS)
     {
         issues.push(warning(
