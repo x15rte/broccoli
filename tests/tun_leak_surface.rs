@@ -2,13 +2,16 @@
 //!
 //! The core's `autoSystemWfpBlockLeak` key is what keeps the system's DNS and
 //! an unrouted address family inside the tunnel, and it defaults on with every
-//! entry the core's `dns` alias stands for. The TUN screen renders one row per
-//! entry; an edit writes the core's own spelling straight into the model, so it
-//! survives a restart (the state file) and reaches the generator (the emitted
-//! document). A list without the entries that block the system's DNS draws the
-//! privacy banner, a list without the unrouted family draws the advisory the
-//! settings pass renders, and a stored `dns` alias warns once for the session
-//! that loaded it.
+//! entry the core's `dns` alias stands for. The TUN screen renders one control
+//! per entry — a named value as a checkbox, a port as a protocol row, and any
+//! other value as a raw row — and an edit writes the core's own spelling
+//! straight into the model, so it survives a restart (the state file) and
+//! reaches the generator (the emitted document). An entry an unprefixed `all`
+//! or `allexceptlan` already covers renders disabled but stays in the list. A
+//! list without the entries that block the system's DNS draws the privacy
+//! banner, a list without the unrouted family draws the advisory the settings
+//! pass renders, and a stored `dns` alias warns once for the session that
+//! loaded it.
 //!
 //! Safety: production startup is read-only with respect to Windows settings.
 //! Tests are serialized because changing a process environment variable while
@@ -16,15 +19,17 @@
 
 use broccoli::app::BroccoliApp;
 use broccoli::r#gen::generate_with_api_port;
-use broccoli::i18n::{Key, safety_message, t, validation_message};
+use broccoli::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use broccoli::model::inbound::{
-    DNS_LEAK_ENTRIES, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT, leak_port,
+    DNS_LEAK_ENTRIES, TUN_LEAK_ALL, TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_ICMP, TUN_LEAK_MISCONFIG_TUN,
+    TUN_LEAK_WINDNS_CLIENT, leak_port,
 };
 use broccoli::model::settings::{Language, Mode, Settings};
 use broccoli::model::{SafetyCode, ServersFile, TunCfg, ValidationCode};
 use broccoli::ui::Screen;
 use egui::accesskit::Role;
 use egui_kittest::Harness;
+use egui_kittest::kittest::NodeT as _;
 use egui_kittest::kittest::Queryable as _;
 use parking_lot::MutexGuard;
 
@@ -115,6 +120,65 @@ fn add_leak_port(h: &mut Harness<'static, BroccoliApp>) {
     h.get_by_role_and_label(Role::Button, t(Language::En, Key::TunLeakAddPort))
         .click();
     h.run_steps(4);
+}
+
+/// Whether one leak entry renders as a checkbox (a named value) rather than a
+/// row.
+fn is_named_leak(entry: &str) -> bool {
+    [
+        TUN_LEAK_WINDNS_CLIENT,
+        TUN_LEAK_MISCONFIG_TUN,
+        TUN_LEAK_ALL,
+        TUN_LEAK_ALL_EXCEPT_LAN,
+        TUN_LEAK_ICMP,
+    ]
+    .iter()
+    .any(|named| entry.eq_ignore_ascii_case(named))
+}
+
+/// The number of leak rows the editor renders: every stored entry that is not
+/// one of the named checkboxes.
+fn leak_row_count(entries: &[String]) -> usize {
+    entries.iter().filter(|entry| !is_named_leak(entry)).count()
+}
+
+/// Whether the named value's checkbox renders disabled.
+fn named_disabled(h: &Harness<'static, BroccoliApp>, key: Key) -> bool {
+    h.get_by_role_and_label(Role::CheckBox, t(Language::En, key))
+        .accesskit_node()
+        .is_disabled()
+}
+
+/// Whether leak row `index`'s 🗑 renders disabled.
+fn leak_row_delete_disabled(h: &Harness<'static, BroccoliApp>, index: usize) -> bool {
+    h.query_all_by_label(t(Language::En, Key::DeleteRow))
+        .nth(index)
+        .expect("a leak row's delete button")
+        .accesskit_node()
+        .is_disabled()
+}
+
+/// Press a leak block button by its label key.
+fn press_leak_button(h: &mut Harness<'static, BroccoliApp>, key: Key) {
+    h.get_by_role_and_label(Role::Button, t(Language::En, key))
+        .click();
+    h.run_steps(4);
+}
+
+/// Type `text` into the leak block's raw entry row and press its add button.
+fn add_raw_leak(h: &mut Harness<'static, BroccoliApp>, text: &str) {
+    let label = t(Language::En, Key::TunLeakRawLabel);
+    h.get_by_role_and_label(Role::TextInput, label).click();
+    h.run();
+    h.get_by_role_and_label(Role::TextInput, label)
+        .type_text(text);
+    h.run_steps(4);
+    press_leak_button(h, Key::TunLeakAddEntry);
+}
+
+/// The covered-entry note naming `covering`.
+fn covered_note(covering: &str) -> String {
+    t_fmt(Language::En, Key::TunLeakCoveredNote, &[&covering])
 }
 
 /// True when the AccessKit tree carries a node whose text contains `text`.
@@ -291,4 +355,222 @@ fn the_privacy_banner_and_the_family_advisory_track_their_own_entries() {
         rendered(&h, &family),
         "the family advisory must keep tracking its own entry"
     );
+}
+
+#[test]
+fn the_leak_controls_author_named_values_ports_ranges_and_prefixed_entries() {
+    let (_lock, _tmp, mut h) = boot(tun_settings());
+    let mut expected = seeded_leak();
+
+    // A named value: the toggle adds the core's spelling and removes it
+    // again, and the state file carries each change.
+    toggle_leak_switch(&mut h, Key::TunLeakIcmpLabel);
+    expected.push(TUN_LEAK_ICMP.to_string());
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the toggle must add its named value"
+    );
+    toggle_leak_switch(&mut h, Key::TunLeakIcmpLabel);
+    expected.pop();
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the toggle must remove its named value"
+    );
+
+    // A port row: the button appends the lowest port the list lacks, and the
+    // row's 🗑 removes exactly that entry.
+    press_leak_button(&mut h, Key::TunLeakAddPort);
+    expected.push("tcp/1".to_string());
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the port button appends a free port"
+    );
+    delete_leak_port_row(&mut h, leak_row_count(&expected) - 1);
+    expected.pop();
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the row's remove button must remove the port"
+    );
+
+    // A range row: the button appends the lowest free two-port range.
+    press_leak_button(&mut h, Key::TunLeakAddRange);
+    expected.push("tcp/1-2".to_string());
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the range button appends a free range"
+    );
+    delete_leak_port_row(&mut h, leak_row_count(&expected) - 1);
+    expected.pop();
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the row's remove button must remove the range"
+    );
+
+    // A CIDR-prefixed value: authored in the raw row and stored in the
+    // model's canonical spelling.
+    add_raw_leak(&mut h, "1.1.1.0/24:53");
+    expected.push("1.1.1.0/24:53".to_string());
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the raw row must add the parsed value"
+    );
+    delete_leak_port_row(&mut h, leak_row_count(&expected) - 1);
+    expected.pop();
+    assert_eq!(
+        saved_leak(),
+        expected,
+        "the raw row's remove button must remove it"
+    );
+}
+
+#[test]
+fn an_unprefixed_all_disables_the_other_entries_and_keeps_them_stored() {
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = vec![
+        TUN_LEAK_ALL.to_string(),
+        "udp/53".to_string(),
+        TUN_LEAK_ICMP.to_string(),
+        TUN_LEAK_MISCONFIG_TUN.to_string(),
+    ];
+    let (_lock, _tmp, mut h) = boot(settings);
+
+    // The note names the entry that covers the others.
+    assert!(
+        rendered(&h, &covered_note(TUN_LEAK_ALL)),
+        "the covered entries must name all"
+    );
+
+    // `all` itself and the unrouted-family entry stay editable, so the
+    // covering entry can be removed and the family kept.
+    assert!(!named_disabled(&h, Key::TunLeakAllLabel));
+    assert!(!named_disabled(&h, Key::TunLeakMisconfigLabel));
+    for key in [
+        Key::TunLeakWindnsClientLabel,
+        Key::TunLeakAllExceptLanLabel,
+        Key::TunLeakIcmpLabel,
+    ] {
+        assert!(named_disabled(&h, key), "all covers the {key:?} entry");
+    }
+    assert!(leak_row_delete_disabled(&h, 0), "all covers the udp/53 row");
+
+    // The state disables, never deletes: the list and the emitted document
+    // keep every covered entry.
+    let stored: Vec<String> = ["all", "udp/53", "icmp", "misconfigtun"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(saved_leak(), stored);
+    let loaded = Settings::load().expect("the persisted settings.json loads");
+    assert_eq!(
+        tun_wire(&loaded)["autoSystemWfpBlockLeak"],
+        serde_json::json!(stored),
+        "the emitted list must still carry every covered entry"
+    );
+
+    // Removing the covering entry restores the stored entries to editable.
+    toggle_leak_switch(&mut h, Key::TunLeakAllLabel);
+    assert!(
+        !rendered(&h, &covered_note(TUN_LEAK_ALL)),
+        "the note must clear with the covering entry"
+    );
+    assert_eq!(
+        saved_leak(),
+        vec!["udp/53", "icmp", "misconfigtun"],
+        "removing all must keep the entries it covered"
+    );
+    assert!(!named_disabled(&h, Key::TunLeakIcmpLabel));
+    assert!(!named_disabled(&h, Key::TunLeakWindnsClientLabel));
+    assert!(!leak_row_delete_disabled(&h, 0));
+}
+
+#[test]
+fn an_unprefixed_allexceptlan_disables_the_dns_entries_and_icmp_only() {
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = vec![
+        TUN_LEAK_ALL_EXCEPT_LAN.to_string(),
+        "udp/53".to_string(),
+        "tcp/853".to_string(),
+        "tcp/443".to_string(),
+        TUN_LEAK_ICMP.to_string(),
+        TUN_LEAK_MISCONFIG_TUN.to_string(),
+    ];
+    let (_lock, _tmp, mut h) = boot(settings);
+
+    assert!(
+        rendered(&h, &covered_note(TUN_LEAK_ALL_EXCEPT_LAN)),
+        "the covered entries must name allexceptlan"
+    );
+
+    assert!(named_disabled(&h, Key::TunLeakWindnsClientLabel));
+    assert!(named_disabled(&h, Key::TunLeakIcmpLabel));
+    for key in [
+        Key::TunLeakAllLabel,
+        Key::TunLeakAllExceptLanLabel,
+        Key::TunLeakMisconfigLabel,
+    ] {
+        assert!(
+            !named_disabled(&h, key),
+            "{key:?} is not a DNS entry the alias covers"
+        );
+    }
+    // The DNS port rows are covered, while another port stays editable.
+    assert!(leak_row_delete_disabled(&h, 0), "udp/53 is a DNS entry");
+    assert!(leak_row_delete_disabled(&h, 1), "tcp/853 is a DNS entry");
+    assert!(
+        !leak_row_delete_disabled(&h, 2),
+        "tcp/443 is not a DNS entry"
+    );
+
+    // Removing the covering entry restores every stored entry, and nothing
+    // was deleted by the state.
+    assert_eq!(saved_leak().len(), 6);
+    toggle_leak_switch(&mut h, Key::TunLeakAllExceptLanLabel);
+    assert_eq!(
+        saved_leak(),
+        vec!["udp/53", "tcp/853", "tcp/443", "icmp", "misconfigtun"],
+        "removing allexceptlan must keep the entries it covered"
+    );
+    assert!(!named_disabled(&h, Key::TunLeakIcmpLabel));
+    assert!(!leak_row_delete_disabled(&h, 0));
+}
+
+#[test]
+fn a_prefixed_all_or_allexceptlan_covers_no_other_entry() {
+    for covering in ["1.1.1.0/24:all", "[::/0]:allexceptlan"] {
+        let mut settings = tun_settings();
+        settings.tun.auto_system_wfp_block_leak = vec![
+            covering.to_string(),
+            "udp/53".to_string(),
+            TUN_LEAK_ICMP.to_string(),
+            TUN_LEAK_MISCONFIG_TUN.to_string(),
+        ];
+        let (_lock, _tmp, h) = boot(settings);
+
+        for value in [TUN_LEAK_ALL, TUN_LEAK_ALL_EXCEPT_LAN] {
+            assert!(
+                !rendered(&h, &covered_note(value)),
+                "{covering} must not cover other entries"
+            );
+        }
+        for key in [
+            Key::TunLeakAllLabel,
+            Key::TunLeakAllExceptLanLabel,
+            Key::TunLeakIcmpLabel,
+        ] {
+            assert!(
+                !named_disabled(&h, key),
+                "{covering} must leave {key:?} editable"
+            );
+        }
+        assert!(
+            !leak_row_delete_disabled(&h, 0),
+            "{covering} must leave the port row editable"
+        );
+    }
 }

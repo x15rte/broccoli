@@ -221,7 +221,6 @@ pub(crate) fn all_codes() -> Vec<ValidationCode> {
         TunGatewayInvalid("10.255.0.1".into()),
         TunLeakRoutingTableRequired,
         TunLeakValueUnknown("bogus".into()),
-        TunLeakPortInvalid("tcp/0".into()),
         TunLeakDnsAliasExpanded,
         TunLeakMisconfigTunOff,
         ListenerConflict(
@@ -500,7 +499,7 @@ validation_codes! {
         FinalmaskNoiseExpArgumentNotAllowed,
         FinalmaskUnknownTcpMask, FinalmaskRealmUrlSyntax, FinalmaskFilterIpRuleInvalid,
         FinalmaskUnknownUdpMask, FinalmaskExtraShadow,
-        TunLeakValueUnknown, TunLeakPortInvalid, TunGatewayInvalid,
+        TunLeakValueUnknown, TunGatewayInvalid,
         FilePathRemote, TlsExtraShadow, StreamExtraShadow, OutboundExtraShadow,
         EnvCorePathOverride, SettingsExtraShadow,
         XmuxExtraShadow,

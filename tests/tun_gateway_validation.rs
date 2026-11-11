@@ -246,20 +246,103 @@ fn leak_block_without_a_routing_table_is_a_validation_error() {
 }
 
 #[test]
-fn unknown_leak_value_is_a_validation_error() {
-    // Any value outside the core's vocabulary — the `dns` alias, `windnsclient`,
-    // `misconfigtun`, and a `tcp/<port>`/`udp/<port>` filter — makes the core
-    // refuse the whole document at load ("unknown autoSystemWfpBlockLeak
-    // value: ...", confirmed against the pinned binary).
-    let settings = leak_settings(vec!["bogus".into()]);
-    assert!(verdict_carries(
-        &settings,
-        &ValidationCode::TunLeakValueUnknown("bogus".into())
-    ));
-    let error = generate(&settings).expect_err("an unknown leak value must be rejected");
-    assert!(
-        error.contains(leak_message(&ValidationCode::TunLeakValueUnknown("bogus".into())).as_str()),
-        "the error must name the unknown value: {error:?}"
+fn every_leak_form_the_core_parses_is_accepted() {
+    // `parseLeak` accepts the named values, `tcp`/`udp` alone, a protocol with
+    // a port or a range, a bare port or range for both protocols, and any of
+    // those behind an IPv4 or bracketed IPv6 CIDR prefix
+    // (proxy/tun/wfp_leak.go, live on the pinned binary).
+    for value in [
+        "dns",
+        "windnsclient",
+        "misconfigtun",
+        "all",
+        "allexceptlan",
+        "icmp",
+        "tcp",
+        "udp",
+        "tcp/443",
+        "udp/10-20",
+        "53",
+        "10-20",
+        "tcp/1-65535",
+        "1.1.1.0/24:53",
+        "[::/0]:all",
+        "[2001:db8::/32]:tcp/443",
+        "1.1.1.0/24:dns",
+    ] {
+        let settings = leak_settings(vec![value.into()]);
+        assert!(
+            !verdict(&settings).has_blocking(),
+            "{value} is a value the core parses"
+        );
+        generate(&settings).unwrap_or_else(|error| {
+            panic!("{value} must generate a config the core accepts: {error}")
+        });
+    }
+}
+
+#[test]
+fn a_leak_value_outside_the_core_grammar_is_a_validation_error() {
+    // The core's build refuses any value `parseLeak` does not read ("unknown
+    // autoSystemWfpBlockLeak value: ...", live on the pinned binary), so the
+    // entry is reported with the grammar and the configuration never loads.
+    for value in [
+        "bogus",
+        "tcp/0",
+        "udp/65536",
+        "tcp/10-5",
+        "tcp/",
+        "dns/53",
+        "all/53",
+        "[1.1.1.0/24]:53",
+        "10.0.0.0/030:53",
+        "010.0.0.0/30:53",
+        "::/0:all",
+        "1.1.1.0/24:",
+        "1.1.1.0/33:53",
+        "[::ffff:1.2.3.4/128]:53",
+    ] {
+        let settings = leak_settings(vec![value.into()]);
+        let code = ValidationCode::TunLeakValueUnknown(value.into());
+        assert!(verdict_carries(&settings, &code), "{value}");
+        let error = generate(&settings).expect_err("a value the core refuses must be rejected");
+        assert!(
+            error.contains(leak_message(&code).as_str()),
+            "{value}: the error must name the grammar: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn the_wire_carries_the_core_canonical_leak_form() {
+    // The generator reads the list through the core's own rendering
+    // (`leak.String`): lower case, masked CIDRs, ports from their numeric
+    // value, `tcp/1-65535` collapsed to `tcp`, duplicates dropped in order,
+    // and a prefixed `dns` alias expanded instead of saved.
+    let settings = leak_settings(vec![
+        "ALL".into(),
+        "1.1.1.5/24:53".into(),
+        "[2001:db8::5/32]:TCP/0443-0500".into(),
+        "TCP/1-65535".into(),
+        "UDP/010-20".into(),
+        "udp/10-20".into(),
+        "1.1.1.0/24:dns".into(),
+    ]);
+    let cfg = generate(&settings).expect("the canonical values are the core's own");
+    assert_eq!(
+        tun_wire(&cfg)["autoSystemWfpBlockLeak"],
+        serde_json::json!([
+            "all",
+            "1.1.1.0/24:53",
+            "[2001:db8::/32]:tcp/443-500",
+            "tcp",
+            "udp/10-20",
+            "1.1.1.0/24:udp/53",
+            "1.1.1.0/24:tcp/53",
+            "1.1.1.0/24:windnsclient",
+            "1.1.1.0/24:tcp/853",
+            "1.1.1.0/24:udp/853",
+        ])
     );
 }
 
@@ -280,24 +363,6 @@ fn leak_entries_fold_case_insensitively_like_the_core() {
         tun_wire(&cfg)["autoSystemWfpBlockLeak"],
         serde_json::json!(["udp/53", "windnsclient", "misconfigtun"])
     );
-}
-
-#[test]
-fn a_port_the_core_refuses_is_a_validation_error() {
-    // A `tcp/`/`udp/` value whose port is zero, over 65535, or not a number is
-    // the core's own refusal ("unknown autoSystemWfpBlockLeak value: ..."), so
-    // the entry is reported with the port rule rather than the unknown-value
-    // one.
-    for value in ["tcp/0", "udp/65536", "tcp/bogus", "udp/"] {
-        let settings = leak_settings(vec![value.into()]);
-        let code = ValidationCode::TunLeakPortInvalid(value.into());
-        assert!(verdict_carries(&settings, &code), "{value}");
-        let error = generate(&settings).expect_err("a port the core refuses must be rejected");
-        assert!(
-            error.contains(leak_message(&code).as_str()),
-            "{value}: the error must name the port rule: {error:?}"
-        );
-    }
 }
 
 #[test]

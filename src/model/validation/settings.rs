@@ -10,13 +10,10 @@ use super::{
 };
 use crate::model::dns::parse_pool_cidr;
 use crate::model::inbound::{
-    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DNS_LEAK_ALIAS, DokodemoNetwork,
-    LocalInboundCfg, LocalInboundProtocol, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT,
-    leak_port, listen_endpoints_conflict,
+    API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
+    LocalInboundProtocol, leak_entry_is_valid, listen_endpoints_conflict,
 };
-use crate::model::{
-    Group, ServerProfile, ServersFile, Settings, TunCfg, emit, fold_lower, vocabulary_holds,
-};
+use crate::model::{Group, ServerProfile, ServersFile, Settings, TunCfg, emit};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Validate a listen address: always a concrete IP literal.
@@ -1081,34 +1078,20 @@ impl<'a> SettingsWalk<'a> {
                 );
             }
             for (index, value) in leak.iter().enumerate() {
-                // The core's whole vocabulary, folded the way it lowercases
-                // each entry before it matches (`ExpandWfpBlockLeak`,
-                // proxy/tun/wfp_leak.go): the `dns` alias it expands, the two
-                // named entries, and a port filter. A port filter is only
-                // accepted when the port is one `parseLeakPort` reads, so a
-                // `tcp/` entry the core would refuse is reported as such
-                // rather than as an unknown value.
-                let folded = fold_lower(value);
-                let code = if vocabulary_holds(
-                    &[
-                        DNS_LEAK_ALIAS,
-                        TUN_LEAK_WINDNS_CLIENT,
-                        TUN_LEAK_MISCONFIG_TUN,
-                    ],
-                    value,
-                ) {
-                    None
-                } else if folded.starts_with("tcp/") || folded.starts_with("udp/") {
-                    leak_port(value)
-                        .is_none()
-                        .then(|| ValidationCode::TunLeakPortInvalid(excerpt(value)))
-                } else {
-                    Some(ValidationCode::TunLeakValueUnknown(excerpt(value)))
-                };
-                if let Some(code) = code {
+                // The core's whole grammar, folded the way it lowercases each
+                // entry before it matches (`parseLeak`, proxy/tun/wfp_leak.go):
+                // the named values, a protocol alone or with a port or a
+                // range, a bare port or range, and any of those behind an
+                // IPv4 or bracketed IPv6 CIDR prefix. Every other value makes
+                // the build refuse the document with "unknown
+                // autoSystemWfpBlockLeak value: ...".
+                if !leak_entry_is_valid(value) {
                     self.issues.push(
-                        issue(code, Some(format!("tun.autoSystemWfpBlockLeak[{index}]")))
-                            .at(FindingTarget::Tun),
+                        issue(
+                            ValidationCode::TunLeakValueUnknown(excerpt(value)),
+                            Some(format!("tun.autoSystemWfpBlockLeak[{index}]")),
+                        )
+                        .at(FindingTarget::Tun),
                     );
                 }
             }

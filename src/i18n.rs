@@ -490,6 +490,19 @@ keys! {
     TunLeakWindnsClientNote 0,
     TunLeakMisconfigLabel 0,
     TunLeakMisconfigNote 0,
+    TunLeakAllLabel 0,
+    TunLeakAllNote 0,
+    TunLeakAllExceptLanLabel 0,
+    TunLeakAllExceptLanNote 0,
+    TunLeakIcmpLabel 0,
+    TunLeakIcmpNote 0,
+    TunLeakCoveredNote 1,
+    TunLeakRangeLabel 0,
+    TunLeakBothProtocols 0,
+    TunLeakAddRange 0,
+    TunLeakRawLabel 0,
+    TunLeakRawHint 0,
+    TunLeakAddEntry 0,
     TunLeakInstallFailed 1,
     TunLeakInstallRemedy 0,
     TunLeakInstallRemedyHint 0,
@@ -1996,8 +2009,9 @@ keys! {
     /// argument).
     SettingsTunGatewayInvalid 1,
     SettingsTunLeakRoutingTableRequired 0,
+    /// A `tun.autoSystemWfpBlockLeak` entry outside the core's grammar (the
+    /// entry is the argument).
     SettingsTunLeakValueUnknown 1,
-    SettingsTunLeakPortInvalid 1,
     SettingsTunLeakDnsAliasExpanded 1,
     SettingsTunLeakMisconfigTunOff 0,
     SettingsListenerConflict 4,
@@ -3143,7 +3157,6 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         TunGatewayInvalid(arg) => (Key::SettingsTunGatewayInvalid, vec![Text(arg)]),
         TunLeakRoutingTableRequired => (Key::SettingsTunLeakRoutingTableRequired, Vec::new()),
         TunLeakValueUnknown(arg) => (Key::SettingsTunLeakValueUnknown, vec![Text(arg)]),
-        TunLeakPortInvalid(arg) => (Key::SettingsTunLeakPortInvalid, vec![Text(arg)]),
         TunLeakDnsAliasExpanded => (
             Key::SettingsTunLeakDnsAliasExpanded,
             vec![Text(&DNS_LEAK_ENTRY_LIST)],
@@ -3585,8 +3598,8 @@ mod en {
                  wait about ten seconds on other adapters' blocked resolvers."
             }
             Key::TunLeakEntriesHint => {
-                "The core drops traffic to these ports outside the tunnel. dns stands for {}, \
-                 and a profile saves those entries."
+                "The core drops the listed traffic outside the tunnel. dns stands for {}, and a \
+                 profile saves those entries."
             }
             Key::TunLeakAddPort => "Add a port",
             Key::TunLeakWindnsClientLabel => "keep the DNS Client service inside the tunnel",
@@ -3599,6 +3612,29 @@ mod en {
                 "The core drops an address family the routing table does not route into the \
                  tunnel. The unrouted family needs a routing table."
             }
+            Key::TunLeakAllLabel => "keep every port inside the tunnel",
+            Key::TunLeakAllNote => {
+                "Blocks every port outside the tunnel. The core still permits loopback, DHCP, \
+                 and IPv6 neighbor discovery."
+            }
+            Key::TunLeakAllExceptLanLabel => {
+                "keep every port except the local network inside the tunnel"
+            }
+            Key::TunLeakAllExceptLanNote => {
+                "Blocks every port outside the tunnel except traffic to the local network. A \
+                 resolver on the local network can forward DNS outside the tunnel."
+            }
+            Key::TunLeakIcmpLabel => "keep ICMP inside the tunnel",
+            Key::TunLeakIcmpNote => {
+                "Blocks ICMP outside the tunnel, so ping and traceroute fail while the TUN runs."
+            }
+            Key::TunLeakCoveredNote => "Remove {} to edit the entries it covers.",
+            Key::TunLeakRangeLabel => "range",
+            Key::TunLeakBothProtocols => "both",
+            Key::TunLeakAddRange => "Add a range",
+            Key::TunLeakRawLabel => "CIDR-prefixed entry",
+            Key::TunLeakRawHint => "1.1.1.0/24:53",
+            Key::TunLeakAddEntry => "Add entry",
             Key::TunLeakInstallFailed => "The core could not install the leak block: {}",
             Key::TunLeakInstallRemedy => "Turn the leak block off and retry",
             Key::TunLeakInstallRemedyHint => {
@@ -5898,11 +5934,11 @@ mod en {
                  configuration without it."
             }
             Key::SettingsTunLeakValueUnknown => {
-                "Leak block value {} is unknown. The core refuses to load the configuration."
-            }
-            Key::SettingsTunLeakPortInvalid => {
-                "Leak block entry {} is not a port the core accepts. Use tcp with a port from 1 \
-                 to 65535, or udp with a port from 1 to 65535."
+                "Leak block value {} is not one the core accepts. Use dns, windnsclient, \
+                 misconfigtun, all, allexceptlan, icmp, tcp, or udp. A port or port range may \
+                 follow tcp or udp. A bare port or port range applies to both protocols. Any of \
+                 these may start with an IPv4 or bracketed IPv6 CIDR prefix. The core refuses to \
+                 load the configuration."
             }
             Key::SettingsTunLeakDnsAliasExpanded => {
                 "The dns value was expanded to {}. The profile saves the expanded entries."

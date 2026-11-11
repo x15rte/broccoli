@@ -2,8 +2,10 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{
-    DNS_LEAK_ENTRY_LIST, LeakPort, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT, leak_port,
-    next_free_leak_port,
+    DNS_LEAK_ENTRY_LIST, LeakPort, TUN_LEAK_ALL, TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_ICMP,
+    TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT, canonical_leak_entry,
+    canonicalize_leak_entries, leak_covering_entry, leak_entry_covered, leak_port,
+    next_free_leak_port, next_free_leak_range,
 };
 use crate::model::settings::Language;
 use crate::model::validation::{FindingTarget, ValidationCode};
@@ -56,8 +58,8 @@ struct ValidationTexts {
     /// The settings pass's advisories — an expanded `dns` alias and a missing
     /// unrouted family — in the verdict's own order.
     leak_warnings: Vec<String>,
-    /// The settings pass's blocking leak findings — a value outside the core's
-    /// vocabulary and a malformed port — rendered under the list they judge.
+    /// The settings pass's blocking leak findings — an entry outside the
+    /// core's grammar — rendered under the list they judge.
     leak_errors: Vec<String>,
     /// The leak block is emitted and its entries block the system's DNS: the
     /// only state in which turning the takeover off can stall name
@@ -65,67 +67,131 @@ struct ValidationTexts {
     dns_leak_block_on: bool,
 }
 
-/// The leak block: the two named entries as checkboxes over the stored list,
-/// the port filters as editable rows, and one button that appends a free
-/// port. Every edit writes the model directly, in the core's own form — the
-/// stored list and the generated document never carry an alias or a padded
-/// port.
-fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
-    let mut changed = false;
-    changed |= leak_switch(
-        ui,
-        lang,
-        entries,
-        TUN_LEAK_MISCONFIG_TUN,
-        Key::TunLeakMisconfigLabel,
-        Key::TunLeakMisconfigNote,
-    );
-    changed |= leak_switch(
-        ui,
-        lang,
-        entries,
-        TUN_LEAK_WINDNS_CLIENT,
-        Key::TunLeakWindnsClientLabel,
-        Key::TunLeakWindnsClientNote,
-    );
+/// One named leak value and the text its quick toggle carries.
+#[derive(Clone, Copy)]
+struct NamedLeak {
+    value: &'static str,
+    label: Key,
+    note: Key,
+}
 
+/// The named leak values the editor offers as toggles, in the order the
+/// core's grammar names them (`parseLeak`, proxy/tun/wfp_leak.go). `dns` is
+/// the alias the app stores expanded, so it has no switch of its own.
+const NAMED_LEAKS: [NamedLeak; 5] = [
+    NamedLeak {
+        value: TUN_LEAK_WINDNS_CLIENT,
+        label: Key::TunLeakWindnsClientLabel,
+        note: Key::TunLeakWindnsClientNote,
+    },
+    NamedLeak {
+        value: TUN_LEAK_MISCONFIG_TUN,
+        label: Key::TunLeakMisconfigLabel,
+        note: Key::TunLeakMisconfigNote,
+    },
+    NamedLeak {
+        value: TUN_LEAK_ALL,
+        label: Key::TunLeakAllLabel,
+        note: Key::TunLeakAllNote,
+    },
+    NamedLeak {
+        value: TUN_LEAK_ALL_EXCEPT_LAN,
+        label: Key::TunLeakAllExceptLanLabel,
+        note: Key::TunLeakAllExceptLanNote,
+    },
+    NamedLeak {
+        value: TUN_LEAK_ICMP,
+        label: Key::TunLeakIcmpLabel,
+        note: Key::TunLeakIcmpNote,
+    },
+];
+
+/// One raw row's edit buffer: the draft text plus the stored spelling it grew
+/// from, so a commit of the row or an edit elsewhere replaces the draft
+/// instead of leaving stale text behind.
+#[derive(Clone)]
+struct LeakDraft {
+    source: String,
+    text: String,
+}
+
+impl LeakDraft {
+    fn new(entry: &str) -> Self {
+        Self {
+            source: entry.to_string(),
+            text: entry.to_string(),
+        }
+    }
+}
+
+/// The leak block: the named values as checkboxes over the stored list, the
+/// port rows as a protocol, a port or range, and a raw row for the forms the
+/// controls cannot express, such as a CIDR-prefixed value. Every authored
+/// value goes through the model's parser, so the stored list and the
+/// generated document never carry a spelling the core would refuse. An entry
+/// an unprefixed `all` or `allexceptlan` already covers renders disabled and
+/// stays in the list.
+fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
+    if let Some(covering) = leak_covering_entry(entries) {
+        ui.label(
+            egui::RichText::new(t_fmt(lang, Key::TunLeakCoveredNote, &[&covering]))
+                .small()
+                .color(status_colors_of(ui).warn),
+        );
+    }
+
+    let mut changed = false;
+    for named in NAMED_LEAKS {
+        let enabled = !leak_entry_covered(entries, named.value);
+        changed |= leak_switch(ui, lang, entries, named, enabled);
+    }
+
+    // The rows come from the list, so each row's coverage is read before the
+    // loop borrows the list mutably.
+    let covered: Vec<bool> = entries
+        .iter()
+        .map(|entry| leak_entry_covered(entries, entry))
+        .collect();
     let mut remove = None;
+    let mut replace = None;
     for (index, entry) in entries.iter_mut().enumerate() {
-        // The two named entries are the checkboxes above; a row for them would
-        // edit the same value twice.
-        if fold_eq(entry, TUN_LEAK_MISCONFIG_TUN) || fold_eq(entry, TUN_LEAK_WINDNS_CLIENT) {
+        // A named value is its checkbox above; a row for it would edit the
+        // same value twice.
+        if NAMED_LEAKS.iter().any(|named| fold_eq(entry, named.value)) {
             continue;
         }
+        let enabled = !covered[index];
         ui.horizontal(|ui| {
             if let Some(port) = leak_port(entry) {
-                changed |= leak_port_row(ui, index, port, entry);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
-                        remove = Some(index);
-                    }
-                });
-            } else {
-                // A value the core would refuse stays editable, so a
-                // hand-edited spelling can be fixed instead of lost.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button(t(lang, Key::DeleteRow)).clicked() {
-                        remove = Some(index);
-                    }
-                    let field =
-                        ui.add(egui::TextEdit::singleline(entry).desired_width(f32::INFINITY));
-                    changed |= field.changed();
-                });
+                changed |= leak_port_row(ui, lang, index, port, entry, enabled);
+            } else if let Some(values) = leak_raw_row(ui, index, entry, enabled) {
+                replace = Some((index, values));
             }
+            leak_delete(ui, lang, index, enabled, &mut remove);
         });
     }
     if let Some(index) = remove {
         entries.remove(index);
         changed = true;
     }
-    if ui.button(t(lang, Key::TunLeakAddPort)).clicked() {
-        let port = next_free_leak_port(entries);
-        entries.push(port.to_string());
+    if let Some((index, values)) = replace {
+        entries.splice(index..=index, values);
         changed = true;
+    }
+    if ui.button(t(lang, Key::TunLeakAddPort)).clicked() {
+        entries.push(next_free_leak_port(entries).to_string());
+        changed = true;
+    }
+    if ui.button(t(lang, Key::TunLeakAddRange)).clicked() {
+        entries.push(next_free_leak_range(entries).to_string());
+        changed = true;
+    }
+    changed |= leak_raw_add(ui, lang, entries);
+    if changed {
+        // The parser owns the stored spelling: a port is written from its
+        // number, a CIDR is masked, an alias is expanded, and a duplicate is
+        // dropped, exactly as the load writes it.
+        canonicalize_leak_entries(entries);
     }
     changed
 }
@@ -133,60 +199,182 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
 /// One named leak entry as a checkbox over the stored list: on appends the
 /// core's spelling, off removes every spelling of it. The note says what the
 /// entry closes, on hover, because it is one line of policy rather than a
-/// control the label can carry.
+/// control the label can carry. A covered entry stays visible but disabled.
 fn leak_switch(
     ui: &mut egui::Ui,
     lang: Language,
     entries: &mut Vec<String>,
-    entry: &str,
-    label: Key,
-    note: Key,
+    named: NamedLeak,
+    enabled: bool,
 ) -> bool {
-    let mut on = entries.iter().any(|kept| fold_eq(kept, entry));
-    let toggled =
-        widgets::noted(ui, t(lang, note), |ui| ui.checkbox(&mut on, t(lang, label))).changed();
+    let mut on = entries.iter().any(|kept| fold_eq(kept, named.value));
+    let toggled = widgets::noted(ui, t(lang, named.note), |ui| {
+        ui.add_enabled(enabled, egui::Checkbox::new(&mut on, t(lang, named.label)))
+    })
+    .changed();
     if !toggled {
         return false;
     }
-    entries.retain(|kept| !fold_eq(kept, entry));
+    entries.retain(|kept| !fold_eq(kept, named.value));
     if on {
-        entries.push(entry.to_string());
+        entries.push(named.value.to_string());
     }
     true
 }
 
-/// One port row: the protocol combo and the port, written back as the core's
-/// `tcp/<port>`/`udp/<port>` spelling. `port` always parses, so the field
-/// starts at a value the core accepts.
-fn leak_port_row(ui: &mut egui::Ui, index: usize, port: LeakPort, entry: &mut String) -> bool {
+/// One port row: the protocol, a port or a range, written back as the core's
+/// `tcp/<port>`, `udp/<low>-<high>`, or bare `<port>` spelling. The controls
+/// are bounded, so the value always parses.
+fn leak_port_row(
+    ui: &mut egui::Ui,
+    lang: Language,
+    index: usize,
+    port: LeakPort,
+    entry: &mut String,
+    enabled: bool,
+) -> bool {
     let mut protocol = port.protocol();
-    let protocol_changed = egui::ComboBox::from_id_salt(("leak-protocol", index))
-        .selected_text(protocol)
-        .show_ui(ui, |ui| {
-            let mut picked = false;
-            for candidate in ["tcp", "udp"] {
-                if ui
-                    .selectable_label(protocol == candidate, candidate)
-                    .clicked()
-                    && protocol != candidate
-                {
-                    protocol = candidate;
-                    picked = true;
+    let mut low = port.low();
+    let mut high = port.high();
+    let mut changed = false;
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt(("leak-protocol", index))
+            .selected_text(leak_protocol_label(lang, protocol))
+            .show_ui(ui, |ui| {
+                for candidate in [Some("tcp"), Some("udp"), None] {
+                    if ui
+                        .selectable_label(
+                            protocol == candidate,
+                            leak_protocol_label(lang, candidate),
+                        )
+                        .clicked()
+                        && protocol != candidate
+                    {
+                        protocol = candidate;
+                        changed = true;
+                    }
                 }
-            }
-            picked
-        })
-        .inner
-        .unwrap_or(false);
-    let mut next_port = port.port();
-    let port_changed = ui
-        .add(egui::DragValue::new(&mut next_port).range(1..=65535))
-        .changed();
-    if !protocol_changed && !port_changed {
-        return false;
+            });
+        let mut range = high != low;
+        if ui
+            .checkbox(&mut range, t(lang, Key::TunLeakRangeLabel))
+            .changed()
+        {
+            high = if range {
+                low.checked_add(1).unwrap_or(low)
+            } else {
+                low
+            };
+            changed = true;
+        }
+        if high != low {
+            changed |= ui
+                .add(egui::DragValue::new(&mut low).range(1..=high))
+                .changed();
+            changed |= ui
+                .add(egui::DragValue::new(&mut high).range(low..=u16::MAX))
+                .changed();
+        } else {
+            changed |= ui
+                .add(egui::DragValue::new(&mut low).range(1..=u16::MAX))
+                .changed();
+        }
+    });
+    if changed {
+        *entry = LeakPort::new(protocol, low, high).to_string();
     }
-    *entry = format!("{protocol}/{next_port}");
-    true
+    changed
+}
+
+/// The text of one protocol option in a port row.
+fn leak_protocol_label(lang: Language, protocol: Option<&'static str>) -> &'static str {
+    protocol.unwrap_or(t(lang, Key::TunLeakBothProtocols))
+}
+
+/// One stored entry the controls cannot express — a CIDR-prefixed value or a
+/// spelling outside the grammar — as a text row. The draft lives in egui
+/// memory, and only a value the model's parser accepts replaces the entry, so
+/// an in-progress or refused spelling never reaches the stored list. The
+/// field reverts to the stored spelling when it loses focus.
+fn leak_raw_row(
+    ui: &mut egui::Ui,
+    index: usize,
+    entry: &mut String,
+    enabled: bool,
+) -> Option<Vec<String>> {
+    let id = ui.make_persistent_id(("leak-raw-row", index));
+    let mut replacement = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        let mut draft = ui
+            .data(|data| data.get_temp::<LeakDraft>(id))
+            .unwrap_or_else(|| LeakDraft::new(entry));
+        if draft.source != *entry {
+            draft = LeakDraft::new(entry);
+        }
+        let field =
+            ui.add(egui::TextEdit::singleline(&mut draft.text).desired_width(f32::INFINITY));
+        if field.changed()
+            && let Some(values) = canonical_leak_entry(&draft.text)
+        {
+            replacement = Some(values);
+        }
+        if field.lost_focus() {
+            draft = LeakDraft::new(entry);
+        }
+        ui.data_mut(|data| data.insert_temp(id, draft));
+    });
+    replacement
+}
+
+/// One row's 🗑: disabled while a covering entry owns the value.
+fn leak_delete(
+    ui: &mut egui::Ui,
+    lang: Language,
+    index: usize,
+    enabled: bool,
+    remove: &mut Option<usize>,
+) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui
+            .add_enabled(enabled, egui::Button::new(t(lang, Key::DeleteRow)).small())
+            .clicked()
+        {
+            *remove = Some(index);
+        }
+    });
+}
+
+/// The raw entry row: a value typed in the core's grammar and added only when
+/// the model's parser accepts it. The draft lives in egui memory, so an
+/// in-progress spelling survives repaints and never reaches the stored list.
+fn leak_raw_add(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
+    let id = ui.make_persistent_id("leak-raw-add");
+    let mut added = false;
+    ui.horizontal(|ui| {
+        let label = ui.label(t(lang, Key::TunLeakRawLabel));
+        let mut draft: String = ui.data(|data| data.get_temp(id).unwrap_or_default());
+        ui.add(
+            egui::TextEdit::singleline(&mut draft)
+                .hint_text(t(lang, Key::TunLeakRawHint))
+                .desired_width(220.0),
+        )
+        .labelled_by(label.id);
+        let values = canonical_leak_entry(&draft);
+        if ui
+            .add_enabled(
+                values.is_some(),
+                egui::Button::new(t(lang, Key::TunLeakAddEntry)),
+            )
+            .clicked()
+            && let Some(values) = values
+        {
+            entries.extend(values);
+            draft.clear();
+            added = true;
+        }
+        ui.data_mut(|data| data.insert_temp(id, draft));
+    });
+    added
 }
 
 impl TunScreen {
@@ -278,13 +466,7 @@ impl TunScreen {
                     .collect(),
                 leak_errors: verdict
                     .for_target(FindingTarget::Tun)
-                    .filter(|issue| {
-                        matches!(
-                            issue.code,
-                            ValidationCode::TunLeakValueUnknown(_)
-                                | ValidationCode::TunLeakPortInvalid(_)
-                        )
-                    })
+                    .filter(|issue| matches!(issue.code, ValidationCode::TunLeakValueUnknown(_)))
                     .map(|issue| validation_message(&issue.code, lang))
                     .collect(),
                 dns_leak_block_on: emit::dns_inbound_emitted(ctx.settings)
@@ -359,21 +541,22 @@ impl TunScreen {
         ui.add_space(4.0);
         let tun = &mut ctx.settings.tun;
 
-        // The leak block sits right under the privacy banner it feeds. The two
-        // named entries are checkboxes, the core's `tcp/<port>`/`udp/<port>`
-        // values are one row each, and a value the core would refuse stays an
-        // editable row so the user can fix it. Each edit writes the model
-        // directly, so the state survives a restart and reaches the generator;
-        // the privacy banner reads the same model through the safety pass.
+        // The leak block sits right under the privacy banner it feeds. The
+        // named values are checkboxes, a port entry is a protocol and a port
+        // or range, and a CIDR-prefixed or unparseable entry stays an editable
+        // raw row. Each edit writes the model directly, so the state survives
+        // a restart and reaches the generator; the privacy banner reads the
+        // same model through the safety pass. An entry an unprefixed `all` or
+        // `allexceptlan` covers renders disabled but stays in the list.
         widgets::section(ui, t(lang, Key::TunSectionLeakBlock), |ui| {
             let hint = t_fmt(lang, Key::TunLeakEntriesHint, &[&*DNS_LEAK_ENTRY_LIST]);
             ui.label(egui::RichText::new(hint).small());
             changed |= leak_entries(ui, lang, &mut tun.auto_system_wfp_block_leak);
-            // The settings pass's blocking findings — a value outside the
-            // core's vocabulary and a malformed port — render under the list
-            // they judge, in the same bytes the apply gate carries. An entry
-            // the load could not canonicalize stays editable above so the user
-            // can fix it, and this line names what is wrong with it.
+            // The settings pass's blocking findings — an entry outside the
+            // core's grammar — render under the list they judge, in the same
+            // bytes the apply gate carries. An entry the load could not
+            // canonicalize stays editable above so the user can fix it, and
+            // this line names what is wrong with it.
             for message in leak_errors {
                 ui.label(
                     egui::RichText::new(message.as_str())
@@ -989,10 +1172,9 @@ mod tests {
         );
     }
 
-    /// A blocking leak finding renders where the list is edited: a value the
-    /// core would refuse and a malformed port both name their entry under the
-    /// rows, in the same bytes the apply gate carries, and clearing the entry
-    /// clears the message.
+    /// A blocking leak finding renders where the list is edited: an entry the
+    /// core would refuse names itself under the rows, in the same bytes the
+    /// apply gate carries, and clearing the entry clears the message.
     #[test]
     fn the_screen_renders_blocking_leak_findings_under_the_list() {
         let mut rig = UiTestRig::default();
@@ -1006,7 +1188,7 @@ mod tests {
             Language::En,
         );
         let port = validation_message(
-            &ValidationCode::TunLeakPortInvalid("tcp/0".into()),
+            &ValidationCode::TunLeakValueUnknown("tcp/0".into()),
             Language::En,
         );
         for message in [&unknown, &port] {

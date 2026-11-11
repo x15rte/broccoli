@@ -9,6 +9,7 @@ use crate::r#gen::keys;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Wire tag of the TUN inbound: `"in-tun"`. Referenced wherever the
 /// generated config must address the TUN listener by tag — emission of the
@@ -999,16 +1000,18 @@ pub struct TunCfg {
     #[serde(skip_serializing_if = "skip_empty_str")]
     pub auto_outbounds_interface: String,
     /// The core's leak block: the entries whose traffic may only egress the
-    /// TUN. Most are `tcp/<port>`/`udp/<port>` filters; [`TUN_LEAK_WINDNS_CLIENT`]
-    /// blocks Windows' DNS Client service, [`TUN_LEAK_MISCONFIG_TUN`] drops an
-    /// address family the routing table does not route into the tunnel, and
-    /// [`DNS_LEAK_ALIAS`] is an alias the core expands into
-    /// [`DNS_LEAK_ENTRIES`] before it matches (`ExpandWfpBlockLeak`,
-    /// proxy/tun/wfp_leak.go). The load stores the canonical form
-    /// ([`Self::canonical_leak_block`]). Always serialized (storage): the
-    /// seeded policy must survive a round-trip after the user removes an
-    /// entry, and the generator emits it whenever the TUN inbound and the DNS
-    /// module are both present (the same predicate the runtime reads back).
+    /// TUN. A value is a named policy — [`TUN_LEAK_WINDNS_CLIENT`],
+    /// [`TUN_LEAK_MISCONFIG_TUN`], [`TUN_LEAK_ALL`],
+    /// [`TUN_LEAK_ALL_EXCEPT_LAN`], [`TUN_LEAK_ICMP`] — a `tcp`/`udp` filter
+    /// with a port or range, a bare port or range, or any of these behind a
+    /// CIDR prefix; [`DNS_LEAK_ALIAS`] is an alias the core expands into
+    /// [`DNS_LEAK_ENTRIES`] before it matches (`parseLeak`,
+    /// `ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go). The load stores the
+    /// canonical form ([`Self::canonical_leak_block`]). Always serialized
+    /// (storage): the seeded policy must survive a round-trip after the user
+    /// removes an entry, and the generator emits it whenever the TUN inbound
+    /// and the DNS module are both present (the same predicate the runtime
+    /// reads back).
     pub auto_system_wfp_block_leak: Vec<String>,
     /// True when the load expanded a stored [`DNS_LEAK_ALIAS`] into
     /// [`DNS_LEAK_ENTRIES`]. Never serialized: the save writes the entries the
@@ -1040,6 +1043,18 @@ pub const TUN_LEAK_MISCONFIG_TUN: &str = "misconfigtun";
 /// queries can use protocols and ports a port filter does not see
 /// (`dnsLeaks`, proxy/tun/wfp_leak.go).
 pub const TUN_LEAK_WINDNS_CLIENT: &str = "windnsclient";
+
+/// The leak-block entry covering every port of every address
+/// (`parseLeak`, proxy/tun/wfp_leak.go).
+pub const TUN_LEAK_ALL: &str = "all";
+
+/// The leak-block entry covering every port except traffic to the local
+/// network, which follows the DNS entries it stands for (`parseLeak`,
+/// `ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go).
+pub const TUN_LEAK_ALL_EXCEPT_LAN: &str = "allexceptlan";
+
+/// The leak-block entry covering ICMP (`parseLeak`, proxy/tun/wfp_leak.go).
+pub const TUN_LEAK_ICMP: &str = "icmp";
 
 /// The `dns` spelling of `autoSystemWfpBlockLeak`: an alias the core expands
 /// into [`DNS_LEAK_ENTRIES`] before it matches, so it names no entry of its
@@ -1075,55 +1090,91 @@ pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 6] = [
     TUN_LEAK_MISCONFIG_TUN,
 ];
 
-/// One `tcp/<port>` or `udp/<port>` leak entry the core parses: a connection
-/// to that port may only go through the TUN.
+/// One port row of the leak editor: the core's `tcp|udp/<low>[-<high>]`
+/// spelling, or the bare `<low>[-<high>]` form both protocols share
+/// (`parseLeak`, proxy/tun/wfp_leak.go). A connection to those ports may only
+/// go through the TUN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeakPort {
-    tcp: bool,
-    port: u16,
+    protocol: Option<&'static str>,
+    low: u16,
+    high: u16,
 }
 
 impl LeakPort {
-    /// The protocol token the core matches, `tcp` or `udp`.
-    pub fn protocol(self) -> &'static str {
-        if self.tcp { "tcp" } else { "udp" }
+    /// A row built from the editor's controls: `protocol` is `tcp` or `udp`,
+    /// or `None` for the bare form both protocols share. `high` follows `low`
+    /// so a range never points backwards.
+    pub fn new(protocol: Option<&'static str>, low: u16, high: u16) -> Self {
+        debug_assert!(matches!(protocol, None | Some("tcp") | Some("udp")));
+        Self {
+            protocol,
+            low,
+            high: high.max(low),
+        }
     }
 
-    /// The port the filter blocks.
-    pub fn port(self) -> u16 {
-        self.port
+    /// The protocol token the core matches, or `None` for the bare form.
+    pub fn protocol(self) -> Option<&'static str> {
+        self.protocol
+    }
+
+    /// The first port the row names.
+    pub fn low(self) -> u16 {
+        self.low
+    }
+
+    /// The last port the row names, equal to [`Self::low`] for one port.
+    pub fn high(self) -> u16 {
+        self.high
+    }
+
+    /// Whether the row names more than one port.
+    pub fn is_range(self) -> bool {
+        self.high != self.low
     }
 }
 
-/// The core's spelling of the value, `tcp/<port>` or `udp/<port>`.
+/// The core's spelling of the value.
 impl std::fmt::Display for LeakPort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}/{}", self.protocol(), self.port())
+        if let Some(protocol) = self.protocol {
+            write!(formatter, "{protocol}/")?;
+        }
+        write!(formatter, "{}", self.low)?;
+        if self.high != self.low {
+            write!(formatter, "-{}", self.high)?;
+        }
+        Ok(())
     }
 }
 
-/// Parse one canonical `tcp/<port>` or `udp/<port>` value the way the core
-/// does (`parseLeakPort`, proxy/tun/wfp_leak.go): the protocol token, then a
-/// decimal port in `1..=65535`. Go's `strconv.ParseUint` reads digits only, so
-/// a sign, padding, a second slash or a non-digit anywhere refuses the value.
+/// Parse one stored entry as a port row: a protocol with a port or range, or
+/// the bare form. A named value, a protocol with no port, and a
+/// CIDR-prefixed value are not rows, so the editor renders them as they are
+/// (`parseLeak`, proxy/tun/wfp_leak.go).
 fn parse_leak_port(value: &str) -> Option<LeakPort> {
-    let (protocol, digits) = value.split_once('/')?;
-    let tcp = match protocol {
-        "tcp" => true,
-        "udp" => false,
-        _ => return None,
-    };
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+    let leak = parse_leak(value)?;
+    if leak.prefix.is_some() || leak.low == 0 {
         return None;
     }
-    let port: u16 = digits.parse().ok()?;
-    (port != 0).then_some(LeakPort { tcp, port })
+    let protocol = match leak.name {
+        "tcp" => Some("tcp"),
+        "udp" => Some("udp"),
+        "" => None,
+        _ => return None,
+    };
+    Some(LeakPort {
+        protocol,
+        low: leak.low,
+        high: leak.high,
+    })
 }
 
-/// The protocol and port of one `tcp/<port>`/`udp/<port>` leak entry, folded
-/// the way the core lowercases it, or `None` for any other spelling. The leak
-/// editor asks this to decide whether an entry renders as a port row; an
-/// unparseable port stays an ordinary value the user can fix as text.
+/// The protocol, first port, and last port of one port row, folded the way
+/// the core lowercases it, or `None` for any other spelling. The leak editor
+/// asks this to decide whether an entry renders as a port row; every other
+/// value stays an editable raw row.
 pub fn leak_port(entry: &str) -> Option<LeakPort> {
     parse_leak_port(&fold_lower(entry))
 }
@@ -1131,45 +1182,321 @@ pub fn leak_port(entry: &str) -> Option<LeakPort> {
 /// The lowest port no entry names yet, for the editor's "add a port" button: a
 /// new row that repeated an existing entry would edit the same value twice.
 pub fn next_free_leak_port(entries: &[String]) -> LeakPort {
-    let held: Vec<LeakPort> = entries
-        .iter()
-        .filter_map(|entry| leak_port(entry))
-        .collect();
     let port = (1..=u16::MAX)
-        .find(|port| held.iter().all(|held| held.port != *port))
+        .find(|port| {
+            !entries
+                .iter()
+                .any(|entry| fold_eq(entry, &format!("tcp/{port}")))
+        })
         .unwrap_or(1);
-    LeakPort { tcp: true, port }
+    LeakPort::new(Some("tcp"), port, port)
+}
+
+/// The lowest two-port range no entry names yet, for the editor's "add a
+/// range" button: the same reason as [`next_free_leak_port`].
+pub fn next_free_leak_range(entries: &[String]) -> LeakPort {
+    let (low, high) = (1..u16::MAX)
+        .find_map(|low| {
+            let high = low + 1;
+            (!entries
+                .iter()
+                .any(|entry| fold_eq(entry, &format!("tcp/{low}-{high}"))))
+            .then_some((low, high))
+        })
+        .unwrap_or((1, 2));
+    LeakPort::new(Some("tcp"), low, high)
+}
+
+/// The CIDR prefix in front of a leak value, without its brackets, masked the
+/// way `netip.Prefix.Masked` leaves it (`parseLeak`, proxy/tun/wfp_leak.go).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeakPrefix {
+    address: IpAddr,
+    bits: u8,
+}
+
+impl LeakPrefix {
+    /// Parse the address part with Go's `netip.ParsePrefix` semantics. The
+    /// prefix length is digits only, no sign and no leading zero, which the
+    /// core's parser enforces; the address family must match the bracket
+    /// form, and an IPv4-mapped IPv6 address is refused because Windows
+    /// checks such connections as IPv4.
+    fn parse(text: &str, ipv6: bool) -> Option<Self> {
+        let (address, bits) = text.rsplit_once('/')?;
+        if bits.is_empty()
+            || !bits.bytes().all(|byte| byte.is_ascii_digit())
+            || (bits.len() > 1 && bits.starts_with('0'))
+        {
+            return None;
+        }
+        let address: IpAddr = address.parse().ok()?;
+        if address.is_ipv6() != ipv6 {
+            return None;
+        }
+        if let IpAddr::V6(v6) = address
+            && v6.to_ipv4_mapped().is_some()
+        {
+            return None;
+        }
+        let bits: u8 = bits.parse().ok()?;
+        let width = if ipv6 { 128 } else { 32 };
+        if bits > width {
+            return None;
+        }
+        Some(Self {
+            address: mask_address(address, bits),
+            bits,
+        })
+    }
+}
+
+/// The address with its host bits cleared, the way `netip.Prefix.Masked`
+/// returns it.
+fn mask_address(address: IpAddr, bits: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(v4) => {
+            let mask = if bits == 0 {
+                0
+            } else {
+                u32::MAX << (32 - bits)
+            };
+            IpAddr::V4(Ipv4Addr::from(u32::from(v4) & mask))
+        }
+        IpAddr::V6(v6) => {
+            let mask = if bits == 0 {
+                0
+            } else {
+                u128::MAX << (128 - bits)
+            };
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask))
+        }
+    }
+}
+
+/// One `autoSystemWfpBlockLeak` value the core parses: a named value, `tcp`
+/// or `udp` with no port (all of them) or some (`low..=high`), or a bare port
+/// or port range for both protocols, any of them behind a
+/// [`LeakPrefix`] (`parseLeak`, proxy/tun/wfp_leak.go).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Leak {
+    prefix: Option<LeakPrefix>,
+    /// Empty for the bare port form, which applies to TCP and UDP.
+    name: &'static str,
+    /// Both zero for a named value and for a protocol that stands for all
+    /// ports.
+    low: u16,
+    high: u16,
+}
+
+impl Leak {
+    /// The core's own rendering (`leak.String`): the name, then `/low` or
+    /// `/low-high` for some ports, the whole value behind the masked prefix,
+    /// with an IPv6 one in brackets.
+    fn canonical(self) -> String {
+        let mut value = String::from(self.name);
+        if self.low != 0 {
+            if !value.is_empty() {
+                value.push('/');
+            }
+            value.push_str(&self.low.to_string());
+            if self.high != self.low {
+                value.push('-');
+                value.push_str(&self.high.to_string());
+            }
+        }
+        match self.prefix {
+            None => value,
+            Some(prefix) => match prefix.address {
+                IpAddr::V4(address) => format!("{address}/{}:{value}", prefix.bits),
+                IpAddr::V6(address) => format!("[{address}/{}]:{value}", prefix.bits),
+            },
+        }
+    }
+
+    /// Whether the value covers traffic of `protocol` to `port`, to at least
+    /// some addresses (`leak.covers`).
+    fn covers(self, protocol: &str, port: u16) -> bool {
+        match self.name {
+            "all" => true,
+            "" => self.low == 0 || self.low <= port && port <= self.high,
+            name if name == protocol => self.low == 0 || self.low <= port && port <= self.high,
+            _ => false,
+        }
+    }
+
+    /// Whether the value keeps the system's DNS inside the tunnel
+    /// (`leak.blocksDNS`): the DNS Client service, or TCP or UDP port 53.
+    fn blocks_system_dns(self) -> bool {
+        self.name == TUN_LEAK_WINDNS_CLIENT || self.covers("udp", 53) || self.covers("tcp", 53)
+    }
+}
+
+/// Parse one lower-case leak value the way the core's `parseLeak` does: an
+/// optional IPv4 or bracketed IPv6 CIDR prefix, then a named value, `tcp` or
+/// `udp` with an optional `/<port>` or `/<low>-<high>`, or a bare port or
+/// range for both protocols. Ports run `1..=65535`, low not above high, and
+/// `tcp/1-65535` stands for the bare protocol token.
+fn parse_leak(value: &str) -> Option<Leak> {
+    let ipv6 = value.starts_with('[');
+    let (cidr, rest) = if ipv6 {
+        match value[1..].split_once("]:") {
+            Some((cidr, rest)) => (Some(cidr), rest),
+            // Without the `]:` the whole value is left to the rest of the
+            // parse, exactly as `strings.Cut` reports no prefix.
+            None => (None, value),
+        }
+    } else {
+        match value.split_once(':') {
+            Some((cidr, rest)) => (Some(cidr), rest),
+            None => (None, value),
+        }
+    };
+    let mut leak = Leak {
+        prefix: None,
+        name: "",
+        low: 0,
+        high: 0,
+    };
+    if let Some(cidr) = cidr {
+        leak.prefix = Some(LeakPrefix::parse(cidr, ipv6)?);
+    }
+    let (name, ports) = match rest.split_once('/') {
+        Some((name, ports)) => (name, Some(ports)),
+        None => (rest, None),
+    };
+    match name {
+        "tcp" | "udp" => {
+            leak.name = if name == "tcp" { "tcp" } else { "udp" };
+            if ports.is_none() {
+                return Some(leak);
+            }
+        }
+        "dns" | "windnsclient" | "misconfigtun" | "all" | "allexceptlan" | "icmp" => {
+            leak.name = match name {
+                "dns" => "dns",
+                "windnsclient" => "windnsclient",
+                "misconfigtun" => "misconfigtun",
+                "all" => "all",
+                "allexceptlan" => "allexceptlan",
+                _ => "icmp",
+            };
+            return ports.is_none().then_some(leak);
+        }
+        _ => {
+            // Any other name is the bare port form, which takes no slash.
+            if ports.is_some() {
+                return None;
+            }
+        }
+    }
+    let ports = ports.unwrap_or(name);
+    let (low, high) = match ports.split_once('-') {
+        Some((low, high)) => (parse_leak_number(low)?, Some(parse_leak_number(high)?)),
+        None => (parse_leak_number(ports)?, None),
+    };
+    if low == 0 {
+        return None;
+    }
+    let high = match high {
+        Some(high) => {
+            if high < low {
+                return None;
+            }
+            high
+        }
+        None => low,
+    };
+    if leak.name.is_empty() || low != 1 || high != u16::MAX {
+        leak.low = low;
+        leak.high = high;
+    }
+    Some(leak)
+}
+
+/// Read one port with Go's `strconv.ParseUint(text, 10, 16)`: digits only, no
+/// sign, and at most 65535. Leading zeros are the same number.
+fn parse_leak_number(text: &str) -> Option<u16> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// Whether one leak entry is a value the core parses, folded the way it
+/// lowercases every entry before matching. The settings pass reports the
+/// entries this refuses; the save keeps them so the user can fix them.
+pub fn leak_entry_is_valid(entry: &str) -> bool {
+    let folded = fold_lower(entry);
+    parse_leak(folded.as_ref()).is_some()
 }
 
 /// The canonical form of one leak list, plus whether the `dns` alias was among
 /// its stored spellings: every entry lowercased, the alias replaced by
-/// [`DNS_LEAK_ENTRIES`], a port written without leading zeros, and duplicates
-/// dropped with the first spelling kept and the order preserved — the core's
-/// own expansion (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go). An entry the
-/// core would refuse stays as written, so the validation pass reports it
-/// instead of the load rewriting it away.
+/// [`DNS_LEAK_ENTRIES`] under the alias's own prefix, a CIDR masked, a port
+/// written from its numeric value, `tcp/1-65535` collapsed to `tcp`, and
+/// duplicates dropped with the first spelling kept and the order preserved —
+/// the core's own expansion (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go). An
+/// entry the core would refuse stays as written, so the validation pass
+/// reports it instead of the load rewriting it away.
 fn canonicalize_leak_block(entries: &[String]) -> (Vec<String>, bool) {
     let mut canonical: Vec<String> = Vec::with_capacity(entries.len());
     let mut dns_alias_expanded = false;
     for entry in entries {
         let folded = fold_lower(entry);
-        if folded.as_ref() == DNS_LEAK_ALIAS {
-            dns_alias_expanded = true;
-            for leak in DNS_LEAK_ENTRIES {
-                push_unique_leak(&mut canonical, leak);
-            }
+        let Some(leak) = parse_leak(folded.as_ref()) else {
+            // The core's build refuses this value, so the load keeps the
+            // spelling the user typed and the validation pass reports it.
+            push_unique_leak(&mut canonical, entry);
             continue;
+        };
+        if leak.name == DNS_LEAK_ALIAS {
+            dns_alias_expanded = true;
         }
-        match parse_leak_port(&folded) {
-            Some(port) => push_unique_leak(&mut canonical, &port.to_string()),
-            None => push_unique_leak(&mut canonical, &folded),
+        for value in leak_canonical_entries(leak) {
+            push_unique_leak(&mut canonical, &value);
         }
     }
     (canonical, dns_alias_expanded)
 }
 
+/// The canonical entries one parsed leak value stores: its own spelling, or
+/// every entry the `dns` alias stands for under the alias's own prefix
+/// (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go).
+fn leak_canonical_entries(leak: Leak) -> Vec<String> {
+    if leak.name != DNS_LEAK_ALIAS {
+        return vec![leak.canonical()];
+    }
+    DNS_LEAK_ENTRIES
+        .iter()
+        .map(|dns| {
+            let mut dns = parse_leak(dns).expect("a stored DNS entry parses");
+            dns.prefix = leak.prefix;
+            dns.canonical()
+        })
+        .collect()
+}
+
+/// The entries one authored leak value stores, or `None` when the core would
+/// refuse it (`parseLeak`, proxy/tun/wfp_leak.go): the core's canonical
+/// spelling, with the `dns` alias replaced by the entries it stands for, so
+/// the editor never stores the alias.
+pub fn canonical_leak_entry(entry: &str) -> Option<Vec<String>> {
+    let folded = fold_lower(entry);
+    parse_leak(folded.as_ref()).map(leak_canonical_entries)
+}
+
+/// Replace a stored list with the entries the core builds from it
+/// (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go): folded, aliases expanded,
+/// CIDRs masked, duplicates dropped in order, and an entry the core refuses
+/// kept verbatim for the validation pass. The editor calls this after an edit
+/// so it stores the same form a load writes.
+pub fn canonicalize_leak_entries(entries: &mut Vec<String>) {
+    let stored = std::mem::take(entries);
+    *entries = canonicalize_leak_block(&stored).0;
+}
+
 /// Append `entry` unless the list already holds it. Every entry reaching here
-/// is folded already, so an exact comparison is the core's own duplicate
+/// is canonical already, so an exact comparison is the core's own duplicate
 /// check.
 fn push_unique_leak(list: &mut Vec<String>, entry: &str) {
     if !list.iter().any(|kept| kept == entry) {
@@ -1179,14 +1506,75 @@ fn push_unique_leak(list: &mut Vec<String>, entry: &str) {
 
 /// Whether one stored leak entry keeps the system's DNS inside the tunnel,
 /// read the way the core reads an expanded list (`BlocksSystemDNS`,
-/// proxy/tun/wfp_leak.go): the alias and the DNS Client service block it, and
-/// so does a port filter on port 53.
+/// proxy/tun/wfp_leak.go): `all` and `windnsclient` block it through their
+/// expansion, a port or range covering TCP or UDP port 53 blocks it, and the
+/// `dns` and `allexceptlan` aliases stand for the DNS entries themselves.
 fn leak_entry_blocks_system_dns(entry: &str) -> bool {
     let folded = fold_lower(entry);
+    let Some(leak) = parse_leak(folded.as_ref()) else {
+        return false;
+    };
+    leak.name == DNS_LEAK_ALIAS || leak.name == "allexceptlan" || leak.blocks_system_dns()
+}
+
+/// The unprefixed covering entry a stored list holds, if any: [`TUN_LEAK_ALL`]
+/// first, then [`TUN_LEAK_ALL_EXCEPT_LAN`]. A prefixed entry limits itself to
+/// its own addresses, so it covers no other entry (`parseLeak`,
+/// `ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go).
+pub fn leak_covering_entry(entries: &[String]) -> Option<&'static str> {
+    if leak_block_holds(entries, TUN_LEAK_ALL) {
+        Some(TUN_LEAK_ALL)
+    } else if leak_block_holds(entries, TUN_LEAK_ALL_EXCEPT_LAN) {
+        Some(TUN_LEAK_ALL_EXCEPT_LAN)
+    } else {
+        None
+    }
+}
+
+/// Whether `entry` is redundant under the list's covering entry. `all` covers
+/// every value except [`TUN_LEAK_MISCONFIG_TUN`], while `allexceptlan` already
+/// contains the DNS entries it stands for and ICMP (`ExpandWfpBlockLeak`,
+/// proxy/tun/wfp_leak.go). The editor renders a covered entry disabled and
+/// keeps it in the list.
+pub fn leak_entry_covered(entries: &[String], entry: &str) -> bool {
+    let Some(covering) = leak_covering_entry(entries) else {
+        return false;
+    };
+    let folded = fold_lower(entry);
     let folded = folded.as_ref();
-    folded == DNS_LEAK_ALIAS
-        || folded == TUN_LEAK_WINDNS_CLIENT
-        || parse_leak_port(folded).is_some_and(|port| port.port == 53)
+    if fold_eq(folded, TUN_LEAK_MISCONFIG_TUN) {
+        return false;
+    }
+    if covering == TUN_LEAK_ALL {
+        return !fold_eq(folded, TUN_LEAK_ALL);
+    }
+    !fold_eq(folded, TUN_LEAK_ALL_EXCEPT_LAN) && leak_entry_is_dns_or_icmp(folded)
+}
+
+/// Whether the list holds `value` as an unprefixed named entry.
+fn leak_block_holds(entries: &[String], value: &str) -> bool {
+    entries.iter().any(|entry| {
+        let folded = fold_lower(entry);
+        matches!(
+            parse_leak(folded.as_ref()),
+            Some(leak) if leak.prefix.is_none() && leak.name == value
+        )
+    })
+}
+
+/// Whether `allexceptlan` already contains the value: the DNS entries it
+/// stands for, and ICMP. A port filter counts only when it names port 53 or
+/// 853 alone, so a range or a protocol-wide filter that reaches other ports
+/// stays editable.
+fn leak_entry_is_dns_or_icmp(value: &str) -> bool {
+    let Some(leak) = parse_leak(value) else {
+        return false;
+    };
+    match leak.name {
+        TUN_LEAK_WINDNS_CLIENT | DNS_LEAK_ALIAS | TUN_LEAK_ICMP => true,
+        TUN_LEAK_ALL | TUN_LEAK_ALL_EXCEPT_LAN | TUN_LEAK_MISCONFIG_TUN => false,
+        _ => leak.low != 0 && leak.low == leak.high && matches!(leak.low, 53 | 853),
+    }
 }
 
 impl Default for TunCfg {
@@ -1438,7 +1826,9 @@ impl TunCfg {
 }
 #[cfg(test)]
 mod tun_tests {
-    use super::{DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, TunCfg};
+    use super::{
+        DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, TunCfg, leak_entry_is_valid,
+    };
     use serde_json::json;
 
     /// The seeded list as the stored-file `Vec<String>`.
@@ -1557,13 +1947,155 @@ mod tun_tests {
     }
 
     #[test]
-    fn the_system_dns_predicate_mirrors_the_core() {
-        // `BlocksSystemDNS` is true for exactly these three entries; the alias
-        // stands for them, so an in-memory list holding it reads true too.
+    fn every_form_the_core_parses_is_accepted() {
+        // `parseLeak` covers the named values, a protocol alone, a protocol
+        // with a port or a range, a bare port or range for both protocols,
+        // and any of those behind an IPv4 or bracketed IPv6 CIDR prefix
+        // (proxy/tun/wfp_leak.go).
         for entry in [
-            DNS_LEAK_ENTRIES[0],
-            DNS_LEAK_ENTRIES[1],
-            DNS_LEAK_ENTRIES[2],
+            "dns",
+            "windnsclient",
+            "misconfigtun",
+            "all",
+            "allexceptlan",
+            "icmp",
+            "tcp",
+            "udp",
+            "tcp/443",
+            "udp/443",
+            "tcp/10-20",
+            "udp/10-20",
+            "53",
+            "10-20",
+            "tcp/1-65535",
+            "udp/1-65535",
+            "1.1.1.0/24:53",
+            "[::/0]:all",
+            "[2001:db8::/32]:tcp/443",
+            "8.8.8.8/32:all",
+            "1.1.1.0/24:dns",
+            "10.0.0.5/24:53",
+            "TCP",
+            "ALL",
+            "udp/053",
+            "tcp/443-443",
+        ] {
+            assert!(leak_entry_is_valid(entry), "{entry}");
+        }
+    }
+
+    #[test]
+    fn a_value_outside_the_core_grammar_is_refused() {
+        // The core's `parseLeak` refuses each of these: an unknown name, a
+        // zero or over-wide port, a reversed or dangling range, ports on a
+        // named value, an unbracketed IPv6 or bracketed IPv4 prefix, a prefix
+        // with leading zeros or an over-wide length, and an IPv4-mapped IPv6
+        // prefix.
+        for entry in [
+            "bogus",
+            "tcp/0",
+            "udp/0",
+            "tcp/65536",
+            "udp/65536",
+            "tcp/10-5",
+            "tcp/",
+            "tcp/x",
+            "tcp/10-",
+            "tcp/-5",
+            "tcp/1-2-3",
+            "53-",
+            "+53",
+            "dns/53",
+            "all/53",
+            "icmp/1",
+            "[1.1.1.0/24]:53",
+            "::/0:all",
+            "10.0.0.0/030:53",
+            "010.0.0.0/30:53",
+            "1.1.1.0/24:",
+            "1.1.1.0/33:53",
+            "[::/129]:53",
+            "[::ffff:1.2.3.4/128]:53",
+        ] {
+            assert!(!leak_entry_is_valid(entry), "{entry}");
+        }
+    }
+
+    #[test]
+    fn the_load_keeps_the_core_canonical_form_of_every_value() {
+        // Lower case, CIDR masked, ports from their numeric value, duplicates
+        // dropped in first-seen order, and `tcp/1-65535` rendered as `tcp`
+        // (`leak.String`, proxy/tun/wfp_leak.go).
+        let tun = load(json!({
+            "autoSystemWfpBlockLeak": [
+                "ALL",
+                "1.1.1.5/24:53",
+                "[2001:db8::5/32]:TCP/0443-0500",
+                "TCP/1-65535",
+                "UDP/010-20",
+                "udp/10-20",
+                "tcp/443-443",
+            ],
+        }));
+        assert_eq!(
+            tun.auto_system_wfp_block_leak,
+            vec![
+                "all".to_string(),
+                "1.1.1.0/24:53".to_string(),
+                "[2001:db8::/32]:tcp/443-500".to_string(),
+                "tcp".to_string(),
+                "udp/10-20".to_string(),
+                "tcp/443".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prefixed_dns_alias_expands_with_its_prefix() {
+        // The app stores the five entries the alias stands for, and a CIDR
+        // prefix on the alias limits every one of them, as the core's own
+        // expansion does.
+        let tun = load(json!({ "autoSystemWfpBlockLeak": ["1.1.1.0/24:dns"] }));
+        assert_eq!(
+            tun.auto_system_wfp_block_leak,
+            vec![
+                "1.1.1.0/24:udp/53".to_string(),
+                "1.1.1.0/24:tcp/53".to_string(),
+                "1.1.1.0/24:windnsclient".to_string(),
+                "1.1.1.0/24:tcp/853".to_string(),
+                "1.1.1.0/24:udp/853".to_string(),
+            ]
+        );
+        assert!(tun.dns_alias_expanded);
+        assert!(tun.leak_blocks_system_dns());
+    }
+
+    #[test]
+    fn the_system_dns_predicate_mirrors_the_core() {
+        // `BlocksSystemDNS` over the core's expansion is true for `all`,
+        // `allexceptlan` (which the expansion follows with the DNS entries),
+        // `dns`, `windnsclient`, and anything covering TCP or UDP port 53,
+        // however it is limited to addresses or narrowed to a range.
+        for entry in [
+            "all",
+            "allexceptlan",
+            "dns",
+            "windnsclient",
+            "53",
+            "udp/53",
+            "tcp/53",
+            "tcp",
+            "udp",
+            "tcp/1-65535",
+            "tcp/40-60",
+            "udp/53-53",
+            "1.1.1.0/24:53",
+            "[::/0]:53",
+            "1.1.1.0/24:udp/53",
+            "[::/0]:allexceptlan",
+            "8.8.8.8/32:all",
+            "1.1.1.0/24:dns",
+            "TCP/053",
         ] {
             let tun = TunCfg {
                 auto_system_wfp_block_leak: vec![entry.to_string()],
@@ -1571,13 +2103,23 @@ mod tun_tests {
             };
             assert!(tun.leak_blocks_system_dns(), "{entry}");
         }
-        for entry in ["tcp/853", "udp/853", "misconfigtun", "TCP/53", "dns"] {
+        for entry in [
+            "icmp",
+            "misconfigtun",
+            "tcp/853",
+            "udp/853",
+            "tcp/443",
+            "udp/10-20",
+            "tcp/54-60",
+            "1.1.1.0/24:icmp",
+            "bogus",
+            "tcp/0",
+        ] {
             let tun = TunCfg {
                 auto_system_wfp_block_leak: vec![entry.to_string()],
                 ..Default::default()
             };
-            let expected = matches!(entry, "TCP/53" | "dns");
-            assert_eq!(tun.leak_blocks_system_dns(), expected, "{entry}");
+            assert!(!tun.leak_blocks_system_dns(), "{entry}");
         }
         let clear = TunCfg {
             auto_system_wfp_block_leak: Vec::new(),
@@ -1590,8 +2132,8 @@ mod tun_tests {
     fn the_canonical_form_is_what_the_generator_emits() {
         // A model edited in memory reaches the generator through this form:
         // folded, alias expanded in place, ports without leading zeros,
-        // duplicates gone, order kept, and a value the core refuses kept as
-        // written.
+        // duplicates gone, order kept, and a value the core refuses kept
+        // verbatim for the validation pass.
         let tun = TunCfg {
             auto_system_wfp_block_leak: vec![
                 "DNS".into(),
@@ -1602,7 +2144,7 @@ mod tun_tests {
             ..Default::default()
         };
         let mut expected: Vec<String> = DNS_LEAK_ENTRIES.map(String::from).to_vec();
-        expected.push("bogus".into());
+        expected.push("Bogus".into());
         assert_eq!(tun.canonical_leak_block(), expected);
     }
 

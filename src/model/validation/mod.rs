@@ -676,19 +676,15 @@ pub enum ValidationCode {
     /// autoSystemRoutingTable to be set", live on the pinned binary), so the
     /// configuration never loads. Error tier.
     TunLeakRoutingTableRequired,
-    /// A leak-block entry outside the core's vocabulary — `dns`,
-    /// `windnsclient`, `misconfigtun`, `tcp/<port>`, `udp/<port>` — with the
-    /// offending value, bounded. The core's build refuses any other spelling
-    /// with "unknown autoSystemWfpBlockLeak value: ..." (live on the pinned
-    /// binary), so the configuration never loads. Values fold
-    /// case-insensitively. Error tier.
+    /// A leak-block entry outside the core's grammar: the named values
+    /// (`dns`, `windnsclient`, `misconfigtun`, `all`, `allexceptlan`, `icmp`),
+    /// `tcp` or `udp` alone or with `/<port>`/`/<low>-<high>`, a bare port or
+    /// port range, or any of those behind an IPv4 or bracketed IPv6 CIDR
+    /// prefix. The offending value accompanies the code, bounded. The core's
+    /// build refuses any other spelling with "unknown autoSystemWfpBlockLeak
+    /// value: ..." (live on the pinned binary), so the configuration never
+    /// loads. Values fold case-insensitively. Error tier.
     TunLeakValueUnknown(String),
-    /// A `tcp/<port>` or `udp/<port>` entry whose port is not a nonzero
-    /// 16-bit number (the offending value, bounded), which the core's
-    /// `parseLeakPort` refuses with the same unknown-value error
-    /// (proxy/tun/wfp_leak.go). The structured editor cannot build one, so
-    /// this rule guards raw edits and imported files. Error tier.
-    TunLeakPortInvalid(String),
     /// A profile that carried the `dns` alias after the load-time migration
     /// expanded it — a raw edit or an import. The app accepts the alias in
     /// memory and saves the five entries it stands for. Advisory
