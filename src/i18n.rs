@@ -1456,6 +1456,8 @@ keys! {
     SrvFreedomFragmentInvalid 0,
     SrvFreedomNoiseInvalid 0,
     SrvFreedomFinalRuleInvalid 0,
+    SrvFreedomFinalRuleBlockOnly 0,
+    SrvFreedomFinalRuleLogLevelInvalid 0,
     SrvBlackholeResponseInvalidShort 0,
     SrvDnsRuleActionInvalidShort 0,
     SrvLoopbackTagRequired 0,
@@ -1640,7 +1642,6 @@ keys! {
     SrvOfficialSourceToken 0,
     SrvConcurrencyLegacy 0,
     SrvDelayMs 0,
-    SrvBlockDelayMs 0,
     SrvIntervalS 0,
     SrvReverseTag 0,
     SrvSecretKey 0,
@@ -3058,6 +3059,8 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
         // keeps the existing key (its bytes are the editor's contract).
         SendThroughInvalid => (Key::SrvSendThroughInvalidShort, Vec::new()),
         FreedomFinalRuleInvalid => (Key::SrvFreedomFinalRuleInvalid, Vec::new()),
+        FreedomFinalRuleBlockOnly => (Key::SrvFreedomFinalRuleBlockOnly, Vec::new()),
+        FreedomFinalRuleLogLevelInvalid => (Key::SrvFreedomFinalRuleLogLevelInvalid, Vec::new()),
         DnsRuleActionInvalid => (Key::SrvDnsRuleActionInvalidShort, Vec::new()),
         WireguardRemoteDnsInvalid => (Key::SrvWgRemoteDnsInvalid, Vec::new()),
         WireguardDomainStrategyRetired => (Key::SrvWgDomainStrategyRetired, Vec::new()),
@@ -4902,6 +4905,14 @@ mod en {
                 "every Freedom noise requires a valid type, packet, and applyTo"
             }
             Key::SrvFreedomFinalRuleInvalid => "every Freedom final rule requires allow or block",
+            Key::SrvFreedomFinalRuleBlockOnly => {
+                "delay and logLevel are only supported on a block final rule. Remove them or set \
+                 the action to block."
+            }
+            Key::SrvFreedomFinalRuleLogLevelInvalid => {
+                "a final rule logLevel must be none, info, debug, warning or error. Leave it unset \
+                 for the core's info default."
+            }
             Key::SrvBlackholeResponseInvalidShort => {
                 "Blackhole response type must be none, http or custom"
             }
@@ -5164,7 +5175,6 @@ mod en {
             Key::SrvOfficialSourceToken => "official source token",
             Key::SrvConcurrencyLegacy => "concurrency (-1 = legacy single-stream)",
             Key::SrvDelayMs => "delay (ms)",
-            Key::SrvBlockDelayMs => "blockDelay (ms)",
             Key::SrvIntervalS => "interval (s)",
             Key::SrvReverseTag => "reverse tag",
             Key::SrvSecretKey => "secret key",

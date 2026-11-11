@@ -266,7 +266,8 @@ fn roundtrip_protocol_settings() {
         "noises": [{"type": "rand", "packet": "50-100", "delay": "1-5", "applyTo": "ipv4"}],
         "proxyProtocol": 1,
         "finalRules": [{"action": "block", "network": "udp", "port": "443",
-                        "ip": ["203.0.113.0/24"], "blockDelay": "10-20"}]
+                        "ip": ["203.0.113.0/24"], "delay": "10-20",
+                        "logLevel": "warning"}]
     }));
     check::<BlackholeSettings>(json!({"response": {"type": "http"}}));
     check::<DnsOutboundSettings>(json!({
@@ -277,6 +278,78 @@ fn roundtrip_protocol_settings() {
         "inboundTag": "in-socks", "sniffing": {"enabled": true, "destOverride": ["tls"]}
     }));
     check::<HysteriaSettings>(json!({"version": 2, "address": "h.example.com", "port": 443}));
+}
+
+/// The legacy `blockDelay` spelling still loads, and the rule saves the one
+/// canonical `delay` key. The pinned core reads `blockDelay`, copies it into
+/// `delay`, and logs a deprecation warning on every start
+/// (infra/conf/freedom.go:285-288), so re-emitting it would keep warning
+/// about a configuration the app itself wrote.
+#[test]
+fn freedom_final_rule_delay_loads_from_both_spellings_and_saves_as_delay() {
+    let legacy: FreedomFinalRule = serde_json::from_value(json!({
+        "action": "block",
+        "blockDelay": "10-20",
+    }))
+    .expect("a stored blockDelay loads");
+    assert_eq!(legacy.delay, Some(Int32Range::new(10, 20)));
+    assert!(
+        !legacy.extra.contains_key("blockDelay"),
+        "the flatten map must not retain the legacy spelling: {:?}",
+        legacy.extra
+    );
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        json!({"action": "block", "delay": "10-20"})
+    );
+
+    let canonical: FreedomFinalRule = serde_json::from_value(json!({
+        "action": "block",
+        "delay": "10-20",
+    }))
+    .expect("the canonical spelling loads");
+    assert_eq!(canonical.delay, Some(Int32Range::new(10, 20)));
+    assert_eq!(
+        serde_json::to_value(&canonical).unwrap(),
+        json!({"action": "block", "delay": "10-20"})
+    );
+}
+
+/// An unset `logLevel` is the core's `info` default and stays out of the
+/// document; a chosen value is emitted verbatim. The core maps an empty
+/// string to `Info` and reads the field only on a block rule
+/// (infra/conf/freedom.go:290-317).
+#[test]
+fn freedom_final_rule_log_level_is_emitted_only_when_chosen() {
+    let unset: FreedomFinalRule =
+        serde_json::from_value(json!({"action": "block"})).expect("a rule without logLevel loads");
+    assert!(unset.log_level.is_empty());
+    assert_eq!(
+        serde_json::to_value(&unset).unwrap(),
+        json!({"action": "block"})
+    );
+
+    let chosen: FreedomFinalRule = serde_json::from_value(json!({
+        "action": "block",
+        "logLevel": "warning",
+    }))
+    .expect("a chosen logLevel loads");
+    assert_eq!(chosen.log_level, "warning");
+    assert_eq!(
+        serde_json::to_value(&chosen).unwrap(),
+        json!({"action": "block", "logLevel": "warning"})
+    );
+
+    // The empty spelling is the core's default, not a value to emit.
+    let empty: FreedomFinalRule = serde_json::from_value(json!({
+        "action": "block",
+        "logLevel": "",
+    }))
+    .expect("the empty spelling loads");
+    assert_eq!(
+        serde_json::to_value(&empty).unwrap(),
+        json!({"action": "block"})
+    );
 }
 
 #[test]

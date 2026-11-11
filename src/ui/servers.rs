@@ -29,10 +29,11 @@ use crate::model::stream::{
 };
 use crate::model::validation::{
     self, DNS_OUT_ACTIONS, ValidationCode, ValidationIssue, Verdict, XUDP_PROXY_UDP443_MODES,
-    dns_out_action_supported, freedom_final_rule_supported, masque_warp_address_list_verdict,
-    mux_conflicts_with_vision_flow, pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid,
-    reality_public_key_valid, send_through_supported, server_name_implausible,
-    validate_outbound_with_blocks,
+    dns_out_action_supported, freedom_final_rule_block_only_supported,
+    freedom_final_rule_block_only_violated, freedom_final_rule_log_level_supported,
+    freedom_final_rule_supported, masque_warp_address_list_verdict, mux_conflicts_with_vision_flow,
+    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
+    send_through_supported, server_name_implausible, validate_outbound_with_blocks,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -12813,15 +12814,36 @@ fn final_rules_editor(
                         t(lang, Key::SrvFinalRuleActionInvalid),
                     );
                 }
+                if freedom_final_rule_block_only_violated(r) {
+                    ui.colored_label(
+                        status_colors_of(ui).err,
+                        t(lang, Key::SrvFreedomFinalRuleBlockOnly),
+                    );
+                }
                 changed |= widgets::text_field(ui, "network", &mut r.network, "tcp,udp");
                 changed |= widgets::text_field(ui, "port", &mut r.port, "1-65535");
                 changed |= widgets::string_list(ui, lang, t(lang, Key::Ips), &mut r.ip, "geoip:cn");
-                changed |= widgets::opt_range(
-                    ui,
-                    t(lang, Key::SrvBlockDelayMs),
-                    &mut r.block_delay,
-                    0..=60_000,
-                );
+                // The core reads `delay` and `logLevel` only on a block rule,
+                // and refuses the whole configuration when a non-block rule
+                // carries either (infra/conf/freedom.go:290-317).
+                if freedom_final_rule_block_only_supported(&r.action) {
+                    changed |=
+                        widgets::opt_range(ui, t(lang, Key::SrvDelayMs), &mut r.delay, 0..=60_000);
+                    changed |= widgets::combo_str_labeled(
+                        ui,
+                        "logLevel",
+                        &mut r.log_level,
+                        &["", "none", "info", "debug", "warning", "error"],
+                        t(lang, Key::SrvDefault),
+                        false,
+                    );
+                    if !freedom_final_rule_log_level_supported(&r.log_level) {
+                        ui.colored_label(
+                            status_colors_of(ui).err,
+                            t(lang, Key::SrvFreedomFinalRuleLogLevelInvalid),
+                        );
+                    }
+                }
                 if ui.button(t(lang, Key::SrvRemoveRule)).clicked() {
                     del = Some(i);
                 }
@@ -21637,6 +21659,165 @@ Authentication: ML-KEM-768, Post-Quantum
         let findings = editor_validation_findings(&profile.borrow());
         assert!(findings.blocking.is_empty(), "{:#?}", findings.blocking);
         assert!(findings.advisory.is_empty(), "{:#?}", findings.advisory);
+    }
+
+    #[test]
+    fn block_final_rule_row_offers_delay_and_log_level_controls() {
+        let rules = Rc::new(RefCell::new(vec![FreedomFinalRule {
+            action: "block".into(),
+            ..Default::default()
+        }]));
+        let rules_for_ui = Rc::clone(&rules);
+        let mut harness = harness_builder().build_ui(move |ui| {
+            let _ = final_rules_editor(ui, Language::En, &mut rules_for_ui.borrow_mut());
+        });
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvDelayMs))
+                .is_some(),
+            "a block rule offers the delay field"
+        );
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some(t(Language::En, Key::SrvDefault)))
+            .expect("the block rule's log-level combo starts at the core default")
+            .click();
+        harness.run();
+        for level in ["none", "info", "debug", "warning", "error"] {
+            assert!(
+                harness.query_all_by_label(level).next().is_some(),
+                "the log-level combo offers {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_final_rule_row_hides_delay_and_log_level_controls() {
+        let rules = Rc::new(RefCell::new(vec![FreedomFinalRule {
+            action: "allow".into(),
+            ..Default::default()
+        }]));
+        let rules_for_ui = Rc::clone(&rules);
+        let mut harness = harness_builder().build_ui(move |ui| {
+            let _ = final_rules_editor(ui, Language::En, &mut rules_for_ui.borrow_mut());
+        });
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvDelayMs))
+                .is_none(),
+            "an allow rule offers no delay field"
+        );
+        assert_eq!(
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .count(),
+            1,
+            "only the action combo renders on an allow rule"
+        );
+    }
+
+    #[test]
+    fn choosing_a_final_rule_log_level_writes_it() {
+        let rules = Rc::new(RefCell::new(vec![FreedomFinalRule {
+            action: "block".into(),
+            ..Default::default()
+        }]));
+        let rules_for_ui = Rc::clone(&rules);
+        let mut harness = harness_builder().build_ui(move |ui| {
+            let _ = final_rules_editor(ui, Language::En, &mut rules_for_ui.borrow_mut());
+        });
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some(t(Language::En, Key::SrvDefault)))
+            .expect("the log-level combo shows the core default")
+            .click();
+        harness.run();
+        harness.get_by_label("warning").click();
+        harness.run();
+        assert_eq!(rules.borrow()[0].log_level, "warning");
+        assert_eq!(
+            serde_json::to_value(&rules.borrow()[0]).unwrap()["logLevel"],
+            "warning"
+        );
+    }
+
+    #[test]
+    fn the_default_final_rule_log_level_writes_nothing() {
+        let rules = Rc::new(RefCell::new(vec![FreedomFinalRule {
+            action: "block".into(),
+            log_level: "warning".into(),
+            ..Default::default()
+        }]));
+        let rules_for_ui = Rc::clone(&rules);
+        let mut harness = harness_builder().build_ui(move |ui| {
+            let _ = final_rules_editor(ui, Language::En, &mut rules_for_ui.borrow_mut());
+        });
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .into_iter()
+            .find(|node| node.value().as_deref() == Some("warning"))
+            .expect("the log-level combo shows the stored level")
+            .click();
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvDefault))
+            .click();
+        harness.run();
+        assert!(rules.borrow()[0].log_level.is_empty());
+        assert!(
+            serde_json::to_value(&rules.borrow()[0])
+                .unwrap()
+                .get("logLevel")
+                .is_none(),
+            "the core default must not be emitted"
+        );
+    }
+
+    #[test]
+    fn a_stored_allow_rule_with_a_delay_is_reported_not_dropped() {
+        let rule = FreedomFinalRule {
+            action: "allow".into(),
+            delay: Some(Int32Range::single(10)),
+            ..Default::default()
+        };
+        let rules = Rc::new(RefCell::new(vec![rule.clone()]));
+        let rules_for_ui = Rc::clone(&rules);
+        let mut harness = harness_builder().build_ui(move |ui| {
+            let _ = final_rules_editor(ui, Language::En, &mut rules_for_ui.borrow_mut());
+        });
+        harness.run();
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvDelayMs))
+                .is_none(),
+            "an allow rule offers no delay field"
+        );
+        assert!(
+            harness
+                .query_all_by_label(t(Language::En, Key::SrvFreedomFinalRuleBlockOnly))
+                .next()
+                .is_some(),
+            "the retained delay must be surfaced inline"
+        );
+
+        let mut profile = ServerProfile::new("direct", OutboundModel::new(Protocol::Freedom));
+        let ProtocolSettings::Freedom(settings) = &mut profile.outbound.settings else {
+            unreachable!();
+        };
+        settings.final_rules.push(rule);
+        let blocking = editor_validation_findings(&profile).blocking;
+        assert!(
+            blocking
+                .iter()
+                .any(|issue| issue.code == ValidationCode::FreedomFinalRuleBlockOnly),
+            "{blocking:#?}"
+        );
     }
 
     #[test]

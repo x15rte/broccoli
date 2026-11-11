@@ -497,6 +497,17 @@ pub enum ValidationCode {
     /// `allow` nor `block` (case-insensitive) — Xray's freedom build rejects
     /// the outbound at load.
     FreedomFinalRuleInvalid,
+    /// A freedom `settings.finalRules[]` entry whose action is not `block`
+    /// yet carries a `delay` or a `logLevel`. Xray's freedom build refuses
+    /// the outbound at load: `delay and logLevel are only supported for
+    /// block finalRules` (infra/conf/freedom.go:290-295).
+    FreedomFinalRuleBlockOnly,
+    /// A freedom `settings.finalRules[].logLevel` outside the core's
+    /// vocabulary — `none`, `info`, `debug`, `warning`, `error`, matched
+    /// after lowercasing, with the empty spelling accepted as the `info`
+    /// default. Xray's freedom build refuses the outbound at load:
+    /// `unknown finalRules.logLevel` (infra/conf/freedom.go:304-317).
+    FreedomFinalRuleLogLevelInvalid,
     /// A DNS inbound/outbound `settings.rules[]` entry whose action is not
     /// one of {direct, drop, return, hijack} — Xray's DNS build rejects
     /// unknown actions.
@@ -1698,8 +1709,10 @@ mod stream;
 
 pub use outbound::{
     DNS_OUT_ACTIONS, XUDP_PROXY_UDP443_MODES, dns_out_action_supported,
-    freedom_final_rule_supported, masque_remote_dns_verdict, masque_warp_address_list_verdict,
-    masque_warp_address_verdict, masque_warp_private_key_verdict, masque_warp_public_key_verdict,
+    freedom_final_rule_block_only_supported, freedom_final_rule_block_only_violated,
+    freedom_final_rule_log_level_supported, freedom_final_rule_supported,
+    masque_remote_dns_verdict, masque_warp_address_list_verdict, masque_warp_address_verdict,
+    masque_warp_private_key_verdict, masque_warp_public_key_verdict,
     mux_conflicts_with_vision_flow, send_through_supported, sniffing_dest_override_supported,
     validate_outbound, validate_outbound_with_blocks, validate_sniffing,
     wireguard_peer_public_key_verdict, wireguard_preshared_key_verdict,

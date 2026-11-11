@@ -16,8 +16,8 @@ use super::{
 };
 use crate::model::inbound::Sniffing;
 use crate::model::outbound::{
-    Fragment, MasqueWarpAddressFamily, MuxModel, Noise, OutboundModel, Protocol, ProtocolSettings,
-    blackhole_response_is_custom, blackhole_response_type_supported,
+    Fragment, FreedomFinalRule, MasqueWarpAddressFamily, MuxModel, Noise, OutboundModel, Protocol,
+    ProtocolSettings, blackhole_response_is_custom, blackhole_response_type_supported,
     endpoint_requires_transport_security, is_valid_wireguard_key,
     masque_remote_dns_entry_supported, masque_warp_address_family, masque_warp_key_shaped,
     vless_encryption_supported, wireguard_remote_dns_entry_supported,
@@ -99,10 +99,39 @@ fn mux_xudp_knobs_inert(m: &MuxModel) -> bool {
 
 /// True when a freedom `finalRules[].action` is one Xray's freedom build
 /// accepts — `allow` or `block`, under [`vocabulary_holds`] (the core
-/// lowercases the action before its switch, infra/conf/freedom.go:255; the
-/// editor combo offers exactly these spellings).
+/// lowercases the action before its switch, infra/conf/freedom.go:260-267;
+/// the editor combo offers exactly these spellings).
 pub fn freedom_final_rule_supported(action: &str) -> bool {
     vocabulary_holds(&["allow", "block"], action)
+}
+
+/// True when a freedom `finalRules[].logLevel` is one Xray's freedom build
+/// accepts — `none`, `info`, `debug`, `warning`, or `error`, under
+/// [`vocabulary_holds`] (the core lowercases the value before its switch,
+/// infra/conf/freedom.go:304-317). The empty spelling is the core's `info`
+/// default and is accepted; any other value refuses the outbound at load.
+pub fn freedom_final_rule_log_level_supported(log_level: &str) -> bool {
+    log_level.is_empty()
+        || vocabulary_holds(&["none", "info", "debug", "warning", "error"], log_level)
+}
+
+/// True when a freedom `finalRules[]` action may carry `delay` and
+/// `logLevel` — only `block`, under the core's lowercasing; any other action
+/// that carries either field is a load error (infra/conf/freedom.go:290-295).
+/// The editor renders both controls only when this holds, so it never offers
+/// a shape the core refuses.
+pub fn freedom_final_rule_block_only_supported(action: &str) -> bool {
+    fold_eq(action, "block")
+}
+
+/// True when a freedom `finalRules[]` entry carries a `delay` or a log level
+/// on an action that is not `block` — the placement the core refuses at
+/// load (infra/conf/freedom.go:290-295). The model pass and the editor's
+/// inline verdict both read this predicate, so the sweep and the row cannot
+/// disagree, and a retained value is surfaced rather than dropped.
+pub fn freedom_final_rule_block_only_violated(rule: &FreedomFinalRule) -> bool {
+    !freedom_final_rule_block_only_supported(&rule.action)
+        && (rule.delay.is_some() || !rule.log_level.is_empty())
 }
 
 /// The DNS-out `rules[].action` vocabulary — the four actions Xray's DNS
@@ -1699,22 +1728,49 @@ pub fn validate_outbound_with_blocks(o: &OutboundModel) -> (Verdict, StreamBlock
 
     // Editor rules that decide configuration validity — moved into the
     // per-model pass so the editor, generation and the importer all consume
-    // one verdict. Each rule keeps the editor's old error shape: one finding
-    // per rule, whole-model (the message names no field), so the rendered
-    // text is byte-identical wherever the editor lists it.
+    // one verdict. `sendThrough` and the two action vocabularies keep the
+    // editor's old error shape: one whole-model finding with no field path,
+    // so the rendered text is byte-identical wherever the editor lists it.
+    // The freedom final-rule placement and log-level rules name the
+    // offending entry instead, because a rule list needs the row to fix.
     if o.send_through
         .as_deref()
         .is_some_and(|value| !send_through_supported(value))
     {
         issues.push(issue(ValidationCode::SendThroughInvalid, None));
     }
-    if let ProtocolSettings::Freedom(settings) = &o.settings
-        && settings
-            .final_rules
-            .iter()
-            .any(|rule| !freedom_final_rule_supported(&rule.action))
-    {
-        issues.push(issue(ValidationCode::FreedomFinalRuleInvalid, None));
+    if let ProtocolSettings::Freedom(settings) = &o.settings {
+        let mut action_invalid = false;
+        for (index, rule) in settings.final_rules.iter().enumerate() {
+            if !freedom_final_rule_supported(&rule.action) {
+                action_invalid = true;
+                continue;
+            }
+            // `delay` and `logLevel` exist only on a block rule: the core
+            // returns a load error for a non-block rule that carries either
+            // (infra/conf/freedom.go:290-295). A block rule then reads the
+            // log level through the five-value switch (:304-317); the empty
+            // spelling is the `info` default.
+            if freedom_final_rule_block_only_violated(rule) {
+                issues.push(issue(
+                    ValidationCode::FreedomFinalRuleBlockOnly,
+                    Some(format!("settings.finalRules[{index}]")),
+                ));
+                continue;
+            }
+            if !freedom_final_rule_block_only_supported(&rule.action) {
+                continue;
+            }
+            if !freedom_final_rule_log_level_supported(&rule.log_level) {
+                issues.push(issue(
+                    ValidationCode::FreedomFinalRuleLogLevelInvalid,
+                    Some(format!("settings.finalRules[{index}].logLevel")),
+                ));
+            }
+        }
+        if action_invalid {
+            issues.push(issue(ValidationCode::FreedomFinalRuleInvalid, None));
+        }
     }
     if let ProtocolSettings::Dns(settings) = &o.settings
         && settings
@@ -3900,6 +3956,26 @@ mod tests {
         OutboundModel::new(Protocol::Freedom)
     }
 
+    fn freedom_with_final_rule(
+        action: &str,
+        delay: Option<Int32Range>,
+        log_level: &str,
+    ) -> OutboundModel {
+        let mut outbound = freedom_canonical();
+        let ProtocolSettings::Freedom(settings) = &mut outbound.settings else {
+            unreachable!()
+        };
+        settings
+            .final_rules
+            .push(crate::model::outbound::FreedomFinalRule {
+                action: action.into(),
+                delay,
+                log_level: log_level.into(),
+                ..Default::default()
+            });
+        outbound
+    }
+
     #[test]
     fn trojan_flow_extra_is_refused_like_the_removed_feature() {
         // Xray's TrojanClientConfig.Build refuses a non-empty
@@ -4232,6 +4308,125 @@ mod tests {
                 ValidationCode::FreedomFinalRulesIgnored,
                 Some("settings.finalRules".into()),
             )]
+        );
+    }
+
+    #[test]
+    fn freedom_final_rules_gate_delay_and_log_level_on_non_block_rules() {
+        // A non-block rule that carries `delay` or `logLevel` is refused at
+        // load: "delay and logLevel are only supported for block finalRules"
+        // (infra/conf/freedom.go:290-295).
+        for delay in [Some(Int32Range::single(0)), Some(Int32Range::new(10, 20))] {
+            let issues = validate_outbound(&freedom_with_final_rule("allow", delay, ""));
+            assert!(
+                issues.has_blocking(),
+                "an allow rule with a delay must gate: {issues:?}"
+            );
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::FreedomFinalRuleBlockOnly]
+            );
+            assert_eq!(issues[0].path.as_deref(), Some("settings.finalRules[0]"));
+        }
+        for action in ["allow", "ALLOW", "Allow"] {
+            let issues = validate_outbound(&freedom_with_final_rule(action, None, "info"));
+            assert!(
+                issues.has_blocking(),
+                "{action:?} with a logLevel must gate: {issues:?}"
+            );
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::FreedomFinalRuleBlockOnly]
+            );
+        }
+        // Both keys on one non-block rule are still the core's one refusal.
+        assert_eq!(
+            codes(&validate_outbound(&freedom_with_final_rule(
+                "allow",
+                Some(Int32Range::single(5)),
+                "warning"
+            ))),
+            vec![ValidationCode::FreedomFinalRuleBlockOnly]
+        );
+        // A non-block rule is refused by the placement rule first, exactly
+        // as the core reports it.
+        assert_eq!(
+            codes(&validate_outbound(&freedom_with_final_rule(
+                "allow", None, "verbose"
+            ))),
+            vec![ValidationCode::FreedomFinalRuleBlockOnly]
+        );
+    }
+
+    #[test]
+    fn freedom_final_rules_accept_delay_and_log_level_on_block_rules() {
+        // A block rule may carry both, with any accepted log level; the
+        // empty spelling is the core's `info` default (:304-317).
+        for (delay, log_level) in [
+            (None, ""),
+            (Some(Int32Range::single(0)), ""),
+            (Some(Int32Range::new(10, 20)), "warning"),
+            (None, "none"),
+            (None, "info"),
+            (None, "INFO"),
+            (None, "debug"),
+            (None, "warning"),
+            (None, "error"),
+        ] {
+            let issues = validate_outbound(&freedom_with_final_rule("block", delay, log_level));
+            assert!(
+                issues.is_empty(),
+                "block {delay:?}/{log_level:?} must pass: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn freedom_final_rules_refuse_unknown_log_levels() {
+        // On a block rule the core reaches its log-level switch and refuses
+        // every spelling outside the five values (:304-317).
+        for log_level in ["verbose", "warn", "info ", " "] {
+            let issues = validate_outbound(&freedom_with_final_rule("block", None, log_level));
+            assert_eq!(
+                codes(&issues),
+                vec![ValidationCode::FreedomFinalRuleLogLevelInvalid]
+            );
+            assert_eq!(
+                issues[0].path.as_deref(),
+                Some("settings.finalRules[0].logLevel")
+            );
+        }
+    }
+
+    #[test]
+    fn freedom_final_rule_findings_name_the_incompatibility_and_the_fix() {
+        let issues = {
+            let mut outbound = freedom_with_final_rule("allow", Some(Int32Range::single(5)), "");
+            let ProtocolSettings::Freedom(settings) = &mut outbound.settings else {
+                unreachable!()
+            };
+            settings
+                .final_rules
+                .push(crate::model::outbound::FreedomFinalRule {
+                    action: "block".into(),
+                    log_level: "verbose".into(),
+                    ..Default::default()
+                });
+            validate_outbound(&outbound)
+        };
+        let block_only = finding(&issues, &ValidationCode::FreedomFinalRuleBlockOnly)
+            .expect("the allow rule gates");
+        assert_eq!(
+            crate::i18n::validation_issue_message(block_only, crate::model::settings::Language::En),
+            "settings.finalRules[0]: delay and logLevel are only supported on a block final rule. \
+             Remove them or set the action to block."
+        );
+        let log_level = finding(&issues, &ValidationCode::FreedomFinalRuleLogLevelInvalid)
+            .expect("the block rule's log level gates");
+        assert_eq!(
+            crate::i18n::validation_issue_message(log_level, crate::model::settings::Language::En),
+            "settings.finalRules[1].logLevel: a final rule logLevel must be none, info, debug, \
+             warning or error. Leave it unset for the core's info default."
         );
     }
 

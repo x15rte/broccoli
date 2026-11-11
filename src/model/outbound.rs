@@ -729,8 +729,18 @@ pub struct FreedomFinalRule {
     pub port: String,
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub ip: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_delay: Option<Int32Range>,
+    /// Block duration for a `block` rule, in the core's `delay` spelling.
+    /// Stored profiles from older builds carry the retired `blockDelay`
+    /// key: the core still reads it, copies it into `delay`, and logs a
+    /// deprecation warning (infra/conf/freedom.go:285-288), so it is
+    /// accepted on load and emitted only as `delay`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "blockDelay")]
+    pub delay: Option<Int32Range>,
+    /// `none` | `info` | `debug` | `warning` | `error`, for a `block` rule.
+    /// Empty means the core's `info` default and is not emitted
+    /// (infra/conf/freedom.go:290-317).
+    #[serde(skip_serializing_if = "skip_empty_str")]
+    pub log_level: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
