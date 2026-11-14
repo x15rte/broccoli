@@ -1078,28 +1078,16 @@ pub const DNS_LEAK_ENTRIES: [&str; 5] = [
 pub static DNS_LEAK_ENTRY_LIST: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| DNS_LEAK_ENTRIES.join(", "));
 
-/// The single ports [`DNS_LEAK_ENTRIES`] closes, derived from that table so a
-/// port filter's coverage cannot drift from the alias it stands for.
-static DNS_LEAK_PORTS: std::sync::LazyLock<Vec<u16>> = std::sync::LazyLock::new(|| {
-    DNS_LEAK_ENTRIES
-        .iter()
-        .filter_map(|entry| parse_leak(entry))
-        .filter(|leak| leak.low != 0 && leak.low == leak.high)
-        .map(|leak| leak.low)
-        .collect()
-});
-
-/// The leak-block entries a fresh install runs: everything `dns` stands for,
-/// then the unrouted family. A TUN session keeps the system's DNS and the
-/// unrouted family inside the tunnel until the user removes an entry.
-pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 6] = [
-    DNS_LEAK_ENTRIES[0],
-    DNS_LEAK_ENTRIES[1],
-    DNS_LEAK_ENTRIES[2],
-    DNS_LEAK_ENTRIES[3],
-    DNS_LEAK_ENTRIES[4],
-    TUN_LEAK_MISCONFIG_TUN,
-];
+/// The leak-block entries a fresh install runs: everything outside the local
+/// network stays inside the tunnel, so private destinations keep their direct
+/// route, plus an unrouted family the alias leaves open on that network. The
+/// core follows the alias with the DNS entries it stands for
+/// (`ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go), which keeps the system's DNS
+/// inside the tunnel and satisfies the core's DNS gate. The core drops the
+/// family value while both families have routes into the TUN
+/// (`newLeakFilters`, tun_windows_wfp.go:217-247), so it acts only on the
+/// misconfiguration it names.
+pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 2] = [TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_MISCONFIG_TUN];
 
 /// One port row of the leak editor: the core's `tcp|udp/<low>[-<high>]`
 /// spelling, or the bare `<low>[-<high>]` form both protocols share
@@ -1516,38 +1504,98 @@ fn leak_entry_blocks_system_dns(entry: &str) -> bool {
     leak.name == DNS_LEAK_ALIAS || leak.name == "allexceptlan" || leak.blocks_system_dns()
 }
 
-/// The unprefixed covering entry a stored list holds, if any: [`TUN_LEAK_ALL`]
-/// first, then [`TUN_LEAK_ALL_EXCEPT_LAN`]. A prefixed entry limits itself to
-/// its own addresses, so it covers no other entry (`parseLeak`,
-/// `ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go).
-pub fn leak_covering_entry(entries: &[String]) -> Option<&'static str> {
+/// The leak block's scope: the two unprefixed values that state a policy for
+/// every destination, or the detail list the editor shows entry by entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeakScope {
+    /// Neither unprefixed scope value is stored: the list is a detail list.
+    Custom,
+    /// Unprefixed [`TUN_LEAK_ALL`] is stored.
+    All,
+    /// Unprefixed [`TUN_LEAK_ALL_EXCEPT_LAN`] is stored.
+    AllExceptLan,
+}
+
+/// The scope a stored list states. [`TUN_LEAK_ALL`] wins when both scope
+/// values are stored, because it covers everything the other value does
+/// (`parseLeak`, `ExpandWfpBlockLeak`, proxy/tun/wfp_leak.go). A prefixed
+/// `all` or `allexceptlan` limits itself to its own addresses, so it is a
+/// detail entry and leaves the scope custom.
+pub fn leak_scope(entries: &[String]) -> LeakScope {
     if leak_block_holds(entries, TUN_LEAK_ALL) {
-        Some(TUN_LEAK_ALL)
+        LeakScope::All
     } else if leak_block_holds(entries, TUN_LEAK_ALL_EXCEPT_LAN) {
-        Some(TUN_LEAK_ALL_EXCEPT_LAN)
+        LeakScope::AllExceptLan
     } else {
-        None
+        LeakScope::Custom
     }
 }
 
-/// Whether `entry` is redundant under the list's covering entry. `all` covers
-/// every value except [`TUN_LEAK_MISCONFIG_TUN`], while `allexceptlan` already
-/// contains the DNS entries it stands for and ICMP (`ExpandWfpBlockLeak`,
-/// proxy/tun/wfp_leak.go). The editor renders a covered entry disabled and
-/// keeps it in the list.
-pub fn leak_entry_covered(entries: &[String], entry: &str) -> bool {
-    let Some(covering) = leak_covering_entry(entries) else {
+/// Rewrite the list's scope to `scope`: drop every unprefixed scope value,
+/// then add the selected spelling. A detail entry — including a prefixed
+/// `all` or `allexceptlan` — is never touched.
+pub fn set_leak_scope(entries: &mut Vec<String>, scope: LeakScope) {
+    entries.retain(|entry| !is_unprefixed_scope_entry(entry));
+    match scope {
+        LeakScope::Custom => {}
+        LeakScope::All => entries.push(TUN_LEAK_ALL.to_string()),
+        LeakScope::AllExceptLan => entries.push(TUN_LEAK_ALL_EXCEPT_LAN.to_string()),
+    }
+}
+
+/// Whether the scope's own filters already produce every block `entry` adds,
+/// so the editor hides it. The relation is read from the core's expansion and
+/// filter weights (`proxy/tun/wfp_leak.go:137-146`,
+/// `tun_windows_wfp.go:327-335`): `all` blocks every protocol and address
+/// outside the tunnel, so every valid entry is contained; `allexceptlan`
+/// expands into `53`, `853` and the DNS Client service at every address, so an
+/// entry no wider than those is contained. An invalid entry is never hidden:
+/// the scope does not contain a value that breaks the load, and the user must
+/// repair it.
+pub fn leak_scope_hides(scope: LeakScope, entry: &str) -> bool {
+    if !leak_entry_is_valid(entry) {
+        return false;
+    }
+    match scope {
+        LeakScope::Custom => false,
+        LeakScope::All => true,
+        LeakScope::AllExceptLan => leak_entry_in_dns_expansion(entry),
+    }
+}
+
+/// Whether `entry` blocks no more than `allexceptlan` already adds for DNS.
+/// The alias follows itself with `53`, `853` and `windnsclient` at every
+/// address (`dnsLeaks`, `ExpandWfpBlockLeak`), so a stored DNS alias, the DNS
+/// Client service, or a single 53/853 port — bare, protocol-qualified, or
+/// CIDR-limited — is contained. A range that reaches another port is not.
+fn leak_entry_in_dns_expansion(entry: &str) -> bool {
+    let folded = fold_lower(entry);
+    let Some(leak) = parse_leak(folded.as_ref()) else {
         return false;
     };
-    let folded = fold_lower(entry);
-    let folded = folded.as_ref();
-    if fold_eq(folded, TUN_LEAK_MISCONFIG_TUN) {
-        return false;
+    match leak.name {
+        DNS_LEAK_ALIAS | TUN_LEAK_WINDNS_CLIENT => true,
+        TUN_LEAK_ALL | TUN_LEAK_ALL_EXCEPT_LAN | TUN_LEAK_MISCONFIG_TUN | TUN_LEAK_ICMP => false,
+        _ => leak.low != 0 && leak.low == leak.high && matches!(leak.low, 53 | 853),
     }
-    if covering == TUN_LEAK_ALL {
-        return !fold_eq(folded, TUN_LEAK_ALL);
-    }
-    !fold_eq(folded, TUN_LEAK_ALL_EXCEPT_LAN) && leak_entry_is_dns_or_icmp(folded)
+}
+
+/// The number of stored detail entries the scope hides, for the note that
+/// names them.
+pub fn leak_hidden_count(scope: LeakScope, entries: &[String]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !is_unprefixed_scope_entry(entry) && leak_scope_hides(scope, entry))
+        .count()
+}
+
+/// The number of stored entries the scope selector does not own: the detail
+/// list the custom scope edits.
+pub fn leak_detail_count(entries: &[String]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !is_unprefixed_scope_entry(entry))
+        .count()
 }
 
 /// Whether the list holds `value` as an unprefixed named entry.
@@ -1561,19 +1609,14 @@ fn leak_block_holds(entries: &[String], value: &str) -> bool {
     })
 }
 
-/// Whether `allexceptlan` already contains the value: the DNS entries it
-/// stands for, and ICMP. A port filter counts only when it names one of the
-/// ports [`DNS_LEAK_ENTRIES`] closes alone, so a range or a protocol-wide
-/// filter that reaches other ports stays editable.
-fn leak_entry_is_dns_or_icmp(value: &str) -> bool {
-    let Some(leak) = parse_leak(value) else {
-        return false;
-    };
-    match leak.name {
-        TUN_LEAK_WINDNS_CLIENT | DNS_LEAK_ALIAS | TUN_LEAK_ICMP => true,
-        TUN_LEAK_ALL | TUN_LEAK_ALL_EXCEPT_LAN | TUN_LEAK_MISCONFIG_TUN => false,
-        _ => leak.low != 0 && leak.low == leak.high && DNS_LEAK_PORTS.contains(&leak.low),
-    }
+/// Whether `entry` is one of the two unprefixed scope values.
+pub fn is_unprefixed_scope_entry(entry: &str) -> bool {
+    let folded = fold_lower(entry);
+    matches!(
+        parse_leak(folded.as_ref()),
+        Some(leak) if leak.prefix.is_none()
+            && matches!(leak.name, TUN_LEAK_ALL | TUN_LEAK_ALL_EXCEPT_LAN)
+    )
 }
 
 impl Default for TunCfg {
@@ -1721,6 +1764,17 @@ impl TunCfg {
             .any(|entry| fold_eq(entry, TUN_LEAK_MISCONFIG_TUN))
     }
 
+    /// Whether the leak list keeps traffic of an address family the routing
+    /// table does not route into the tunnel inside the tunnel: it names
+    /// [`TUN_LEAK_MISCONFIG_TUN`], or it states a non-custom scope, whose
+    /// filters block every destination outside the local network
+    /// (`tun_windows_wfp.go`, filter weights). A detail list without the
+    /// entry can still leak, so the settings pass warns only then.
+    pub fn leak_blocks_unrouted_family(&self) -> bool {
+        self.leak_blocks_misconfig_tun()
+            || leak_scope(&self.auto_system_wfp_block_leak) != LeakScope::Custom
+    }
+
     /// Whether an in-memory list still carries the `dns` alias — a model
     /// built by hand rather than loaded. The settings pass warns for it
     /// exactly as it does for a load that expanded the alias.
@@ -1826,7 +1880,9 @@ impl TunCfg {
 #[cfg(test)]
 mod tun_tests {
     use super::{
-        DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, TunCfg, leak_entry_is_valid,
+        DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, LeakScope,
+        TUN_LEAK_MISCONFIG_TUN, TunCfg, leak_detail_count, leak_entry_is_valid, leak_hidden_count,
+        leak_scope, leak_scope_hides, set_leak_scope,
     };
     use serde_json::json;
 
@@ -1858,19 +1914,189 @@ mod tun_tests {
     }
 
     #[test]
-    fn fresh_install_leak_block_covers_the_system_dns_and_the_unrouted_family() {
-        // The seed carries every entry `dns` stands for, then the unrouted
-        // family: the core installs exactly these filters inside its own
-        // process, and nothing is left behind an alias a load would expand.
+    fn fresh_install_leak_block_keeps_dns_the_local_network_and_the_family_guard() {
+        // The seed states the scope the built-in routing defaults need:
+        // private destinations stay direct, so the local network stays open,
+        // the alias follows the DNS entries it stands for inside the core, and
+        // the family guard covers a family with no route into the tunnel.
         let tun = TunCfg::default();
         assert_eq!(tun.auto_system_wfp_block_leak, seeded_leak_block());
         assert!(
             !tun.dns_alias_expanded,
-            "the seed writes the expansion, so no load happened"
+            "the seed writes its own spelling, so no load happened"
         );
         assert!(tun.leak_blocks_system_dns());
         assert!(tun.leak_blocks_misconfig_tun());
+        assert!(
+            tun.leak_blocks_unrouted_family(),
+            "the alias blocks every destination outside the local network"
+        );
         assert!(!tun.auto_system_dns_to_gateway);
+        assert_eq!(
+            leak_scope(&tun.auto_system_wfp_block_leak),
+            LeakScope::AllExceptLan
+        );
+        assert_eq!(leak_detail_count(&tun.auto_system_wfp_block_leak), 1);
+    }
+
+    #[test]
+    fn the_scope_values_keep_the_unrouted_family_inside_the_tunnel() {
+        let mut tun = TunCfg::default();
+        for (entries, blocked) in [
+            (vec!["udp/53"], false),
+            (vec!["misconfigtun"], true),
+            (vec!["all"], true),
+            (vec!["allexceptlan"], true),
+            (vec!["1.1.1.0/24:all"], false),
+        ] {
+            tun.auto_system_wfp_block_leak =
+                entries.iter().map(|entry| (*entry).to_string()).collect();
+            assert_eq!(tun.leak_blocks_unrouted_family(), blocked, "{entries:?}");
+        }
+    }
+
+    #[test]
+    fn leak_scope_reads_the_stored_list() {
+        let scope = |entries: &[&str]| {
+            leak_scope(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(scope(&[]), LeakScope::Custom);
+        assert_eq!(scope(&["udp/53"]), LeakScope::Custom);
+        assert_eq!(scope(&["all"]), LeakScope::All);
+        assert_eq!(scope(&["ALL"]), LeakScope::All);
+        assert_eq!(scope(&["allexceptlan"]), LeakScope::AllExceptLan);
+        assert_eq!(
+            scope(&["allexceptlan", "all"]),
+            LeakScope::All,
+            "all wins when both scope values are stored"
+        );
+        assert_eq!(
+            scope(&["1.1.1.0/24:all"]),
+            LeakScope::Custom,
+            "a prefixed all is a detail entry"
+        );
+        assert_eq!(
+            scope(&["[::/0]:allexceptlan"]),
+            LeakScope::Custom,
+            "a prefixed allexceptlan is a detail entry"
+        );
+    }
+
+    #[test]
+    fn the_scope_hides_exactly_the_entries_it_contains() {
+        // `all` blocks every protocol and address outside the tunnel, so every
+        // valid entry is contained.
+        for entry in [
+            "udp/53",
+            "tcp/853",
+            "53",
+            "1.1.1.0/24:53",
+            "dns",
+            "windnsclient",
+            "icmp",
+            "misconfigtun",
+            "tcp/443",
+            "1.1.1.0/24:all",
+            "allexceptlan",
+        ] {
+            assert!(
+                leak_scope_hides(LeakScope::All, entry),
+                "all contains {entry:?}"
+            );
+        }
+
+        // `allexceptlan` follows itself with 53, 853 and the DNS Client
+        // service, so only those forms are contained; a bare or prefixed
+        // spelling of them is too.
+        for entry in [
+            "dns",
+            "windnsclient",
+            "53",
+            "853",
+            "tcp/53",
+            "udp/853",
+            "1.1.1.0/24:53",
+            "[::/0]:windnsclient",
+            "1.1.1.0/24:dns",
+        ] {
+            assert!(
+                leak_scope_hides(LeakScope::AllExceptLan, entry),
+                "the alias contains {entry:?}"
+            );
+        }
+        for entry in [
+            "icmp",
+            "misconfigtun",
+            "tcp/443",
+            "10-20",
+            "53-54",
+            "1.1.1.0/24:443",
+            "all",
+            "allexceptlan",
+            "tcp",
+        ] {
+            assert!(
+                !leak_scope_hides(LeakScope::AllExceptLan, entry),
+                "the alias leaves room for {entry:?}"
+            );
+        }
+
+        // Custom hides nothing; an invalid entry is never hidden, because the
+        // scope does not contain a value that breaks the load.
+        for (scope, entry) in [
+            (LeakScope::Custom, "udp/53"),
+            (LeakScope::Custom, "bogus"),
+            (LeakScope::All, "bogus"),
+            (LeakScope::AllExceptLan, "bogus"),
+        ] {
+            assert!(
+                !leak_scope_hides(scope, entry),
+                "{scope:?} must show {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hidden_count_matches_the_contained_entries() {
+        let entries: Vec<String> = ["allexceptlan", "udp/53", "tcp/443", "bogus"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(leak_hidden_count(LeakScope::All, &entries), 2);
+        assert_eq!(leak_hidden_count(LeakScope::AllExceptLan, &entries), 1);
+        assert_eq!(leak_hidden_count(LeakScope::Custom, &entries), 0);
+    }
+
+    #[test]
+    fn setting_the_scope_rewrites_only_the_scope_entry() {
+        let mut entries = vec!["udp/53".to_string(), "icmp".to_string()];
+        set_leak_scope(&mut entries, LeakScope::All);
+        assert_eq!(entries, vec!["udp/53", "icmp", "all"]);
+        set_leak_scope(&mut entries, LeakScope::AllExceptLan);
+        assert_eq!(
+            entries,
+            vec!["udp/53", "icmp", "allexceptlan"],
+            "the previous scope value goes, the detail entries stay"
+        );
+        set_leak_scope(&mut entries, LeakScope::Custom);
+        assert_eq!(entries, vec!["udp/53", "icmp"]);
+        assert_eq!(leak_detail_count(&entries), 2);
+    }
+
+    #[test]
+    fn setting_the_scope_keeps_prefixed_forms_and_drops_both_scope_values() {
+        let mut entries = vec![
+            "1.1.1.0/24:all".to_string(),
+            "all".to_string(),
+            "allexceptlan".to_string(),
+            "[::/0]:allexceptlan".to_string(),
+            "tcp/443".to_string(),
+        ];
+        set_leak_scope(&mut entries, LeakScope::Custom);
+        assert_eq!(
+            entries,
+            vec!["1.1.1.0/24:all", "[::/0]:allexceptlan", "tcp/443"]
+        );
+        assert_eq!(leak_detail_count(&entries), 3);
     }
 
     #[test]
@@ -1878,14 +2104,16 @@ mod tun_tests {
         // An old profile stores the alias. The load keeps the entries it
         // stands for — in the core's order — and remembers that it expanded
         // one, which is what the settings pass warns from.
+        let mut expanded: Vec<String> = DNS_LEAK_ENTRIES.map(String::from).to_vec();
+        expanded.push(TUN_LEAK_MISCONFIG_TUN.to_string());
         let tun = load(json!({ "autoSystemWfpBlockLeak": ["DNS", "MisconfigTun"] }));
-        assert_eq!(tun.auto_system_wfp_block_leak, seeded_leak_block());
+        assert_eq!(tun.auto_system_wfp_block_leak, expanded);
         assert!(tun.dns_alias_expanded);
         assert!(tun.leak_blocks_system_dns());
         assert!(tun.leak_blocks_misconfig_tun());
 
         let saved = serde_json::to_value(&tun).expect("the loaded block serializes");
-        assert_eq!(saved["autoSystemWfpBlockLeak"], json!(seeded_leak_block()));
+        assert_eq!(saved["autoSystemWfpBlockLeak"], json!(expanded));
         assert!(
             saved.get("dnsAliasExpanded").is_none(),
             "the flag is a load-time fact, never a stored key: {saved}"
@@ -1893,7 +2121,7 @@ mod tun_tests {
 
         // The stored spelling an older profile wrote, exactly as it was saved.
         let legacy = load(json!({ "autoSystemWfpBlockLeak": ["dns", "misconfigtun"] }));
-        assert_eq!(legacy.auto_system_wfp_block_leak, seeded_leak_block());
+        assert_eq!(legacy.auto_system_wfp_block_leak, expanded);
         assert!(legacy.dns_alias_expanded);
     }
 

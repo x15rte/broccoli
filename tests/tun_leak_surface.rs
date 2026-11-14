@@ -1,17 +1,17 @@
 //! Coverage: the TUN screen's leak-block entry list round-trips.
 //!
 //! The core's `autoSystemWfpBlockLeak` key is what keeps the system's DNS and
-//! an unrouted address family inside the tunnel, and it defaults on with every
-//! entry the core's `dns` alias stands for. The TUN screen renders one control
-//! per entry — a named value as a checkbox, a port as a protocol row, and any
-//! other value as a raw row — and an edit writes the core's own spelling
-//! straight into the model, so it survives a restart (the state file) and
-//! reaches the generator (the emitted document). An entry an unprefixed `all`
-//! or `allexceptlan` already covers renders disabled but stays in the list. A
-//! list without the entries that block the system's DNS draws the privacy
-//! banner, a list without the unrouted family draws the advisory the settings
-//! pass renders, and a stored `dns` alias warns once for the session that
-//! loaded it.
+//! an unrouted address family inside the tunnel, and a fresh profile seeds it
+//! with `allexceptlan`: private destinations stay direct while the core follows
+//! the alias with the DNS entries it stands for. The TUN screen reads the
+//! stored list as a scope — an unprefixed `all` or `allexceptlan` selects one of
+//! the two policy scopes, and every other list selects `Custom entries` — and
+//! only the custom scope shows the detail editor. A scope switch rewrites the
+//! scope values alone, so the detail entries stay stored, stay in the emitted
+//! document, and come back under `Custom`. A list without the entries that
+//! block the system's DNS draws the privacy banner, a list without the
+//! unrouted family draws the advisory the settings pass renders, and a stored
+//! `dns` alias warns once for the session that loaded it.
 //!
 //! Safety: production startup is read-only with respect to Windows settings.
 //! Tests are serialized because changing a process environment variable while
@@ -22,7 +22,7 @@ use broccoli::r#gen::generate_with_api_port;
 use broccoli::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use broccoli::model::inbound::{
     DNS_LEAK_ENTRIES, TUN_LEAK_ALL, TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_ICMP, TUN_LEAK_MISCONFIG_TUN,
-    TUN_LEAK_WINDNS_CLIENT, leak_port,
+    TUN_LEAK_WINDNS_CLIENT,
 };
 use broccoli::model::settings::{Language, Mode, Settings};
 use broccoli::model::{SafetyCode, ServersFile, TunCfg, ValidationCode};
@@ -95,12 +95,33 @@ fn saved_leak() -> Vec<String> {
         .auto_system_wfp_block_leak
 }
 
-/// Click row `index`'s 🗑 among the leak block's port rows.
+/// The emitted leak list of the persisted settings.
+fn saved_wire_leak() -> serde_json::Value {
+    let settings = Settings::load().expect("the persisted settings.json loads");
+    tun_wire(&settings)["autoSystemWfpBlockLeak"].clone()
+}
+
+/// Whether one scope radio reads selected.
+fn scope_checked(h: &Harness<'static, BroccoliApp>, key: Key) -> bool {
+    h.get_by_role_and_label(Role::RadioButton, t(Language::En, key))
+        .accesskit_node()
+        .toggled()
+        .is_some_and(|toggled| matches!(toggled, egui::accesskit::Toggled::True))
+}
+
+/// Click one scope radio.
+fn select_scope(h: &mut Harness<'static, BroccoliApp>, key: Key) {
+    h.get_by_role_and_label(Role::RadioButton, t(Language::En, key))
+        .click();
+    h.run_steps(4);
+}
+
+/// Click row `index`'s 🗑 among the leak block's detail rows.
 ///
-/// The two named entries render as checkboxes, so the delete buttons the leak
-/// section contributes are its port rows only, and they come before every
-/// other list's in the tree.
-fn delete_leak_port_row(h: &mut Harness<'static, BroccoliApp>, index: usize) {
+/// The named values render as checkboxes and the scope as radios, so the
+/// delete buttons the leak section contributes are its detail rows only, and
+/// they come before every other list's in the tree.
+fn delete_leak_row(h: &mut Harness<'static, BroccoliApp>, index: usize) {
     h.query_all_by_label(t(Language::En, Key::DeleteRow))
         .nth(index)
         .expect("a leak row's delete button")
@@ -122,42 +143,6 @@ fn add_leak_port(h: &mut Harness<'static, BroccoliApp>) {
     h.run_steps(4);
 }
 
-/// Whether one leak entry renders as a checkbox (a named value) rather than a
-/// row.
-fn is_named_leak(entry: &str) -> bool {
-    [
-        TUN_LEAK_WINDNS_CLIENT,
-        TUN_LEAK_MISCONFIG_TUN,
-        TUN_LEAK_ALL,
-        TUN_LEAK_ALL_EXCEPT_LAN,
-        TUN_LEAK_ICMP,
-    ]
-    .iter()
-    .any(|named| entry.eq_ignore_ascii_case(named))
-}
-
-/// The number of leak rows the editor renders: every stored entry that is not
-/// one of the named checkboxes.
-fn leak_row_count(entries: &[String]) -> usize {
-    entries.iter().filter(|entry| !is_named_leak(entry)).count()
-}
-
-/// Whether the named value's checkbox renders disabled.
-fn named_disabled(h: &Harness<'static, BroccoliApp>, key: Key) -> bool {
-    h.get_by_role_and_label(Role::CheckBox, t(Language::En, key))
-        .accesskit_node()
-        .is_disabled()
-}
-
-/// Whether leak row `index`'s 🗑 renders disabled.
-fn leak_row_delete_disabled(h: &Harness<'static, BroccoliApp>, index: usize) -> bool {
-    h.query_all_by_label(t(Language::En, Key::DeleteRow))
-        .nth(index)
-        .expect("a leak row's delete button")
-        .accesskit_node()
-        .is_disabled()
-}
-
 /// Press a leak block button by its label key.
 fn press_leak_button(h: &mut Harness<'static, BroccoliApp>, key: Key) {
     h.get_by_role_and_label(Role::Button, t(Language::En, key))
@@ -176,14 +161,37 @@ fn add_raw_leak(h: &mut Harness<'static, BroccoliApp>, text: &str) {
     press_leak_button(h, Key::TunLeakAddEntry);
 }
 
-/// The covered-entry note naming `covering`.
-fn covered_note(covering: &str) -> String {
-    t_fmt(Language::En, Key::TunLeakCoveredNote, &[&covering])
+/// The hidden-detail note naming `count` stored entries.
+fn hidden_note(count: usize) -> String {
+    let count = count.to_string();
+    t_fmt(Language::En, Key::TunLeakHiddenNote, &[&count])
 }
 
 /// True when the AccessKit tree carries a node whose text contains `text`.
 fn rendered(h: &Harness<'static, BroccoliApp>, text: &str) -> bool {
     h.query_all_by_label_contains(text).next().is_some()
+}
+
+/// Whether the detail editor renders: its ICMP checkbox is present under every
+/// scope that keeps the list (the DNS controls are absent under the alias).
+fn detail_visible(h: &Harness<'static, BroccoliApp>) -> bool {
+    h.query_by_role_and_label(Role::CheckBox, t(Language::En, Key::TunLeakIcmpLabel))
+        .is_some()
+}
+
+/// The number of detail rows the editor renders, counted inside the leak
+/// section's body so every other list's delete buttons stay out of the count.
+fn detail_rows(h: &Harness<'static, BroccoliApp>) -> usize {
+    let hint = h.get_by_label(t(Language::En, Key::TunLeakEntriesHint));
+    let body = hint.parent().expect("the hint sits in the section body");
+    let delete = t(Language::En, Key::DeleteRow);
+    body.children_recursive()
+        .filter(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label == delete)
+        })
+        .count()
 }
 
 /// The advisory message the settings pass renders for a list without the
@@ -196,64 +204,89 @@ fn family_warning() -> String {
 fn the_leak_rows_round_trip_into_the_state_file_and_the_generated_config() {
     let (_lock, _tmp, mut h) = boot(tun_settings());
 
-    // A fresh profile runs the core's whole expansion of `dns`, then the
-    // unrouted family: the seeded list, the state file the boot wrote, and
-    // the emitted document all carry the same six entries.
+    // A fresh profile states the scope its routing defaults need: everything
+    // except the local network stays inside the tunnel, and an unrouted family
+    // stays guarded even on that network.
     let seeded = seeded_leak();
-    assert_eq!(seeded.len(), 6, "the seeded list is six entries");
+    assert_eq!(
+        seeded,
+        vec![
+            TUN_LEAK_ALL_EXCEPT_LAN.to_string(),
+            TUN_LEAK_MISCONFIG_TUN.to_string()
+        ],
+        "the seed is the scope value plus the family guard"
+    );
     assert_eq!(saved_leak(), seeded);
     assert_eq!(
         tun_wire(&tun_settings())["autoSystemWfpBlockLeak"],
         serde_json::json!(seeded)
     );
 
-    // One row per port: deleting the first row removes exactly the entry it
-    // names, in the list's own order, until only the two checkboxes' entries
-    // remain.
-    let mut remaining = seeded;
-    for _ in 0..4 {
-        let first_port = remaining
-            .iter()
-            .position(|entry| leak_port(entry).is_some())
-            .expect("a port row to delete");
-        remaining.remove(first_port);
-        delete_leak_port_row(&mut h, 0);
-        assert_eq!(
-            saved_leak(),
-            remaining,
-            "the first port row names {first_port}"
-        );
-    }
-    assert_eq!(
-        remaining,
-        vec![
-            TUN_LEAK_WINDNS_CLIENT.to_string(),
-            TUN_LEAK_MISCONFIG_TUN.to_string(),
-        ],
-        "only the two named entries are left"
-    );
-
-    // The two checkboxes own the named entries: unticking both empties the
-    // list.
-    toggle_leak_switch(&mut h, Key::TunLeakWindnsClientLabel);
-    toggle_leak_switch(&mut h, Key::TunLeakMisconfigLabel);
+    // The scope radio reads the stored alias and the detail editor stays open:
+    // a detail entry still blocks inside the local network, which the alias
+    // leaves alone. The DNS controls are not repeated, and the empty list adds
+    // no hidden note.
+    assert!(scope_checked(&h, Key::TunLeakScopeAllExceptLanLabel));
+    assert!(detail_visible(&h));
+    assert_eq!(detail_rows(&h), 0);
     assert!(
-        saved_leak().is_empty(),
-        "unticking both named entries must leave an empty list"
+        rendered(&h, t(Language::En, Key::TunLeakDnsIncludedNote)),
+        "the alias already blocks DNS"
     );
-    assert_eq!(
-        tun_wire(&Settings::load().expect("the persisted settings.json loads"))["autoSystemWfpBlockLeak"],
-        serde_json::json!([]),
-        "an empty list stays a no-op the core accepts"
+    assert!(
+        h.query_by_role_and_label(
+            Role::CheckBox,
+            t(Language::En, Key::TunLeakWindnsClientLabel)
+        )
+        .is_none(),
+        "the DNS Client control would read off while the alias blocks it"
+    );
+    assert!(
+        !rendered(&h, &hidden_note(0)),
+        "an empty detail list needs no hidden note"
     );
 
-    // The add button appends the lowest port the list does not hold, and the
-    // next save and generation carry it.
+    // The custom scope removes only the scope value: the family guard stays,
+    // and it is the only detail the editor carries.
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    assert_eq!(saved_leak(), vec![TUN_LEAK_MISCONFIG_TUN.to_string()]);
+    assert!(detail_visible(&h));
+
+    // Author a named value and a port through the detail editor; the family
+    // guard is already stored, and the state file and the emitted document
+    // carry each edit.
+    toggle_leak_switch(&mut h, Key::TunLeakWindnsClientLabel);
     add_leak_port(&mut h);
-    assert_eq!(saved_leak(), vec!["tcp/1".to_string()]);
+    let details: Vec<String> = ["misconfigtun", "windnsclient", "tcp/1"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(saved_leak(), details);
+    assert_eq!(saved_wire_leak(), serde_json::json!(details));
+
+    // Selecting a policy scope appends its spelling and hides the details,
+    // while the state and the emitted document keep them.
+    select_scope(&mut h, Key::TunLeakScopeAllLabel);
+    let mut hidden = details.clone();
+    hidden.push(TUN_LEAK_ALL.to_string());
+    assert_eq!(saved_leak(), hidden);
+    assert!(scope_checked(&h, Key::TunLeakScopeAllLabel));
+    assert!(!detail_visible(&h));
+    assert_eq!(detail_rows(&h), 0);
+    assert!(
+        rendered(&h, &hidden_note(details.len())),
+        "the note must count the hidden detail entries"
+    );
+    assert_eq!(saved_wire_leak(), serde_json::json!(hidden));
+
+    // Back to Custom: the scope value goes and every detail entry reappears.
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    assert_eq!(saved_leak(), details);
+    assert!(detail_visible(&h));
+    assert!(!rendered(&h, &hidden_note(details.len())));
     assert_eq!(
-        tun_wire(&Settings::load().expect("the persisted settings.json loads"))["autoSystemWfpBlockLeak"],
-        serde_json::json!(["tcp/1"])
+        saved_wire_leak(),
+        serde_json::json!(details),
+        "the emitted document keeps every detail entry"
     );
 }
 
@@ -282,9 +315,11 @@ fn a_stored_dns_alias_loads_expanded_and_warns_once() {
 #[test]
 fn the_family_advisory_follows_its_entry() {
     let message = family_warning();
-    let (_lock, _tmp, mut h) = boot(tun_settings());
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = vec!["udp/53".into(), TUN_LEAK_MISCONFIG_TUN.into()];
+    let (_lock, _tmp, mut h) = boot(settings);
 
-    // The seeded list carries the family entry: the advisory's text is absent.
+    // The list carries the family entry: the advisory's text is absent.
     assert!(
         !rendered(&h, &message),
         "the advisory must stay quiet while the family entry is present"
@@ -359,218 +394,254 @@ fn the_privacy_banner_and_the_family_advisory_track_their_own_entries() {
 
 #[test]
 fn the_leak_controls_author_named_values_ports_ranges_and_prefixed_entries() {
-    let (_lock, _tmp, mut h) = boot(tun_settings());
-    let mut expected = seeded_leak();
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = Vec::new();
+    let (_lock, _tmp, mut h) = boot(settings);
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    assert!(saved_leak().is_empty());
 
     // A named value: the toggle adds the core's spelling and removes it
     // again, and the state file carries each change.
     toggle_leak_switch(&mut h, Key::TunLeakIcmpLabel);
-    expected.push(TUN_LEAK_ICMP.to_string());
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the toggle must add its named value"
-    );
+    assert_eq!(saved_leak(), vec![TUN_LEAK_ICMP.to_string()]);
     toggle_leak_switch(&mut h, Key::TunLeakIcmpLabel);
-    expected.pop();
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the toggle must remove its named value"
-    );
+    assert!(saved_leak().is_empty());
 
     // A port row: the button appends the lowest port the list lacks, and the
     // row's 🗑 removes exactly that entry.
     press_leak_button(&mut h, Key::TunLeakAddPort);
-    expected.push("tcp/1".to_string());
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the port button appends a free port"
-    );
-    delete_leak_port_row(&mut h, leak_row_count(&expected) - 1);
-    expected.pop();
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the row's remove button must remove the port"
-    );
+    assert_eq!(saved_leak(), vec!["tcp/1".to_string()]);
+    delete_leak_row(&mut h, 0);
+    assert!(saved_leak().is_empty());
 
     // A range row: the button appends the lowest free two-port range.
     press_leak_button(&mut h, Key::TunLeakAddRange);
-    expected.push("tcp/1-2".to_string());
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the range button appends a free range"
-    );
-    delete_leak_port_row(&mut h, leak_row_count(&expected) - 1);
-    expected.pop();
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the row's remove button must remove the range"
-    );
+    assert_eq!(saved_leak(), vec!["tcp/1-2".to_string()]);
+    delete_leak_row(&mut h, 0);
+    assert!(saved_leak().is_empty());
 
     // A CIDR-prefixed value: authored in the raw row and stored in the
-    // model's canonical spelling.
+    // model's canonical spelling, then removed by its own row.
     add_raw_leak(&mut h, "1.1.1.0/24:53");
-    expected.push("1.1.1.0/24:53".to_string());
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the raw row must add the parsed value"
-    );
-    delete_leak_port_row(&mut h, leak_row_count(&expected) - 1);
-    expected.pop();
-    assert_eq!(
-        saved_leak(),
-        expected,
-        "the raw row's remove button must remove it"
-    );
+    assert_eq!(saved_leak(), vec!["1.1.1.0/24:53".to_string()]);
+    delete_leak_row(&mut h, 0);
+    assert!(saved_leak().is_empty());
 }
 
 #[test]
-fn an_unprefixed_all_disables_the_other_entries_and_keeps_them_stored() {
-    let mut settings = tun_settings();
-    settings.tun.auto_system_wfp_block_leak = vec![
-        TUN_LEAK_ALL.to_string(),
-        "udp/53".to_string(),
-        TUN_LEAK_ICMP.to_string(),
-        TUN_LEAK_MISCONFIG_TUN.to_string(),
-    ];
-    let (_lock, _tmp, mut h) = boot(settings);
-
-    // The note names the entry that covers the others.
-    assert!(
-        rendered(&h, &covered_note(TUN_LEAK_ALL)),
-        "the covered entries must name all"
-    );
-
-    // `all` itself and the unrouted-family entry stay editable, so the
-    // covering entry can be removed and the family kept.
-    assert!(!named_disabled(&h, Key::TunLeakAllLabel));
-    assert!(!named_disabled(&h, Key::TunLeakMisconfigLabel));
-    for key in [
-        Key::TunLeakWindnsClientLabel,
-        Key::TunLeakAllExceptLanLabel,
-        Key::TunLeakIcmpLabel,
-    ] {
-        assert!(named_disabled(&h, key), "all covers the {key:?} entry");
-    }
-    assert!(leak_row_delete_disabled(&h, 0), "all covers the udp/53 row");
-
-    // The state disables, never deletes: the list and the emitted document
-    // keep every covered entry.
-    let stored: Vec<String> = ["all", "udp/53", "icmp", "misconfigtun"]
+fn selecting_all_hides_the_detail_and_keeps_the_stored_entries() {
+    let details: Vec<String> = ["udp/53", "icmp", "misconfigtun"]
         .map(String::from)
         .to_vec();
-    assert_eq!(saved_leak(), stored);
-    let loaded = Settings::load().expect("the persisted settings.json loads");
-    assert_eq!(
-        tun_wire(&loaded)["autoSystemWfpBlockLeak"],
-        serde_json::json!(stored),
-        "the emitted list must still carry every covered entry"
-    );
-
-    // Removing the covering entry restores the stored entries to editable.
-    toggle_leak_switch(&mut h, Key::TunLeakAllLabel);
-    assert!(
-        !rendered(&h, &covered_note(TUN_LEAK_ALL)),
-        "the note must clear with the covering entry"
-    );
-    assert_eq!(
-        saved_leak(),
-        vec!["udp/53", "icmp", "misconfigtun"],
-        "removing all must keep the entries it covered"
-    );
-    assert!(!named_disabled(&h, Key::TunLeakIcmpLabel));
-    assert!(!named_disabled(&h, Key::TunLeakWindnsClientLabel));
-    assert!(!leak_row_delete_disabled(&h, 0));
-}
-
-#[test]
-fn an_unprefixed_allexceptlan_disables_the_dns_entries_and_icmp_only() {
     let mut settings = tun_settings();
-    settings.tun.auto_system_wfp_block_leak = vec![
-        TUN_LEAK_ALL_EXCEPT_LAN.to_string(),
-        "udp/53".to_string(),
-        "tcp/853".to_string(),
-        "tcp/443".to_string(),
-        TUN_LEAK_ICMP.to_string(),
-        TUN_LEAK_MISCONFIG_TUN.to_string(),
-    ];
+    settings.tun.auto_system_wfp_block_leak = details.clone();
     let (_lock, _tmp, mut h) = boot(settings);
 
+    // The detail list selects the custom scope and renders its editor.
+    assert!(scope_checked(&h, Key::TunLeakScopeCustomLabel));
+    assert!(detail_visible(&h));
+    assert_eq!(detail_rows(&h), 1, "only udp/53 is a detail row");
+
+    // Selecting `all` appends its spelling and hides the whole editor.
+    select_scope(&mut h, Key::TunLeakScopeAllLabel);
+    let mut stored = details.clone();
+    stored.push(TUN_LEAK_ALL.to_string());
+    assert_eq!(saved_leak(), stored);
+    assert!(scope_checked(&h, Key::TunLeakScopeAllLabel));
+    assert!(!detail_visible(&h), "the whole detail editor must hide");
+    assert_eq!(detail_rows(&h), 0);
     assert!(
-        rendered(&h, &covered_note(TUN_LEAK_ALL_EXCEPT_LAN)),
-        "the covered entries must name allexceptlan"
+        rendered(&h, &hidden_note(details.len())),
+        "the note must count the entries the scope hides"
     );
 
-    assert!(named_disabled(&h, Key::TunLeakWindnsClientLabel));
-    assert!(named_disabled(&h, Key::TunLeakIcmpLabel));
-    for key in [
-        Key::TunLeakAllLabel,
-        Key::TunLeakAllExceptLanLabel,
-        Key::TunLeakMisconfigLabel,
-    ] {
-        assert!(
-            !named_disabled(&h, key),
-            "{key:?} is not a DNS entry the alias covers"
-        );
-    }
-    // The DNS port rows are covered, while another port stays editable.
-    assert!(leak_row_delete_disabled(&h, 0), "udp/53 is a DNS entry");
-    assert!(leak_row_delete_disabled(&h, 1), "tcp/853 is a DNS entry");
-    assert!(
-        !leak_row_delete_disabled(&h, 2),
-        "tcp/443 is not a DNS entry"
-    );
-
-    // Removing the covering entry restores every stored entry, and nothing
-    // was deleted by the state.
-    assert_eq!(saved_leak().len(), 6);
-    toggle_leak_switch(&mut h, Key::TunLeakAllExceptLanLabel);
+    // The emitted document keeps every hidden entry.
     assert_eq!(
-        saved_leak(),
-        vec!["udp/53", "tcp/853", "tcp/443", "icmp", "misconfigtun"],
-        "removing allexceptlan must keep the entries it covered"
+        saved_wire_leak(),
+        serde_json::json!(stored),
+        "the emitted list must still carry every hidden entry"
     );
-    assert!(!named_disabled(&h, Key::TunLeakIcmpLabel));
-    assert!(!leak_row_delete_disabled(&h, 0));
+
+    // Removing the scope restores the stored entries to the editor.
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    assert_eq!(saved_leak(), details);
+    assert!(detail_visible(&h));
+    assert_eq!(detail_rows(&h), 1);
+    assert!(!rendered(&h, &hidden_note(details.len())));
 }
 
 #[test]
-fn a_prefixed_all_or_allexceptlan_covers_no_other_entry() {
-    for covering in ["1.1.1.0/24:all", "[::/0]:allexceptlan"] {
-        let mut settings = tun_settings();
-        settings.tun.auto_system_wfp_block_leak = vec![
-            covering.to_string(),
-            "udp/53".to_string(),
-            TUN_LEAK_ICMP.to_string(),
-            TUN_LEAK_MISCONFIG_TUN.to_string(),
-        ];
-        let (_lock, _tmp, h) = boot(settings);
+fn the_alias_hides_every_dns_spelling_it_contains() {
+    let details: Vec<String> = [
+        TUN_LEAK_ALL_EXCEPT_LAN,
+        "53",
+        "1.1.1.0/24:tcp/53",
+        TUN_LEAK_WINDNS_CLIENT,
+        "tcp/443",
+    ]
+    .map(String::from)
+    .to_vec();
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = details.clone();
+    let (_lock, _tmp, mut h) = boot(settings);
 
-        for value in [TUN_LEAK_ALL, TUN_LEAK_ALL_EXCEPT_LAN] {
-            assert!(
-                !rendered(&h, &covered_note(value)),
-                "{covering} must not cover other entries"
-            );
-        }
-        for key in [
-            Key::TunLeakAllLabel,
-            Key::TunLeakAllExceptLanLabel,
-            Key::TunLeakIcmpLabel,
-        ] {
-            assert!(
-                !named_disabled(&h, key),
-                "{covering} must leave {key:?} editable"
-            );
-        }
-        assert!(
-            !leak_row_delete_disabled(&h, 0),
-            "{covering} must leave the port row editable"
-        );
+    // Bare and prefixed DNS forms, and the DNS Client switch, are contained by
+    // the alias; only the non-DNS port stays editable.
+    assert!(scope_checked(&h, Key::TunLeakScopeAllExceptLanLabel));
+    assert!(rendered(&h, t(Language::En, Key::TunLeakDnsIncludedNote)));
+    assert_eq!(detail_rows(&h), 1);
+    assert!(
+        h.query_by_role_and_label(
+            Role::CheckBox,
+            t(Language::En, Key::TunLeakWindnsClientLabel)
+        )
+        .is_none()
+    );
+    assert_eq!(saved_leak(), details);
+
+    // Custom shows every stored spelling again; nothing was deleted.
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    assert_eq!(
+        saved_leak(),
+        vec![
+            "53".to_string(),
+            "1.1.1.0/24:tcp/53".to_string(),
+            TUN_LEAK_WINDNS_CLIENT.to_string(),
+            "tcp/443".to_string(),
+        ]
+    );
+    assert_eq!(detail_rows(&h), 3);
+    assert!(!rendered(&h, t(Language::En, Key::TunLeakDnsIncludedNote)));
+}
+
+#[test]
+fn an_invalid_entry_stays_editable_under_every_scope() {
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak =
+        vec![TUN_LEAK_ALL.to_string(), "bogus".into(), "udp/53".into()];
+    let (_lock, _tmp, h) = boot(settings);
+
+    // `all` contains the valid entries but not the broken one: the editor
+    // renders that row for repair, while the contained entry is counted as
+    // hidden and the add controls stay away (anything added would be hidden).
+    assert!(scope_checked(&h, Key::TunLeakScopeAllLabel));
+    assert_eq!(detail_rows(&h), 1);
+    assert!(rendered(&h, &hidden_note(1)));
+    assert!(saved_leak().contains(&"bogus".to_string()));
+    assert!(
+        h.query_by_role_and_label(Role::CheckBox, t(Language::En, Key::TunLeakIcmpLabel))
+            .is_none(),
+        "the named switches are contained by all"
+    );
+    assert!(
+        h.query_by_role_and_label(Role::Button, t(Language::En, Key::TunLeakAddPort))
+            .is_none(),
+        "all offers no add control"
+    );
+}
+
+#[test]
+fn selecting_allexceptlan_keeps_the_detail_editable() {
+    let details: Vec<String> = ["udp/53", "tcp/443"].map(String::from).to_vec();
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = details.clone();
+    let (_lock, _tmp, mut h) = boot(settings);
+
+    select_scope(&mut h, Key::TunLeakScopeAllExceptLanLabel);
+    let mut stored = details.clone();
+    stored.push(TUN_LEAK_ALL_EXCEPT_LAN.to_string());
+    assert_eq!(saved_leak(), stored);
+    assert!(scope_checked(&h, Key::TunLeakScopeAllExceptLanLabel));
+    assert!(
+        detail_visible(&h),
+        "the alias leaves LAN blocking to the detail entries"
+    );
+    // The DNS port row is implied by the alias and omitted; the non-DNS port
+    // row stays editable.
+    assert_eq!(detail_rows(&h), 1);
+    assert!(rendered(&h, t(Language::En, Key::TunLeakDnsIncludedNote)));
+    assert!(
+        h.query_by_role_and_label(
+            Role::CheckBox,
+            t(Language::En, Key::TunLeakWindnsClientLabel)
+        )
+        .is_none(),
+        "the DNS Client control would read off while the alias blocks it"
+    );
+    assert!(
+        !rendered(&h, &hidden_note(2)),
+        "nothing is hidden under the alias"
+    );
+
+    // A detail entry still adds LAN-level blocking, so ICMP can join the alias.
+    toggle_leak_switch(&mut h, Key::TunLeakIcmpLabel);
+    let mut with_icmp = details.clone();
+    with_icmp.push(TUN_LEAK_ALL_EXCEPT_LAN.to_string());
+    with_icmp.push("icmp".to_string());
+    assert_eq!(saved_leak(), with_icmp);
+    assert_eq!(saved_wire_leak(), serde_json::json!(with_icmp));
+    assert_eq!(detail_rows(&h), 1);
+
+    // The custom scope drops only the alias; every detail stays.
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    let mut custom = details;
+    custom.push("icmp".to_string());
+    assert_eq!(saved_leak(), custom);
+    assert!(detail_visible(&h));
+    assert_eq!(detail_rows(&h), 2);
+    assert!(!rendered(&h, t(Language::En, Key::TunLeakDnsIncludedNote)));
+}
+
+#[test]
+fn a_prefixed_scope_value_keeps_the_custom_scope() {
+    let details: Vec<String> = ["1.1.1.0/24:all", "[::/0]:allexceptlan", "udp/53"]
+        .map(String::from)
+        .to_vec();
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = details.clone();
+    let (_lock, _tmp, mut h) = boot(settings);
+
+    // A prefixed form limits itself to its own addresses, so it is a detail
+    // entry and the editor stays open.
+    assert!(scope_checked(&h, Key::TunLeakScopeCustomLabel));
+    assert!(detail_visible(&h));
+    assert_eq!(detail_rows(&h), 3);
+
+    // Selecting a scope leaves the prefixed values alone and adds the
+    // unprefixed spelling; the note counts every detail entry, prefixed or
+    // not.
+    select_scope(&mut h, Key::TunLeakScopeAllLabel);
+    let mut stored = details.clone();
+    stored.push(TUN_LEAK_ALL.to_string());
+    assert_eq!(saved_leak(), stored);
+    assert!(rendered(&h, &hidden_note(3)));
+    assert!(!detail_visible(&h));
+
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+    assert_eq!(saved_leak(), details);
+    assert_eq!(detail_rows(&h), 3);
+}
+
+#[test]
+fn the_scope_radio_reflects_the_stored_list() {
+    for (leak, key) in [
+        (vec![TUN_LEAK_ALL.to_string()], Key::TunLeakScopeAllLabel),
+        (
+            vec![TUN_LEAK_ALL_EXCEPT_LAN.to_string()],
+            Key::TunLeakScopeAllExceptLanLabel,
+        ),
+        (Vec::new(), Key::TunLeakScopeCustomLabel),
+        (
+            vec![
+                TUN_LEAK_ALL_EXCEPT_LAN.to_string(),
+                TUN_LEAK_ALL.to_string(),
+            ],
+            Key::TunLeakScopeAllLabel,
+        ),
+    ] {
+        let mut settings = tun_settings();
+        settings.tun.auto_system_wfp_block_leak = leak.clone();
+        let (_lock, _tmp, h) = boot(settings);
+        assert!(scope_checked(&h, key), "{leak:?} must select {key:?}");
     }
 }

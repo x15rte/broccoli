@@ -2,10 +2,10 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{
-    DNS_LEAK_ENTRY_LIST, LeakPort, TUN_LEAK_ALL, TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_ICMP,
-    TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT, canonical_leak_entry,
-    canonicalize_leak_entries, leak_covering_entry, leak_entry_covered, leak_port,
-    next_free_leak_port, next_free_leak_range,
+    LeakPort, LeakScope, TUN_LEAK_ICMP, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT,
+    canonical_leak_entry, canonicalize_leak_entries, is_unprefixed_scope_entry, leak_hidden_count,
+    leak_port, leak_scope, leak_scope_hides, next_free_leak_port, next_free_leak_range,
+    set_leak_scope,
 };
 use crate::model::settings::Language;
 use crate::model::validation::{FindingTarget, ValidationCode};
@@ -75,35 +75,49 @@ struct NamedLeak {
     note: Key,
 }
 
-/// The named leak values the editor offers as toggles, in the order the
-/// core's grammar names them (`parseLeak`, proxy/tun/wfp_leak.go). `dns` is
-/// the alias the app stores expanded, so it has no switch of its own.
-const NAMED_LEAKS: [NamedLeak; 5] = [
-    NamedLeak {
-        value: TUN_LEAK_WINDNS_CLIENT,
-        label: Key::TunLeakWindnsClientLabel,
-        note: Key::TunLeakWindnsClientNote,
-    },
+/// The named value the DNS group offers: Windows' DNS Client service, whose
+/// own queries can use protocols and ports a port filter does not see
+/// (`dnsLeaks`, proxy/tun/wfp_leak.go).
+const DNS_LEAK_SWITCH: NamedLeak = NamedLeak {
+    value: TUN_LEAK_WINDNS_CLIENT,
+    label: Key::TunLeakWindnsClientLabel,
+    note: Key::TunLeakWindnsClientNote,
+};
+
+/// The named values outside the DNS group, in the order the core's grammar
+/// names them (`parseLeak`, proxy/tun/wfp_leak.go).
+const OTHER_LEAK_SWITCHES: [NamedLeak; 2] = [
     NamedLeak {
         value: TUN_LEAK_MISCONFIG_TUN,
         label: Key::TunLeakMisconfigLabel,
         note: Key::TunLeakMisconfigNote,
     },
     NamedLeak {
-        value: TUN_LEAK_ALL,
-        label: Key::TunLeakAllLabel,
-        note: Key::TunLeakAllNote,
-    },
-    NamedLeak {
-        value: TUN_LEAK_ALL_EXCEPT_LAN,
-        label: Key::TunLeakAllExceptLanLabel,
-        note: Key::TunLeakAllExceptLanNote,
-    },
-    NamedLeak {
         value: TUN_LEAK_ICMP,
         label: Key::TunLeakIcmpLabel,
         note: Key::TunLeakIcmpNote,
     },
+];
+
+/// The scope options in display order: the derived scope, the radio label, and
+/// the note the row carries on hover. The scope is read from the stored list,
+/// so no separate choice is persisted.
+const LEAK_SCOPES: [(LeakScope, Key, Key); 3] = [
+    (
+        LeakScope::Custom,
+        Key::TunLeakScopeCustomLabel,
+        Key::TunLeakScopeCustomNote,
+    ),
+    (
+        LeakScope::All,
+        Key::TunLeakScopeAllLabel,
+        Key::TunLeakScopeAllNote,
+    ),
+    (
+        LeakScope::AllExceptLan,
+        Key::TunLeakScopeAllExceptLanLabel,
+        Key::TunLeakScopeAllExceptLanNote,
+    ),
 ];
 
 /// One raw row's edit buffer: the draft text plus the stored spelling it grew
@@ -124,73 +138,55 @@ impl LeakDraft {
     }
 }
 
-/// The leak block: the named values as checkboxes over the stored list, the
-/// port rows as a protocol, a port or range, and a raw row for the forms the
-/// controls cannot express, such as a CIDR-prefixed value. Every authored
-/// value goes through the model's parser, so the stored list and the
-/// generated document never carry a spelling the core would refuse. An entry
-/// an unprefixed `all` or `allexceptlan` already covers renders disabled and
-/// stays in the list.
+/// The leak block: a scope selector over the stored list, and, unless the
+/// scope is `Everything outside the tunnel`, the detail editor grouped by what
+/// each row controls. Every authored value goes through the model's parser, so
+/// the stored list and the generated document never carry a spelling the core
+/// would refuse. The scope owns the unprefixed `all` and `allexceptlan`
+/// entries; every other entry is detail, stays stored under any scope, and is
+/// edited under `Custom` and `Everything except the local network`. Only `all`
+/// makes a detail entry redundant; under `allexceptlan` an entry still blocks
+/// inside the local network, which the scope leaves open.
 fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
-    let covering = leak_covering_entry(entries);
-    if let Some(covering) = covering {
-        ui.label(
-            egui::RichText::new(t_fmt(lang, Key::TunLeakCoveredNote, &[&covering]))
-                .small()
-                .color(status_colors_of(ui).warn),
-        );
-    }
-
     let mut changed = false;
-    for named in NAMED_LEAKS {
-        let enabled = !leak_entry_covered(entries, named.value);
-        changed |= leak_switch(ui, lang, entries, named, enabled);
+    let previous = leak_scope(entries);
+    let mut scope = previous;
+    for (value, label, note) in LEAK_SCOPES {
+        changed |= widgets::noted(ui, t(lang, note), |ui| {
+            ui.radio_value(&mut scope, value, t(lang, label))
+        })
+        .changed();
     }
-
-    // The rows come from the list, so each row's coverage is read before the
-    // loop borrows the list mutably. Only a covering entry can cover a row, so
-    // the common case allocates nothing.
-    let covered: Option<Vec<bool>> = covering.map(|_| {
-        entries
-            .iter()
-            .map(|entry| leak_entry_covered(entries, entry))
-            .collect()
-    });
-    let mut remove = None;
-    let mut replace = None;
-    for (index, entry) in entries.iter_mut().enumerate() {
-        // A named value is its checkbox above; a row for it would edit the
-        // same value twice.
-        if NAMED_LEAKS.iter().any(|named| fold_eq(entry, named.value)) {
-            continue;
+    if scope != previous {
+        // Switching rewrites the scope values alone: the detail list is never
+        // touched, so it reappears unchanged under `Custom`.
+        set_leak_scope(entries, scope);
+        changed = true;
+    }
+    match scope {
+        LeakScope::Custom | LeakScope::AllExceptLan => {
+            changed |= leak_detail_editor(ui, lang, entries, scope);
         }
-        let enabled = !covered.as_ref().is_some_and(|covered| covered[index]);
-        ui.horizontal(|ui| {
-            if let Some(port) = leak_port(entry) {
-                changed |= leak_port_row(ui, lang, index, port, entry, enabled);
-            } else if let Some(values) = leak_raw_row(ui, index, entry, enabled) {
-                replace = Some((index, values));
+        LeakScope::All => {
+            // A valid entry is contained by the scope; an invalid one is not,
+            // and the user must be able to repair it.
+            let repairs = entries
+                .iter()
+                .any(|entry| !is_unprefixed_scope_entry(entry) && !leak_scope_hides(scope, entry));
+            if repairs {
+                changed |= leak_detail_editor(ui, lang, entries, scope);
             }
-            leak_delete(ui, lang, index, enabled, &mut remove);
-        });
+            let hidden = leak_hidden_count(scope, entries);
+            // The selected scope and its hover already explain an empty
+            // detail list, so the note appears only when entries stay behind.
+            if hidden > 0 {
+                let count = hidden.to_string();
+                ui.label(
+                    egui::RichText::new(t_fmt(lang, Key::TunLeakHiddenNote, &[&count])).small(),
+                );
+            }
+        }
     }
-    if let Some(index) = remove {
-        entries.remove(index);
-        changed = true;
-    }
-    if let Some((index, values)) = replace {
-        entries.splice(index..=index, values);
-        changed = true;
-    }
-    if ui.button(t(lang, Key::TunLeakAddPort)).clicked() {
-        entries.push(next_free_leak_port(entries).to_string());
-        changed = true;
-    }
-    if ui.button(t(lang, Key::TunLeakAddRange)).clicked() {
-        entries.push(next_free_leak_range(entries).to_string());
-        changed = true;
-    }
-    changed |= leak_raw_add(ui, lang, entries);
     if changed {
         // The parser owns the stored spelling: a port is written from its
         // number, a CIDR is masked, an alias is expanded, and a duplicate is
@@ -200,20 +196,151 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
     changed
 }
 
+/// The detail editor under a scope that keeps entries: the DNS entries (or a
+/// note when the scope already blocks them), the other named values, the port
+/// rows, and the text rows. Visibility is the model's containment relation
+/// ([`leak_scope_hides`]): a control appears only when its entry adds a block
+/// the scope does not already produce, so no control ever reads off while the
+/// scope blocks it. Invalid entries stay visible under every scope for repair.
+fn leak_detail_editor(
+    ui: &mut egui::Ui,
+    lang: Language,
+    entries: &mut Vec<String>,
+    scope: LeakScope,
+) -> bool {
+    let all_scope = scope == LeakScope::All;
+    let dns_included = scope == LeakScope::AllExceptLan;
+    let mut dns_rows = Vec::new();
+    let mut port_rows = Vec::new();
+    let mut text_rows = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        // Named values own a switch; the unprefixed scope values own the radio;
+        // an entry the scope contains is hidden by definition.
+        if is_named_leak(entry)
+            || is_unprefixed_scope_entry(entry)
+            || leak_scope_hides(scope, entry)
+        {
+            continue;
+        }
+        match leak_port(entry) {
+            Some(port) if port.low() == port.high() && matches!(port.low(), 53 | 853) => {
+                dns_rows.push(index);
+            }
+            Some(_) => port_rows.push(index),
+            None => text_rows.push(index),
+        }
+    }
+
+    let mut changed = false;
+    let mut remove = None;
+    let mut replace = None;
+
+    // The DNS group exists only where its controls add something: Custom owns
+    // them; `allexceptlan` already blocks them and says so; `all` hides them.
+    if dns_included {
+        ui.label(egui::RichText::new(t(lang, Key::TunLeakDnsIncludedNote)).small());
+    } else if !all_scope {
+        ui.label(egui::RichText::new(t(lang, Key::TunLeakDnsHeading)).strong());
+        changed |= leak_switch(ui, lang, entries, DNS_LEAK_SWITCH);
+        for index in dns_rows {
+            changed |= leak_detail_row(ui, lang, index, entries, &mut remove, &mut replace);
+        }
+    }
+
+    let other_switches: Vec<NamedLeak> = OTHER_LEAK_SWITCHES
+        .into_iter()
+        .filter(|named| !leak_scope_hides(scope, named.value))
+        .collect();
+    if !other_switches.is_empty() {
+        ui.label(egui::RichText::new(t(lang, Key::TunLeakOtherHeading)).strong());
+        for named in other_switches {
+            changed |= leak_switch(ui, lang, entries, named);
+        }
+    }
+
+    if !port_rows.is_empty() {
+        ui.label(egui::RichText::new(t(lang, Key::TunLeakPortsHeading)).strong());
+        for index in port_rows {
+            changed |= leak_detail_row(ui, lang, index, entries, &mut remove, &mut replace);
+        }
+    }
+    if !text_rows.is_empty() {
+        ui.label(egui::RichText::new(t(lang, Key::TunLeakTextHeading)).strong());
+        for index in text_rows {
+            changed |= leak_detail_row(ui, lang, index, entries, &mut remove, &mut replace);
+        }
+    }
+
+    if let Some(index) = remove {
+        entries.remove(index);
+        changed = true;
+    }
+    if let Some((index, values)) = replace {
+        entries.splice(index..=index, values);
+        changed = true;
+    }
+    // `all` contains every valid entry a button could add, so it offers no
+    // add control; only repair rows stay editable under it.
+    if !all_scope {
+        if ui.button(t(lang, Key::TunLeakAddPort)).clicked() {
+            entries.push(next_free_leak_port(entries).to_string());
+            changed = true;
+        }
+        if ui.button(t(lang, Key::TunLeakAddRange)).clicked() {
+            entries.push(next_free_leak_range(entries).to_string());
+            changed = true;
+        }
+        changed |= leak_raw_add(ui, lang, entries);
+    }
+    changed
+}
+
+/// Whether `entry` is one of the named values a toggle owns rather than a
+/// detail row.
+fn is_named_leak(entry: &str) -> bool {
+    DNS_LEAK_SWITCH.value.eq_ignore_ascii_case(entry)
+        || OTHER_LEAK_SWITCHES
+            .iter()
+            .any(|named| named.value.eq_ignore_ascii_case(entry))
+}
+
+/// One detail row: a port row for a protocol-and-port value, a text row for
+/// everything else, and its 🗑. A text row that the parser accepts reports the
+/// values it stores instead of writing them itself.
+fn leak_detail_row(
+    ui: &mut egui::Ui,
+    lang: Language,
+    index: usize,
+    entries: &mut [String],
+    remove: &mut Option<usize>,
+    replace: &mut Option<(usize, Vec<String>)>,
+) -> bool {
+    let entry = &mut entries[index];
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        if let Some(port) = leak_port(entry) {
+            changed = leak_port_row(ui, lang, index, port, entry);
+        } else if let Some(values) = leak_raw_row(ui, index, entry) {
+            *replace = Some((index, values));
+        }
+        leak_delete(ui, lang, index, remove);
+    });
+    changed
+}
+
 /// One named leak entry as a checkbox over the stored list: on appends the
 /// core's spelling, off removes every spelling of it. The note says what the
 /// entry closes, on hover, because it is one line of policy rather than a
-/// control the label can carry. A covered entry stays visible but disabled.
+/// control the label can carry.
 fn leak_switch(
     ui: &mut egui::Ui,
     lang: Language,
     entries: &mut Vec<String>,
     named: NamedLeak,
-    enabled: bool,
 ) -> bool {
     let mut on = entries.iter().any(|kept| fold_eq(kept, named.value));
     let toggled = widgets::noted(ui, t(lang, named.note), |ui| {
-        ui.add_enabled(enabled, egui::Checkbox::new(&mut on, t(lang, named.label)))
+        ui.checkbox(&mut on, t(lang, named.label))
     })
     .changed();
     if !toggled {
@@ -235,55 +362,49 @@ fn leak_port_row(
     index: usize,
     port: LeakPort,
     entry: &mut String,
-    enabled: bool,
 ) -> bool {
     let mut protocol = port.protocol();
     let mut low = port.low();
     let mut high = port.high();
     let mut changed = false;
-    ui.add_enabled_ui(enabled, |ui| {
-        egui::ComboBox::from_id_salt(("leak-protocol", index))
-            .selected_text(leak_protocol_label(lang, protocol))
-            .show_ui(ui, |ui| {
-                for candidate in [Some("tcp"), Some("udp"), None] {
-                    if ui
-                        .selectable_label(
-                            protocol == candidate,
-                            leak_protocol_label(lang, candidate),
-                        )
-                        .clicked()
-                        && protocol != candidate
-                    {
-                        protocol = candidate;
-                        changed = true;
-                    }
+    egui::ComboBox::from_id_salt(("leak-protocol", index))
+        .selected_text(leak_protocol_label(lang, protocol))
+        .show_ui(ui, |ui| {
+            for candidate in [Some("tcp"), Some("udp"), None] {
+                if ui
+                    .selectable_label(protocol == candidate, leak_protocol_label(lang, candidate))
+                    .clicked()
+                    && protocol != candidate
+                {
+                    protocol = candidate;
+                    changed = true;
                 }
-            });
-        let mut range = high != low;
-        if ui
-            .checkbox(&mut range, t(lang, Key::TunLeakRangeLabel))
-            .changed()
-        {
-            high = if range {
-                low.checked_add(1).unwrap_or(low)
-            } else {
-                low
-            };
-            changed = true;
-        }
-        if high != low {
-            changed |= ui
-                .add(egui::DragValue::new(&mut low).range(1..=high))
-                .changed();
-            changed |= ui
-                .add(egui::DragValue::new(&mut high).range(low..=u16::MAX))
-                .changed();
+            }
+        });
+    let mut range = high != low;
+    if ui
+        .checkbox(&mut range, t(lang, Key::TunLeakRangeLabel))
+        .changed()
+    {
+        high = if range {
+            low.checked_add(1).unwrap_or(low)
         } else {
-            changed |= ui
-                .add(egui::DragValue::new(&mut low).range(1..=u16::MAX))
-                .changed();
-        }
-    });
+            low
+        };
+        changed = true;
+    }
+    if high != low {
+        changed |= ui
+            .add(egui::DragValue::new(&mut low).range(1..=high))
+            .changed();
+        changed |= ui
+            .add(egui::DragValue::new(&mut high).range(low..=u16::MAX))
+            .changed();
+    } else {
+        changed |= ui
+            .add(egui::DragValue::new(&mut low).range(1..=u16::MAX))
+            .changed();
+    }
     if changed {
         *entry = LeakPort::new(protocol, low, high).to_string();
     }
@@ -300,47 +421,33 @@ fn leak_protocol_label(lang: Language, protocol: Option<&'static str>) -> &'stat
 /// memory, and only a value the model's parser accepts replaces the entry, so
 /// an in-progress or refused spelling never reaches the stored list. The
 /// field reverts to the stored spelling when it loses focus.
-fn leak_raw_row(
-    ui: &mut egui::Ui,
-    index: usize,
-    entry: &mut String,
-    enabled: bool,
-) -> Option<Vec<String>> {
+fn leak_raw_row(ui: &mut egui::Ui, index: usize, entry: &mut String) -> Option<Vec<String>> {
     let id = ui.make_persistent_id(("leak-raw-row", index));
     let mut replacement = None;
-    ui.add_enabled_ui(enabled, |ui| {
-        let mut draft = ui
-            .data(|data| data.get_temp::<LeakDraft>(id))
-            .unwrap_or_else(|| LeakDraft::new(entry));
-        if draft.source != *entry {
-            draft = LeakDraft::new(entry);
-        }
-        let field =
-            ui.add(egui::TextEdit::singleline(&mut draft.text).desired_width(f32::INFINITY));
-        if field.changed()
-            && let Some(values) = canonical_leak_entry(&draft.text)
-        {
-            replacement = Some(values);
-        }
-        if field.lost_focus() {
-            draft = LeakDraft::new(entry);
-        }
-        ui.data_mut(|data| data.insert_temp(id, draft));
-    });
+    let mut draft = ui
+        .data(|data| data.get_temp::<LeakDraft>(id))
+        .unwrap_or_else(|| LeakDraft::new(entry));
+    if draft.source != *entry {
+        draft = LeakDraft::new(entry);
+    }
+    let field = ui.add(egui::TextEdit::singleline(&mut draft.text).desired_width(f32::INFINITY));
+    if field.changed()
+        && let Some(values) = canonical_leak_entry(&draft.text)
+    {
+        replacement = Some(values);
+    }
+    if field.lost_focus() {
+        draft = LeakDraft::new(entry);
+    }
+    ui.data_mut(|data| data.insert_temp(id, draft));
     replacement
 }
 
-/// One row's 🗑: disabled while a covering entry owns the value.
-fn leak_delete(
-    ui: &mut egui::Ui,
-    lang: Language,
-    index: usize,
-    enabled: bool,
-    remove: &mut Option<usize>,
-) {
+/// One row's 🗑.
+fn leak_delete(ui: &mut egui::Ui, lang: Language, index: usize, remove: &mut Option<usize>) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if ui
-            .add_enabled(enabled, egui::Button::new(t(lang, Key::DeleteRow)).small())
+            .add(egui::Button::new(t(lang, Key::DeleteRow)).small())
             .clicked()
         {
             *remove = Some(index);
@@ -364,12 +471,7 @@ fn leak_raw_add(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
         )
         .labelled_by(label.id);
         let values = canonical_leak_entry(&draft);
-        if ui
-            .add_enabled(
-                values.is_some(),
-                egui::Button::new(t(lang, Key::TunLeakAddEntry)),
-            )
-            .clicked()
+        if ui.button(t(lang, Key::TunLeakAddEntry)).clicked()
             && let Some(values) = values
         {
             entries.extend(values);
@@ -546,14 +648,15 @@ impl TunScreen {
         let tun = &mut ctx.settings.tun;
 
         // The leak block sits right under the privacy banner it feeds. The
-        // named values are checkboxes, a port entry is a protocol and a port
-        // or range, and a CIDR-prefixed or unparseable entry stays an editable
-        // raw row. Each edit writes the model directly, so the state survives
-        // a restart and reaches the generator; the privacy banner reads the
-        // same model through the safety pass. An entry an unprefixed `all` or
-        // `allexceptlan` covers renders disabled but stays in the list.
+        // scope selector reads the stored list and owns its unprefixed `all`
+        // and `allexceptlan` values; under the custom scope the detail editor
+        // groups the remaining entries by what they control. Each edit writes
+        // the model directly, so the state survives a restart and reaches the
+        // generator; the privacy banner reads the same model through the
+        // safety pass. A non-custom scope hides the detail list but never
+        // removes it, and no control is ever disabled.
         widgets::section(ui, t(lang, Key::TunSectionLeakBlock), |ui| {
-            let hint = t_fmt(lang, Key::TunLeakEntriesHint, &[&*DNS_LEAK_ENTRY_LIST]);
+            let hint = t(lang, Key::TunLeakEntriesHint);
             ui.label(egui::RichText::new(hint).small());
             changed |= leak_entries(ui, lang, &mut tun.auto_system_wfp_block_leak);
             // The settings pass's blocking findings — an entry outside the
@@ -1043,52 +1146,110 @@ mod tests {
         screen_harness_at(egui::vec2(900.0, 3200.0), rig, TunScreen::default())
     }
 
-    /// The leak block is two checkboxes over the stored list plus one row per
-    /// port. A checkbox toggles its named entry, a row's 🗑 removes exactly
-    /// that port, and the one add button appends the lowest port the list does
-    /// not hold yet.
+    /// The toggled state of the radio the label names.
+    fn radio_checked(harness: &Harness<'static, (TunScreen, UiTestRig)>, label: &str) -> bool {
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::RadioButton, label)
+            .accesskit_node()
+            .toggled()
+            .is_some_and(|toggled| matches!(toggled, egui::accesskit::Toggled::True))
+    }
+
+    /// The leak block opens on the scope its stored list states. The default
+    /// list is `allexceptlan` plus the family guard, so the screen opens on
+    /// that scope with the detail editor visible, the DNS controls replaced by
+    /// their note, and no hidden note (nothing is hidden).
     #[test]
-    fn the_leak_block_renders_switches_rows_and_adds_a_free_port() {
+    fn the_leak_block_opens_on_the_stored_scope() {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
-        let mut harness = leak_harness(rig);
+        let harness = leak_harness(rig);
 
-        let hint = t_fmt(
-            Language::En,
-            Key::TunLeakEntriesHint,
-            &[&*DNS_LEAK_ENTRY_LIST],
-        );
+        let hint = t(Language::En, Key::TunLeakEntriesHint);
         assert!(
-            harness.query_by_label(hint.as_str()).is_some(),
+            harness.query_by_label(hint).is_some(),
             "the section carries its one entry-list hint"
         );
-        for label in [Key::TunLeakWindnsClientLabel, Key::TunLeakMisconfigLabel] {
-            assert_eq!(
-                checked(&harness, t(Language::En, label)),
-                Some(true),
-                "the seeded list carries {label:?}, so its checkbox reads on"
+        assert!(
+            radio_checked(
+                &harness,
+                t(Language::En, Key::TunLeakScopeAllExceptLanLabel)
+            ),
+            "the seeded alias selects its own scope"
+        );
+        assert!(!radio_checked(
+            &harness,
+            t(Language::En, Key::TunLeakScopeCustomLabel)
+        ));
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunLeakDnsIncludedNote))
+                .is_some(),
+            "the alias already blocks DNS, so its controls give way to the note"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::TunLeakOtherHeading))
+                .is_some(),
+            "the detail editor stays open for entries the alias leaves alone"
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::CheckBox,
+                    t(Language::En, Key::TunLeakWindnsClientLabel),
+                )
+                .is_none(),
+            "the DNS Client control would read off while the alias blocks it"
+        );
+        let note = t_fmt(Language::En, Key::TunLeakHiddenNote, &[&"0"]);
+        assert!(
+            harness.query_by_label(&note).is_none(),
+            "an empty detail list adds no hidden note"
+        );
+    }
+
+    /// The custom scope groups the detail editor: DNS, the other named values,
+    /// the port rows, and the text rows. A checkbox toggles its named entry, a
+    /// row's 🗑 removes exactly that entry, and the add button appends the
+    /// lowest free port.
+    #[test]
+    fn the_custom_scope_renders_the_grouped_detail_editor() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak = vec![
+            "udp/53".to_string(),
+            "tcp/443".to_string(),
+            "1.1.1.0/24:53".to_string(),
+        ];
+        let mut harness = leak_harness(rig);
+
+        assert!(radio_checked(
+            &harness,
+            t(Language::En, Key::TunLeakScopeCustomLabel)
+        ));
+        for heading in [
+            Key::TunLeakDnsHeading,
+            Key::TunLeakOtherHeading,
+            Key::TunLeakPortsHeading,
+            Key::TunLeakTextHeading,
+        ] {
+            assert!(
+                harness.query_by_label(t(Language::En, heading)).is_some(),
+                "the detail editor carries the {heading:?} heading"
             );
         }
-
-        // The leak section renders before every other list, so the first 🗑 on
-        // screen belongs to its first port row: the seeded `udp/53`.
-        harness
-            .query_all_by_label(t(Language::En, Key::DeleteRow))
-            .next()
-            .expect("the first leak row's delete button")
-            .click();
-        harness.run();
-        assert_eq!(
-            harness.state().1.settings.tun.auto_system_wfp_block_leak,
-            vec![
-                "tcp/53".to_string(),
-                TUN_LEAK_WINDNS_CLIENT.to_string(),
-                "tcp/853".to_string(),
-                "udp/853".to_string(),
-                TUN_LEAK_MISCONFIG_TUN.to_string(),
-            ],
-            "deleting a row must remove exactly that entry"
-        );
+        for label in [
+            Key::TunLeakWindnsClientLabel,
+            Key::TunLeakMisconfigLabel,
+            Key::TunLeakIcmpLabel,
+        ] {
+            assert_eq!(
+                checked(&harness, t(Language::En, label)),
+                Some(false),
+                "the stored list carries no {label:?} entry"
+            );
+        }
 
         // The family checkbox writes its named entry and nothing else.
         harness
@@ -1100,7 +1261,7 @@ mod tests {
         harness.run();
         let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
         assert!(
-            !leak.contains(&TUN_LEAK_MISCONFIG_TUN.to_string()),
+            leak.contains(&TUN_LEAK_MISCONFIG_TUN.to_string()),
             "{leak:?}"
         );
 
@@ -1118,6 +1279,151 @@ mod tests {
             Some("tcp/1"),
             "the add button must append the lowest free port: {leak:?}"
         );
+
+        // The leak section renders before every other list, so the first 🗑 on
+        // screen belongs to its DNS group: the stored `udp/53` row.
+        harness
+            .query_all_by_label(t(Language::En, Key::DeleteRow))
+            .next()
+            .expect("the first detail row's delete button")
+            .click();
+        harness.run();
+        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
+        assert!(
+            !leak.contains(&"udp/53".to_string()),
+            "deleting the first DNS row must remove exactly that entry: {leak:?}"
+        );
+    }
+
+    /// Switching the scope rewrites only the scope value: the detail entries
+    /// stay stored, the editor hides, the note counts them, and choosing
+    /// Custom brings every one back.
+    #[test]
+    fn the_scope_switch_hides_and_restores_the_detail_editor() {
+        let details: Vec<String> = ["udp/53", "icmp", "misconfigtun"]
+            .map(String::from)
+            .to_vec();
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak = details.clone();
+        let mut harness = leak_harness(rig);
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::RadioButton,
+                t(Language::En, Key::TunLeakScopeAllLabel),
+            )
+            .click();
+        harness.run();
+        let mut stored = details.clone();
+        stored.push("all".to_string());
+        assert_eq!(
+            harness.state().1.settings.tun.auto_system_wfp_block_leak,
+            stored
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::CheckBox,
+                    t(Language::En, Key::TunLeakWindnsClientLabel),
+                )
+                .is_none(),
+            "the whole detail editor must hide"
+        );
+        let note = t_fmt(Language::En, Key::TunLeakHiddenNote, &[&"3"]);
+        assert!(
+            harness.query_all_by_label(&note).next().is_some(),
+            "the note must count the hidden detail entries"
+        );
+
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::RadioButton,
+                t(Language::En, Key::TunLeakScopeCustomLabel),
+            )
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.settings.tun.auto_system_wfp_block_leak,
+            details
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::CheckBox,
+                    t(Language::En, Key::TunLeakWindnsClientLabel),
+                )
+                .is_some(),
+            "the detail editor must come back"
+        );
+        assert!(harness.query_all_by_label(&note).next().is_none());
+    }
+
+    /// No control in the leak editor renders disabled, whatever the stored
+    /// list: the old covered state disabled entries and the raw add button
+    /// waited for a valid draft.
+    #[test]
+    fn the_leak_editor_disables_no_control() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak = vec!["all".to_string(), "udp/53".to_string()];
+        let mut harness = leak_harness(rig);
+
+        // Under a policy scope: the three radios stay enabled.
+        for key in [
+            Key::TunLeakScopeCustomLabel,
+            Key::TunLeakScopeAllLabel,
+            Key::TunLeakScopeAllExceptLanLabel,
+        ] {
+            assert!(
+                !harness
+                    .get_by_role_and_label(egui::accesskit::Role::RadioButton, t(Language::En, key))
+                    .accesskit_node()
+                    .is_disabled(),
+                "{key:?} must stay enabled"
+            );
+        }
+
+        // Under Custom: every checkbox, row control, and add button is live.
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::RadioButton,
+                t(Language::En, Key::TunLeakScopeCustomLabel),
+            )
+            .click();
+        harness.run();
+        for key in [
+            Key::TunLeakWindnsClientLabel,
+            Key::TunLeakMisconfigLabel,
+            Key::TunLeakIcmpLabel,
+        ] {
+            assert!(
+                !harness
+                    .get_by_role_and_label(egui::accesskit::Role::CheckBox, t(Language::En, key))
+                    .accesskit_node()
+                    .is_disabled(),
+                "{key:?} must stay enabled"
+            );
+        }
+        for key in [
+            Key::TunLeakAddPort,
+            Key::TunLeakAddRange,
+            Key::TunLeakAddEntry,
+        ] {
+            assert!(
+                !harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, key))
+                    .accesskit_node()
+                    .is_disabled(),
+                "{key:?} must stay enabled"
+            );
+        }
+        for button in harness.query_all_by_label(t(Language::En, Key::DeleteRow)) {
+            assert!(
+                !button.accesskit_node().is_disabled(),
+                "a row's delete button must stay enabled"
+            );
+        }
     }
 
     /// The two settings-verdict rules this screen renders — the IPv4 gateway
@@ -1326,17 +1632,20 @@ mod tests {
         );
     }
 
-    /// Each fixed-token row carries its note on the row hover: the note names
-    /// what the entry closes and what it needs, and costs no permanent line.
+    /// Each named value and each scope option carries its note on the row
+    /// hover: the note names what the entry closes or what the scope keeps
+    /// open, and costs no permanent line.
     #[test]
     fn leak_switch_notes_ride_the_checkbox_hover() {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak.clear();
         let mut harness = leak_harness(rig);
 
         for (label, note) in [
             (Key::TunLeakWindnsClientLabel, Key::TunLeakWindnsClientNote),
             (Key::TunLeakMisconfigLabel, Key::TunLeakMisconfigNote),
+            (Key::TunLeakIcmpLabel, Key::TunLeakIcmpNote),
         ] {
             let note = t(Language::En, note);
             assert!(
@@ -1350,6 +1659,29 @@ mod tests {
             assert!(
                 harness.query_all_by_label(note).next().is_some(),
                 "the checkbox hover must carry its note"
+            );
+        }
+
+        for (label, note) in [
+            (Key::TunLeakScopeCustomLabel, Key::TunLeakScopeCustomNote),
+            (Key::TunLeakScopeAllLabel, Key::TunLeakScopeAllNote),
+            (
+                Key::TunLeakScopeAllExceptLanLabel,
+                Key::TunLeakScopeAllExceptLanNote,
+            ),
+        ] {
+            let note = t(Language::En, note);
+            assert!(
+                harness.query_by_label(note).is_none(),
+                "the scope note must not be a permanent line"
+            );
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::RadioButton, t(Language::En, label))
+                .hover();
+            harness.run();
+            assert!(
+                harness.query_all_by_label(note).next().is_some(),
+                "the scope hover must carry its note"
             );
         }
     }

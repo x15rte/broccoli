@@ -355,13 +355,16 @@ fn settings_extra_shadow(
     }
 }
 
-/// True when the emitted document carries the leak block without the
-/// unrouted-family entry — the state [`ValidationCode::TunLeakMisconfigTunOff`]
-/// reports. The generator writes the key only while the TUN inbound and the
-/// DNS module are both present (`emit::dns_inbound_emitted`), so this is the
-/// exact predicate the settings pass judges.
+/// True when the emitted document carries the leak block without anything
+/// that keeps an unrouted address family inside the tunnel — the state
+/// [`ValidationCode::TunLeakMisconfigTunOff`] reports. A non-custom scope
+/// blocks every destination outside the local network, so it satisfies the
+/// advisory as the `misconfigtun` entry does. The generator writes the key
+/// only while the TUN inbound and the DNS module are both present
+/// (`emit::dns_inbound_emitted`), so this is the exact predicate the settings
+/// pass judges.
 fn tun_leak_misconfig_tun_off(settings: &Settings) -> bool {
-    emit::dns_inbound_emitted(settings) && !settings.tun.leak_blocks_misconfig_tun()
+    emit::dns_inbound_emitted(settings) && !settings.tun.leak_blocks_unrouted_family()
 }
 
 /// Canonical form of a Windows socket path (case-folded, `/` → `\`,

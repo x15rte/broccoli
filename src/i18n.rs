@@ -484,19 +484,26 @@ keys! {
     TunDnsTakeoverLabel 0,
     TunDnsTakeoverNote 0,
     TunDnsTakeoverOffWarning 0,
-    TunLeakEntriesHint 1,
+    TunLeakEntriesHint 0,
     TunLeakAddPort 0,
     TunLeakWindnsClientLabel 0,
     TunLeakWindnsClientNote 0,
     TunLeakMisconfigLabel 0,
     TunLeakMisconfigNote 0,
-    TunLeakAllLabel 0,
-    TunLeakAllNote 0,
-    TunLeakAllExceptLanLabel 0,
-    TunLeakAllExceptLanNote 0,
+    TunLeakScopeCustomLabel 0,
+    TunLeakScopeCustomNote 0,
+    TunLeakScopeAllLabel 0,
+    TunLeakScopeAllNote 0,
+    TunLeakScopeAllExceptLanLabel 0,
+    TunLeakScopeAllExceptLanNote 0,
+    TunLeakDnsIncludedNote 0,
+    TunLeakDnsHeading 0,
+    TunLeakOtherHeading 0,
+    TunLeakPortsHeading 0,
+    TunLeakTextHeading 0,
     TunLeakIcmpLabel 0,
     TunLeakIcmpNote 0,
-    TunLeakCoveredNote 1,
+    TunLeakHiddenNote 1,
     TunLeakRangeLabel 0,
     TunLeakBothProtocols 0,
     TunLeakAddRange 0,
@@ -3589,7 +3596,7 @@ mod en {
             Key::TunAutoOutboundsMissing => {
                 "'{0}' no longer exists. Pick an active interface or 'auto'."
             }
-            Key::TunSectionLeakBlock => "Leak block",
+            Key::TunSectionLeakBlock => "Block leaks",
             Key::TunSectionApp => "broccoli",
             Key::TunAppNote => "Handled by broccoli, not Xray.",
             Key::TunDnsTakeoverLabel => "take over the system DNS while TUN runs",
@@ -3603,47 +3610,54 @@ mod en {
                  wait about ten seconds on other adapters' blocked resolvers."
             }
             Key::TunLeakEntriesHint => {
-                "The core drops the listed traffic outside the tunnel. dns stands for {}, and a \
-                 profile saves those entries."
+                "The core blocks traffic that tries to leave through another adapter. The dns \
+                 entry covers ports 53 and 853 and the Windows DNS Client service. A profile \
+                 stores those five entries rather than dns."
             }
-            Key::TunLeakAddPort => "Add a port",
-            Key::TunLeakWindnsClientLabel => "keep the DNS Client service inside the tunnel",
+            Key::TunLeakAddPort => "Add port",
+            Key::TunLeakWindnsClientLabel => "Block the Windows DNS Client service",
             Key::TunLeakWindnsClientNote => {
-                "Blocks the DNS Client service's own queries, which can bypass a port-53 filter on \
-                 a build that permits DoH or DoT."
+                "Its own queries can skip a port 53 rule and leave the tunnel."
             }
-            Key::TunLeakMisconfigLabel => "keep the unrouted family inside the tunnel",
+            Key::TunLeakMisconfigLabel => "Block the address family with no tunnel route",
             Key::TunLeakMisconfigNote => {
-                "The core drops an address family the routing table does not route into the \
-                 tunnel. The unrouted family needs a routing table."
+                "Traffic of that family leaves through another adapter when no route sends it \
+                 into the tunnel."
             }
-            Key::TunLeakAllLabel => "keep every port inside the tunnel",
-            Key::TunLeakAllNote => {
-                "Blocks every port outside the tunnel. The core still permits loopback, DHCP, \
-                 and IPv6 neighbor discovery."
+            Key::TunLeakScopeCustomLabel => "Custom entries",
+            Key::TunLeakScopeCustomNote => {
+                "Edit each entry on its own. The app keeps every entry in the list."
             }
-            Key::TunLeakAllExceptLanLabel => {
-                "keep every port except the local network inside the tunnel"
+            Key::TunLeakScopeAllLabel => "Everything outside the tunnel",
+            Key::TunLeakScopeAllNote => {
+                "Loopback, DHCP, and IPv6 neighbor discovery still reach the network."
             }
-            Key::TunLeakAllExceptLanNote => {
-                "Blocks every port outside the tunnel except traffic to the local network. A \
-                 resolver on the local network can forward DNS outside the tunnel."
+            Key::TunLeakScopeAllExceptLanLabel => "Everything except the local network",
+            Key::TunLeakScopeAllExceptLanNote => {
+                "Printers and casting keep working. DNS stays inside the tunnel."
             }
-            Key::TunLeakIcmpLabel => "keep ICMP inside the tunnel",
-            Key::TunLeakIcmpNote => {
-                "Blocks ICMP outside the tunnel, so ping and traceroute fail while the TUN runs."
+            Key::TunLeakDnsIncludedNote => {
+                "This scope already blocks DNS and the DNS Client service."
             }
-            Key::TunLeakCoveredNote => "Remove {} to edit the entries it covers.",
-            Key::TunLeakRangeLabel => "range",
-            Key::TunLeakBothProtocols => "both",
-            Key::TunLeakAddRange => "Add a range",
-            Key::TunLeakRawLabel => "CIDR-prefixed entry",
+            Key::TunLeakDnsHeading => "DNS",
+            Key::TunLeakOtherHeading => "Other entries",
+            Key::TunLeakPortsHeading => "Ports",
+            Key::TunLeakTextHeading => "Text entries",
+            Key::TunLeakIcmpLabel => "Block ping and traceroute",
+            Key::TunLeakIcmpNote => "ICMP traffic leaves through another adapter otherwise.",
+            Key::TunLeakHiddenNote => {
+                "{} stored entries stay hidden. Switch to another scope to edit them."
+            }
+            Key::TunLeakRangeLabel => "port range",
+            Key::TunLeakBothProtocols => "TCP + UDP",
+            Key::TunLeakAddRange => "Add range",
+            Key::TunLeakRawLabel => "Entry limited to an address range",
             Key::TunLeakRawHint => "1.1.1.0/24:53",
             Key::TunLeakAddEntry => "Add entry",
-            Key::TunLeakInstallFailed => "The core could not install the leak block: {}",
-            Key::TunLeakInstallRemedy => "Turn the leak block off and retry",
+            Key::TunLeakInstallFailed => "The core could not install the leak filters: {}",
+            Key::TunLeakInstallRemedy => "Turn these filters off and retry",
             Key::TunLeakInstallRemedyHint => {
-                "The TUN starts without the leak block. DNS can then leave the tunnel."
+                "The TUN starts without them. DNS can leave the tunnel."
             }
             // Dashboard screen.
             Key::DashboardNetworkMode => "Network mode:",
@@ -5936,22 +5950,17 @@ mod en {
                  reads the gateway list"
             }
             Key::SettingsTunLeakRoutingTableRequired => {
-                "The leak block needs a non-empty routing table. The core refuses to load the \
-                 configuration without it."
+                "These filters need a routing table. The core refuses the configuration \
+                 without one."
             }
             Key::SettingsTunLeakValueUnknown => {
-                "Leak block value {} is not one the core accepts. Use dns, windnsclient, \
-                 misconfigtun, all, allexceptlan, icmp, tcp, or udp. A port or port range may \
-                 follow tcp or udp. A bare port or port range applies to both protocols. Any of \
-                 these may start with an IPv4 or bracketed IPv6 CIDR prefix. The core refuses to \
-                 load the configuration."
+                "The core does not accept {}. Use dns, windnsclient, misconfigtun, all, \
+                 allexceptlan, icmp, tcp, udp, a port, or a port range. Put tcp or udp before \
+                 a port. Add an address range in front, like 1.1.1.0/24:53."
             }
-            Key::SettingsTunLeakDnsAliasExpanded => {
-                "The dns value was expanded to {}. The profile saves the expanded entries."
-            }
+            Key::SettingsTunLeakDnsAliasExpanded => "The profile stores the dns entry as {}.",
             Key::SettingsTunLeakMisconfigTunOff => {
-                "The unrouted address family is not blocked. A family without a route into the \
-                 tunnel can send traffic outside it."
+                "Traffic of the address family with no tunnel route can leave the tunnel."
             }
             Key::SettingsListenerConflict => "{} conflicts with {} on {}:{}",
             Key::SettingsRoutingRuleTarget => "routing rule {}: {}",

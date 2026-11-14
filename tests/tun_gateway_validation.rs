@@ -412,8 +412,9 @@ fn a_raw_dns_alias_profile_warns_once_about_the_expansion() {
 #[test]
 fn a_list_without_the_family_entry_warns_with_what_reopens() {
     // The key still reaches the wire (the DNS module is present), but without
-    // the unrouted-family entry an address family the routing table does not
-    // route into the tunnel can egress. Advisory, never a gate.
+    // anything that keeps an unrouted family inside the tunnel, an address
+    // family the routing table does not route into the tunnel can egress.
+    // Advisory, never a gate.
     let settings = leak_settings(vec!["udp/53".into(), "tcp/53".into()]);
     assert!(
         verdict(&settings)
@@ -422,6 +423,27 @@ fn a_list_without_the_family_entry_warns_with_what_reopens() {
         "a missing family entry must warn"
     );
     generate(&settings).expect("a list without the family entry must not block generation");
+
+    // A non-custom scope blocks every destination outside the local network,
+    // so it keeps the unrouted family inside the tunnel and the advisory
+    // clears. A prefixed scope value limits itself to its own addresses and
+    // leaves the advisory in place.
+    for (value, warns) in [
+        ("misconfigtun", false),
+        ("all", false),
+        ("allexceptlan", false),
+        ("1.1.1.0/24:all", true),
+    ] {
+        let settings = leak_settings(vec![value.into()]);
+        assert_eq!(
+            verdict(&settings)
+                .advisory()
+                .any(|issue| issue.code == ValidationCode::TunLeakMisconfigTunOff),
+            warns,
+            "{value}"
+        );
+        generate(&settings).expect("the advisory must never block generation");
+    }
 }
 
 #[test]
@@ -493,9 +515,11 @@ fn deleting_every_gateway_row_shows_inline_error_and_readding_clears_it() {
         "a dual-stack gateway must not show the inline error"
     );
 
-    // Delete both gateway rows. The leak block renders one deletable row per
-    // seeded port above the gateways section — its two named entries are
-    // checkboxes — so the gateway rows' 🗑 buttons start after that many.
+    // Delete both gateway rows. The seeded leak list is the single
+    // `allexceptlan` scope value, which renders no detail row, so the gateway
+    // rows' 🗑 buttons start at the top of the delete-button list. The offset
+    // still derives from the seed, so a future default with detail rows keeps
+    // the index right.
     let above = TunCfg::default()
         .auto_system_wfp_block_leak
         .iter()

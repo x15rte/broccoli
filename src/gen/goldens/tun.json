@@ -44,11 +44,7 @@
           "8000::/1"
         ],
         "autoSystemWfpBlockLeak": [
-          "udp/53",
-          "tcp/53",
-          "windnsclient",
-          "tcp/853",
-          "udp/853",
+          "allexceptlan",
           "misconfigtun"
         ],
         "desc": "Wintun",

@@ -3491,7 +3491,9 @@ fn tun_settings(cfg: &Value) -> &Value {
 fn tun_with_dns_module_emits_the_leak_block_the_predicate_describes() {
     // The leak key rides the same gate the runtime reads back
     // (`config_runs_tun_dns`): a TUN inbound and a top-level DNS module. The
-    // default policy keeps DNS and the unrouted family inside the tunnel.
+    // default policy keeps DNS inside the tunnel, leaves the local network
+    // open so private destinations keep their direct route, and guards a
+    // family with no route into the tunnel.
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     let cfg = generate_deterministic(
@@ -3507,14 +3509,7 @@ fn tun_with_dns_module_emits_the_leak_block_the_predicate_describes() {
     let settings_obj = tun_settings(&cfg);
     assert_eq!(
         settings_obj["autoSystemWfpBlockLeak"],
-        json!([
-            "udp/53",
-            "tcp/53",
-            "windnsclient",
-            "tcp/853",
-            "udp/853",
-            "misconfigtun"
-        ])
+        json!(["allexceptlan", "misconfigtun"])
     );
     assert!(
         settings_obj.get("autoSystemDnsToGateway").is_none(),
