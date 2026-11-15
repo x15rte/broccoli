@@ -99,10 +99,6 @@ version = "0.3.0"
 criteria = "safe-to-deploy"
 notes = "Promise polling helper reached through egui_system_font_provider; not reviewed yet, so this records the deferred review."
 
-[[exemptions.quinn-udp]]
-version = "0.5.15"
-criteria = "safe-to-deploy"
-
 [[exemptions.roxmltree]]
 version = "0.21.2"
 criteria = "safe-to-deploy"

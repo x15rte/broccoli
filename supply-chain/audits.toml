@@ -4530,6 +4530,12 @@ criteria = "safe-to-deploy"
 version = "0.11.18"
 notes = "0.11.17 -> 0.11.18: send windows budgeted against retained storage, abandoned send buffers released on reset, empty ranges handled in RangeSet::replace, no panic on a hostile maximum ACK delay, transport parameters with a mismatched length rejected, the server config preserved for pending incoming connections, and queued DATAGRAMs pruned when the active path changes. Manifest, MSRV and unsafe surface unchanged."
 
+[[audits.quinn-proto]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+delta = "0.11.18 -> 0.11.19"
+notes = "0.11.18 -> 0.11.19: an Initial token from the peer can no longer leave the packet without room for frames — the builder refuses it with PROTOCOL_VIOLATION instead of building an oversized minimum packet, ACK emission reserves CONNECTION_CLOSE, and Initial padding follows the peer-limited min_mtu. received_max_stream_data now validates a peer-initiated bidirectional stream id against the advertised limit and closes with STREAM_LIMIT_ERROR, with a defensive guard where streams open implicitly. A failed TLS session start drops the connection id it just issued. Manifest and MSRV unchanged; no unsafe changes."
+
 [[audits.r-efi]]
 criteria = "safe-to-deploy"
 version = "5.3.0"
