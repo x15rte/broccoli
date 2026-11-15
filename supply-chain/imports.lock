@@ -256,8 +256,8 @@ user-login = "KodrAus"
 user-name = "Ashley Mannix"
 
 [[publisher.zip]]
-version = "9.1.2"
-when = "2026-10-26"
+version = "9.3.0"
+when = "2026-11-03"
 trusted-publisher = "github:zip-rs/zip2"
 
 [[publisher.zvariant]]
