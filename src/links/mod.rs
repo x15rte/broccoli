@@ -24,9 +24,10 @@
 //!
 //! Inputs that name removed or unrepresentable behavior are rejected, never
 //! dropped or normalized:
-//! - mKCP `seed` / non-`none` `headerType`, SIP002 `plugin=`, VMess `aid > 0`,
-//!   `security=xtls`, SOCKS4/4a, Hysteria 1, `obfs=gecko`, and removed
-//!   transports.
+//! - An mKCP `headerType`/`seed` pair that names no mask (a header the core
+//!   never built, or either field on a transport that has no mKCP block),
+//!   SIP002 `plugin=`, VMess `aid > 0`, `security=xtls`, SOCKS4/4a,
+//!   Hysteria 1, `obfs=gecko`, and removed transports.
 //! - gRPC `mode=guna`, which Xray's boolean `multiMode` cannot express.
 //! - URL fields that are duplicated after percent-decoding, empty when #716
 //!   forbids emptiness, or valid only for a different transport or security
@@ -48,11 +49,38 @@
 //! `mldsa65Verify` alias is accepted on import, but the two may not coexist.
 //! Export always emits `pqv`.
 //!
+//! TLS cipher suites: the Xray link export writes the
+//! `tlsSettings.cipherSuites` list as `cs`. Import maps it into the model;
+//! #716 has no spelling for a suite list, so export refuses a modeled list
+//! like every other advanced TLS option.
+//!
+//! The legacy VMess envelope adds three keys to the common VMess JSON schema:
+//! `cs` fills the same cipher-suite field, `allowInsecure` is dropped and
+//! reported (Xray removed the switch), and `throneExtra` is its transport
+//! query — the keys the selected transport's row models go through the same
+//! setters the URL grammar uses, while the mux, padding and packet-encoding
+//! switches are dropped and reported. The envelope's own
+//! `net`/`type`/`host`/`path` stay authoritative, and a JSON field outside
+//! that schema still refuses the link. Export stays the app's #716 URL VMess
+//! form; a modeled field it cannot spell stays import-only.
+//!
 //! The query grammar is declared once per transport in [`TRANSPORTS`]: a
 //! transport's `type` value, the fields it carries with their import defaults
 //! and export spellings, the model facts it cannot carry, and its settings
 //! block. Import, export and the representability ladder all walk that table.
-//! The shareable protocols are declared the same way in [`SHAREABLE`].
+//! The WebSocket and HTTPUpgrade rows carry the clients' early-data (`ed`),
+//! custom-header (`headers`) and, for WebSocket, heartbeat keys; early data is
+//! stored in the path query, which is the model's own spelling. The XHTTP
+//! `headers` key imports into the block, whose canonical link carrier is
+//! `extra`. The shareable protocols are declared the same way in
+//! [`SHAREABLE`].
+//!
+//! An mKCP link's pre-finalmask `headerType` and `seed` are transport fields
+//! the model carries as the `mkcp-legacy` UDP mask, so import folds both into
+//! that mask and export writes it back through `fm` — the shape the legacy
+//! importer produces and its exporter reads. Neither key has an export
+//! spelling of its own, and a link whose `fm` already holds the mask is
+//! refused rather than merged.
 //!
 //! Import also accepts the upstream aliases for a transport's `type` value —
 //! `raw` for `tcp`, `mkcp` for `kcp`, `splithttp` for `xhttp`, `websocket`
@@ -82,7 +110,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::diag::Diag;
 use crate::excerpt::{excerpt, excerpt_debug};
 use crate::i18n::{Key, t_fmt, validation_issue_message};
-use crate::model::Int32Range;
 use crate::model::addr;
 use crate::model::outbound::{
     HttpSettings, HysteriaSettings, OutboundModel, Protocol, ProtocolSettings, ShadowsocksSettings,
@@ -92,14 +119,16 @@ use crate::model::outbound::{
 use crate::model::servers::ServerProfile;
 use crate::model::settings::Language;
 use crate::model::stream::{
-    FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams, FinalmaskSalamander, FinalmaskUdpHop,
-    FinalmaskUdpMask, GrpcSettings, HttpCamouflageRequest, HttpupgradeSettings, HysteriaTransport,
-    KcpSettings, Network, RawHeader, RawSettings, RealityModel, Security, StreamModel, TlsModel,
-    WsSettings, XhttpSettings, transport_settings_path,
+    FinalmaskMkcpLegacy, FinalmaskModel, FinalmaskPortList, FinalmaskQuicParams,
+    FinalmaskSalamander, FinalmaskUdpHop, FinalmaskUdpMask, GrpcSettings, HttpCamouflageRequest,
+    HttpupgradeSettings, HysteriaTransport, KcpSettings, Network, RawHeader, RawSettings,
+    RealityModel, Security, StreamModel, TlsModel, WsSettings, XhttpSettings,
+    transport_settings_path,
 };
 use crate::model::validation::{
     ValidationIssue, is_canonical_uuid, is_vision_flow, validate_outbound,
 };
+use crate::model::{Int32Range, fold_lower};
 
 /// A share-link failure that has no language yet. `Display` renders English
 /// for logs and tests; the display boundary renders the active language with
@@ -207,16 +236,27 @@ const IGNORED_PARAMS: &[&str] = &[
     "mux_min_streams",
     "mux_max_streams",
     "mux_padding",
+    // Xray's mux has no share-link spelling.
+    "mux_concurrency",
+    "mux_xudp_concurrency",
+    "mux_xudp_proxy_udp443",
     "brutal_enabled",
     "brutal_up_mbps",
     "brutal_down_mbps",
     // XUDP packet encoding.
     "packetEncoding",
+    // The VMess padding switches other clients emit; Xray's outbound has
+    // neither field (the legacy VMess envelope writes both, and the URL
+    // grammar reads them).
+    "globalPadding",
+    "authenticatedLength",
     // Dial (socket) fields.
     "reuse_addr",
     "connect_timeout",
     "tcp_fast_open",
     "tcp_multi_path",
+    // The QUIC opener some link exporters write; Xray has no such field.
+    "quic_opener",
     "udp_fragment",
     "bind_interface",
     "inet4_bind_address",
@@ -520,8 +560,14 @@ fn parse_query(query: &str) -> Result<Query, LinkError> {
 
 // ---------- generic link structure ----------
 
-/// Split `userinfo@host:port?query#fragment` (body after `scheme://`).
+/// Split `userinfo@host:port[/path]?query#fragment` (body after `scheme://`).
 /// The fragment is raw (still percent-encoded); the query is raw.
+///
+/// The authority ends at the first `/`, as in every URL grammar: no supported
+/// scheme reads the URL path — a transport path travels as the `path` query
+/// value — while a client writing a query on an empty path emits `/?…`. Left
+/// in the authority, the separator lands in the port text and refuses the
+/// entry.
 fn split_link(body: &str) -> (&str, &str, &str) {
     let (rest, frag) = match body.find('#') {
         Some(i) => (&body[..i], &body[i + 1..]),
@@ -530,6 +576,10 @@ fn split_link(body: &str) -> (&str, &str, &str) {
     let (auth, query) = match rest.find('?') {
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, ""),
+    };
+    let auth = match auth.find('/') {
+        Some(i) => &auth[..i],
+        None => auth,
     };
     (auth, query, frag)
 }
@@ -766,6 +816,18 @@ fn split_alpn(v: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// `gun` and `multi` are gRPC's two spellings of the boolean `multiMode`.
+/// Shared provider templates stamp them on links whose transport has no
+/// `mode` field (`mode=gun` beside `type=tcp`) or whose own `mode` vocabulary
+/// does not carry the value (`mode=gun` beside `type=xhttp`). There the value
+/// names no effective setting, so it is a compatibility parameter like any
+/// other: import drops it, keeps the transport's model default, and reports
+/// the `mode` value it carried. Every other foreign value still refuses.
+fn is_template_grpc_mode(spec: &TransportSpec, value: &str) -> bool {
+    spec.network != Network::Grpc
+        && (value.eq_ignore_ascii_case("gun") || value.eq_ignore_ascii_case("multi"))
+}
+
 fn validate_url_query(
     q: &Query,
     proto: Protocol,
@@ -821,13 +883,15 @@ fn validate_url_query(
         if mode.is_empty() {
             return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg("mode")));
         }
-        let Some(field) = spec.field("mode") else {
-            return Err(LinkError::Unsupported(
-                Diag::new(Key::LinkUnsupportedTransportMode).arg(transport),
-            ));
-        };
-        if let Some(validate) = field.validate {
-            validate(mode)?;
+        if !is_template_grpc_mode(spec, mode) {
+            let Some(field) = spec.field("mode") else {
+                return Err(LinkError::Unsupported(
+                    Diag::new(Key::LinkUnsupportedTransportMode).arg(transport),
+                ));
+            };
+            if let Some(validate) = field.validate {
+                validate(mode)?;
+            }
         }
     }
 
@@ -836,8 +900,11 @@ fn validate_url_query(
             "type" | "security" | "fm" => true,
             "encryption" => matches!(proto, Protocol::Vless | Protocol::Vmess),
             "flow" => proto == Protocol::Vless,
-            "sni" | "fp" => matches!(security, "tls" | "reality"),
-            "alpn" | "ech" => security == "tls",
+            "sni" | "servername" | "fp" => matches!(security, "tls" | "reality"),
+            // `cs` is the link spelling of Xray's
+            // `tlsSettings.cipherSuites`, so it is TLS-only like the other TLS
+            // options.
+            "alpn" | "ech" | "cs" => security == "tls",
             // Upstream clients stamp the TLS pin fields on REALITY links,
             // usually empty, because the template is shared with TLS. The
             // model has no REALITY field to carry them, so the link stays and
@@ -862,13 +929,48 @@ fn validate_url_query(
                 }
                 true
             }
-            "pbk" | "sid" | "pqv" | "mldsa65Verify" | "spx" => security == "reality",
+            "pbk" | "sid" | "spx" => {
+                // Upstream templates stamp the REALITY keys on a TLS link,
+                // usually empty, because the template is shared with REALITY.
+                // The model has no TLS field for them: an empty value names
+                // no setting, a value it cannot carry refuses the link.
+                if security == "reality" {
+                    true
+                } else if value.is_empty() {
+                    continue;
+                } else {
+                    false
+                }
+            }
+            "pqv" | "mldsa65Verify" => security == "reality",
+            // The WebSocket early data and heartbeat arrive as their own link
+            // keys. The selected transport's row answers a value its block
+            // models; a link for another transport carries a setting that
+            // block has no field for, so the value is reported and dropped.
+            "ed" | "heartbeat_period" => {
+                if spec.field(key).is_none()
+                    && !value.is_empty()
+                    && ignored_value_is_reported(value)
+                {
+                    record_ignored(ignored, key, value);
+                }
+                true
+            }
+            // The selected transport's `mode` row answers a value its own
+            // vocabulary carries; `gun`/`multi` are gRPC template artifacts
+            // on any other transport, where they name no setting: dropped and
+            // reported like every other compatibility parameter.
+            "mode" => {
+                if is_template_grpc_mode(spec, value) {
+                    record_ignored(ignored, key, value);
+                }
+                spec.field("mode").is_some() || is_template_grpc_mode(spec, value)
+            }
             "seed" => {
-                // The pinned core parses the key and ignores it
-                // (`infra/conf/transport_method.go` KCPConfig.Build reads
-                // neither `seed` nor `header`), so only the absence of a value
-                // is tolerated: a seed names obfuscation the core cannot run.
-                if value.is_empty() {
+                // A KCP link's seed is the old AES-128-GCM obfuscation, which
+                // import folds into the `mkcp-legacy` mask; no other transport
+                // has an mKCP block to carry it.
+                if spec.network == Network::Kcp || value.is_empty() {
                     continue;
                 }
                 return Err(LinkError::Unsupported(
@@ -877,10 +979,14 @@ fn validate_url_query(
             }
             "headerType" => {
                 // RAW carries it as an import-only field (the HTTP camouflage
-                // Xray still builds); every other transport's header
-                // obfuscation was removed, so only `none` — the absence of
-                // one — is tolerated there.
-                if spec.network == Network::Raw {
+                // Xray still builds) and mKCP folds the pre-finalmask header
+                // types into the `mkcp-legacy` mask. Every other transport's
+                // header obfuscation was removed, so only `none` — the
+                // absence of one — is tolerated there.
+                if spec.network == Network::Kcp {
+                    kcp_legacy_header(value)?;
+                    true
+                } else if spec.network == Network::Raw {
                     true
                 } else if matches!(value.as_str(), "" | "none") {
                     continue;
@@ -910,7 +1016,7 @@ fn validate_url_query(
         }
 
         if value.is_empty()
-            && (matches!(key.as_str(), "sni" | "fp" | "alpn" | "pbk" | "fm")
+            && (matches!(key.as_str(), "fp" | "alpn" | "cs" | "pbk" | "fm")
                 || spec.field(key).is_some_and(|field| field.require_value))
         {
             return Err(malformed(Diag::new(Key::LinkQueryEmpty).arg(key)));
@@ -932,9 +1038,14 @@ fn apply_security(q: &Query, stream: &mut StreamModel, default_tls: bool) -> Res
         "tls" => {
             stream.security = Security::Tls;
             stream.tls_settings = Some(TlsModel {
-                server_name: q.get_ne("sni").unwrap_or_default().to_string(),
+                server_name: q
+                    .get_ne("sni")
+                    .or_else(|| q.get_ne("servername"))
+                    .unwrap_or_default()
+                    .to_string(),
                 fingerprint: q.get_ne("fp").unwrap_or("chrome").to_string(),
                 alpn: split_alpn(q.get("alpn")),
+                cipher_suites: q.get("cs").unwrap_or_default().to_string(),
                 ech_config_list: q.get("ech").unwrap_or_default().to_string(),
                 pinned_peer_cert_sha256: q.get("pcs").unwrap_or_default().to_string(),
                 verify_peer_cert_by_name: q.get("vcn").unwrap_or_default().to_string(),
@@ -945,7 +1056,11 @@ fn apply_security(q: &Query, stream: &mut StreamModel, default_tls: bool) -> Res
             stream.security = Security::Reality;
             let pqv = q.get("pqv").or_else(|| q.get("mldsa65Verify"));
             stream.reality_settings = Some(RealityModel {
-                server_name: q.get_ne("sni").unwrap_or_default().to_string(),
+                server_name: q
+                    .get_ne("sni")
+                    .or_else(|| q.get_ne("servername"))
+                    .unwrap_or_default()
+                    .to_string(),
                 fingerprint: q.get_ne("fp").unwrap_or_default().to_string(),
                 password: q.get_ne("pbk").unwrap_or_default().to_string(),
                 short_id: q.get("sid").unwrap_or_default().to_string(),
@@ -1208,6 +1323,104 @@ fn numeric_param(key: &'static str, value: &str) -> Result<u32, LinkError> {
     })
 }
 
+/// Split the `ed` parameter out of a WebSocket/HTTPUpgrade path. Xray stores
+/// early data inside the path query — the model's `WsSettings::path` carries
+/// the `?ed=N` form — while the link spells it as its own key. The two
+/// directions translate between the spellings; every other query parameter
+/// stays in the path, in order.
+fn split_early_data(path: &str) -> (String, Option<u32>) {
+    let Some(start) = path.find('?') else {
+        return (path.to_string(), None);
+    };
+    let mut early_data = None;
+    let mut kept = Vec::new();
+    for pair in path[start + 1..].split('&') {
+        if let Some(raw) = pair.strip_prefix("ed=")
+            && let Ok(value) = raw.parse::<u32>()
+        {
+            early_data = Some(value);
+            continue;
+        }
+        kept.push(pair);
+    }
+    if early_data.is_none() {
+        return (path.to_string(), None);
+    }
+    let base = &path[..start];
+    let path = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    (path, early_data)
+}
+
+/// Put an early-data cap into a path the way Xray stores it, keeping any other
+/// query parameter before it so the model value is canonical.
+fn with_early_data(path: &str, ed: u32) -> String {
+    let (base, _) = split_early_data(path);
+    if base.is_empty() {
+        format!("?ed={ed}")
+    } else if base.contains('?') {
+        format!("{base}&ed={ed}")
+    } else {
+        format!("{base}?ed={ed}")
+    }
+}
+
+/// The path a link's `path` value stores: an `?ed=` already inside that value
+/// is moved to the end, so both client spellings produce one model value.
+fn transport_path(value: &str) -> String {
+    match split_early_data(value) {
+        (base, Some(ed)) => with_early_data(&base, ed),
+        (_, None) => value.to_string(),
+    }
+}
+
+/// Fold a client's custom-header value into the model map. The transport
+/// spelling is an alternating `name|value` list and the HTTP link the comma
+/// spelling, so a value with a `|` splits there and every other value on `,`.
+/// An odd count, an empty name, or a repeated name has no single meaning and
+/// is refused.
+fn transport_headers(raw: &str) -> Result<Map<String, Value>, LinkError> {
+    header_pairs(raw, if raw.contains('|') { '|' } else { ',' })
+}
+
+/// Split an alternating `name`/`value` list on `separator`.
+fn header_pairs(raw: &str, separator: char) -> Result<Map<String, Value>, LinkError> {
+    let items: Vec<&str> = raw.split(separator).collect();
+    if !items.len().is_multiple_of(2) {
+        return Err(malformed(Diag::new(Key::LinkHttpHeaders)));
+    }
+    let mut headers = Map::new();
+    for pair in items.chunks(2) {
+        if pair[0].is_empty()
+            || headers
+                .insert(pair[0].to_string(), Value::String(pair[1].to_string()))
+                .is_some()
+        {
+            return Err(malformed(Diag::new(Key::LinkHttpHeaders)));
+        }
+    }
+    Ok(headers)
+}
+
+/// The link spelling of a custom-header map: alternating `name|value`, the
+/// form the transport export writes.
+fn export_headers(headers: &Map<String, Value>) -> Option<String> {
+    if headers.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(headers.len() * 2);
+    for (name, value) in headers {
+        parts.push(name.as_str());
+        // The model pass refuses a non-string value before any renderer runs
+        // (`HeaderValuesNotStrings`), so the fallback is unreachable there.
+        parts.push(value.as_str().unwrap_or_default());
+    }
+    Some(parts.join("|"))
+}
+
 // ----- raw / TCP -----
 
 /// Raw has no settings parameters of its own: its camouflage block is model
@@ -1401,6 +1614,252 @@ const KCP: TransportSpec = TransportSpec {
     is_present: |stream| option_has_fields(&stream.kcp_settings),
 };
 
+/// The `mkcp-legacy` header a link's `headerType` names, or `None` for a link
+/// that names none. The pre-finalmask header types are the set link exporters
+/// still emit, folded case-insensitively: the link spelling `wechat-video`
+/// maps onto the core's `wechat` mask id. A name outside the set is a header
+/// the core never built, so it stays refused.
+fn kcp_legacy_header(value: &str) -> Result<Option<&'static str>, LinkError> {
+    Ok(match &*fold_lower(value.trim()) {
+        "" | "none" => None,
+        "dns" => Some("dns"),
+        "dtls" => Some("dtls"),
+        "srtp" => Some("srtp"),
+        "utp" => Some("utp"),
+        "wechat-video" => Some("wechat"),
+        "wireguard" => Some("wireguard"),
+        _ => {
+            return Err(LinkError::Unsupported(
+                Diag::new(Key::LinkUnsupportedField).arg("headerType"),
+            ));
+        }
+    })
+}
+
+/// The legacy mKCP link fields. Before finalmask, a KCP link carried its
+/// obfuscation as `headerType` and `seed` — the pair link exporters still
+/// write and import folds into the mask — and the model carries the same
+/// obfuscation as its `mkcp-legacy` UDP mask. The core's mask build reads
+/// `header` as the header id and `value` as the AES-128-GCM seed when no
+/// header is named, or as the DNS domain under the `dns` header
+/// (`infra/conf/transport_finalmask.go:738-762`). Export writes the mask back
+/// through `fm`: neither key has a spelling of its own.
+fn apply_kcp_legacy(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError> {
+    if stream.network != Network::Kcp {
+        return Ok(());
+    }
+    let header = q
+        .get("headerType")
+        .map(kcp_legacy_header)
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
+    let seed = q.get("seed").unwrap_or_default();
+    if header.is_empty() && seed.is_empty() {
+        return Ok(());
+    }
+    let finalmask = stream.finalmask.get_or_insert_default();
+    // Two sources of one mask: a carried `fm` already names it, and folding
+    // the legacy pair in would have to guess which entry the link meant.
+    // Dropping either source would be a silent loss, so import refuses the
+    // duplicate instead.
+    if finalmask
+        .udp
+        .iter()
+        .any(|mask| matches!(mask, FinalmaskUdpMask::MkcpLegacy { .. }))
+    {
+        return Err(malformed(Diag::new(Key::LinkQueryDuplicate).arg("fm")));
+    }
+    // The mask sits before the entries that must stay last: `xdns` resolves
+    // the destination after the header wrapper, and `udphop`/`xicmp` own the
+    // outbound's socket and are pinned last by the model's own order rule
+    // (`src/model/validation/stream.rs`, `finalmask_validate_udp_order`).
+    let at = finalmask
+        .udp
+        .iter()
+        .position(|mask| {
+            matches!(
+                mask,
+                FinalmaskUdpMask::Xdns { .. }
+                    | FinalmaskUdpMask::Udphop { .. }
+                    | FinalmaskUdpMask::Xicmp { .. }
+            )
+        })
+        .unwrap_or(finalmask.udp.len());
+    finalmask.udp.insert(
+        at,
+        FinalmaskUdpMask::MkcpLegacy {
+            settings: FinalmaskMkcpLegacy {
+                header: header.to_string(),
+                value: seed.to_string(),
+                extra: Map::new(),
+            },
+            extra: Map::new(),
+        },
+    );
+    validate_finalmask(finalmask)
+}
+
+// ----- WebSocket / HTTPUpgrade shared fields -----
+
+/// The settings block the WebSocket and HTTPUpgrade rows carry the same way:
+/// a `path` whose query holds the early-data cap, and a custom-header map.
+trait PathHeadersBlock: Default {
+    fn block(stream: &StreamModel) -> Option<&Self>;
+    fn block_mut(stream: &mut StreamModel) -> &mut Option<Self>;
+    fn path(&self) -> &str;
+    fn path_mut(&mut self) -> &mut String;
+    fn headers(&self) -> &Map<String, Value>;
+    fn headers_mut(&mut self) -> &mut Map<String, Value>;
+}
+
+impl PathHeadersBlock for WsSettings {
+    fn block(stream: &StreamModel) -> Option<&Self> {
+        stream.ws_settings.as_ref()
+    }
+
+    fn block_mut(stream: &mut StreamModel) -> &mut Option<Self> {
+        &mut stream.ws_settings
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn path_mut(&mut self) -> &mut String {
+        &mut self.path
+    }
+
+    fn headers(&self) -> &Map<String, Value> {
+        &self.headers
+    }
+
+    fn headers_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.headers
+    }
+}
+
+impl PathHeadersBlock for HttpupgradeSettings {
+    fn block(stream: &StreamModel) -> Option<&Self> {
+        stream.httpupgrade_settings.as_ref()
+    }
+
+    fn block_mut(stream: &mut StreamModel) -> &mut Option<Self> {
+        &mut stream.httpupgrade_settings
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn path_mut(&mut self) -> &mut String {
+        &mut self.path
+    }
+
+    fn headers(&self) -> &Map<String, Value> {
+        &self.headers
+    }
+
+    fn headers_mut(&mut self) -> &mut Map<String, Value> {
+        &mut self.headers
+    }
+}
+
+/// Early data rides in the path, but the link spells it as its own key; both
+/// getters read one model value, so the `path` export drops the query.
+fn block_path_get<S: PathHeadersBlock>(stream: &StreamModel) -> Result<Option<String>, LinkError> {
+    Ok(export_text(
+        S::block(stream).map(|block| split_early_data(block.path()).0),
+    ))
+}
+
+fn block_path_set<S: PathHeadersBlock>(
+    stream: &mut StreamModel,
+    value: &str,
+) -> Result<(), LinkError> {
+    *S::block_mut(stream).get_or_insert_default().path_mut() = transport_path(value);
+    Ok(())
+}
+
+fn block_ed_get<S: PathHeadersBlock>(stream: &StreamModel) -> Result<Option<String>, LinkError> {
+    let early_data = S::block(stream).and_then(|block| split_early_data(block.path()).1);
+    Ok(export_number(early_data.filter(|ed| *ed > 0)))
+}
+
+fn block_ed_set<S: PathHeadersBlock>(
+    stream: &mut StreamModel,
+    value: &str,
+) -> Result<(), LinkError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let ed = numeric_param("ed", value)?;
+    let block = S::block_mut(stream).get_or_insert_default();
+    // Zero is the core's "no early data" value.
+    let path = if ed > 0 {
+        with_early_data(block.path(), ed)
+    } else {
+        split_early_data(block.path()).0
+    };
+    *block.path_mut() = path;
+    Ok(())
+}
+
+fn block_headers_get<S: PathHeadersBlock>(
+    stream: &StreamModel,
+) -> Result<Option<String>, LinkError> {
+    Ok(S::block(stream).and_then(|block| export_headers(block.headers())))
+}
+
+fn block_headers_set<S: PathHeadersBlock>(
+    stream: &mut StreamModel,
+    value: &str,
+) -> Result<(), LinkError> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    *S::block_mut(stream).get_or_insert_default().headers_mut() = transport_headers(value)?;
+    Ok(())
+}
+
+/// The `path` field both rows carry: import moves an `?ed=` inside the value
+/// to the end, and export renders the path without the early-data query.
+const fn block_path_field<S: PathHeadersBlock>() -> Field {
+    Field {
+        key: "path",
+        default: DEFAULT_PATH,
+        require_value: true,
+        validate: None,
+        get: block_path_get::<S>,
+        set: block_path_set::<S>,
+    }
+}
+
+/// The early-data key for both rows; zero is the core's "no early data"
+/// value.
+const fn block_ed_field<S: PathHeadersBlock>() -> Field {
+    Field {
+        key: "ed",
+        default: "",
+        require_value: true,
+        validate: None,
+        get: block_ed_get::<S>,
+        set: block_ed_set::<S>,
+    }
+}
+
+/// The custom-header key for both rows.
+const fn block_headers_field<S: PathHeadersBlock>() -> Field {
+    Field {
+        key: "headers",
+        default: "",
+        require_value: false,
+        validate: None,
+        get: block_headers_get::<S>,
+        set: block_headers_set::<S>,
+    }
+}
+
 // ----- WebSocket -----
 
 const WS: TransportSpec = TransportSpec {
@@ -1423,30 +1882,43 @@ const WS: TransportSpec = TransportSpec {
                 Ok(())
             },
         },
+        block_path_field::<WsSettings>(),
+        block_ed_field::<WsSettings>(),
+        block_headers_field::<WsSettings>(),
         Field {
-            key: "path",
-            default: DEFAULT_PATH,
+            // The WebSocket heartbeat keepalive; zero means none.
+            key: "heartbeat_period",
+            default: "",
             require_value: true,
             validate: None,
             get: |stream| {
-                Ok(export_text(
-                    stream.ws_settings.as_ref().map(|ws| ws.path.clone()),
+                Ok(export_number(
+                    stream
+                        .ws_settings
+                        .as_ref()
+                        .and_then(|ws| ws.heartbeat_period)
+                        .filter(|period| *period > 0),
                 ))
             },
             set: |stream, value| {
-                stream.ws_settings.get_or_insert_default().path = value.to_string();
+                if value.is_empty() {
+                    return Ok(());
+                }
+                let period = numeric_param("heartbeat_period", value)?;
+                stream.ws_settings.get_or_insert_default().heartbeat_period =
+                    (period > 0).then_some(period);
                 Ok(())
             },
         },
     ],
     refused: &[Refused {
         key: Key::LinkLossyWs,
-        // Custom headers and the heartbeat keepalive have no share-link
-        // spelling.
+        // The block's unknown settings have no share-link spelling.
         is_set: |stream| {
-            stream.ws_settings.as_ref().is_some_and(|ws| {
-                !ws.headers.is_empty() || ws.heartbeat_period.is_some() || !ws.extra.is_empty()
-            })
+            stream
+                .ws_settings
+                .as_ref()
+                .is_some_and(|ws| !ws.extra.is_empty())
         },
     }],
     is_present: |stream| option_has_fields(&stream.ws_settings),
@@ -1578,33 +2050,18 @@ const HTTPUPGRADE: TransportSpec = TransportSpec {
                 Ok(())
             },
         },
-        Field {
-            key: "path",
-            default: DEFAULT_PATH,
-            require_value: true,
-            validate: None,
-            get: |stream| {
-                Ok(export_text(
-                    stream
-                        .httpupgrade_settings
-                        .as_ref()
-                        .map(|upgrade| upgrade.path.clone()),
-                ))
-            },
-            set: |stream, value| {
-                stream.httpupgrade_settings.get_or_insert_default().path = value.to_string();
-                Ok(())
-            },
-        },
+        block_path_field::<HttpupgradeSettings>(),
+        block_ed_field::<HttpupgradeSettings>(),
+        block_headers_field::<HttpupgradeSettings>(),
     ],
     refused: &[Refused {
         key: Key::LinkLossyHttpupgrade,
-        // Custom headers have no share-link spelling.
+        // The block's unknown settings have no share-link spelling.
         is_set: |stream| {
             stream
                 .httpupgrade_settings
                 .as_ref()
-                .is_some_and(|upgrade| !upgrade.headers.is_empty() || !upgrade.extra.is_empty())
+                .is_some_and(|upgrade| !upgrade.extra.is_empty())
         },
     }],
     is_present: |stream| option_has_fields(&stream.httpupgrade_settings),
@@ -1789,6 +2246,26 @@ const XHTTP: TransportSpec = TransportSpec {
                 Ok(())
             },
         },
+        Field {
+            // The same custom-header key arrives on XHTTP links, but the
+            // block's canonical link carrier is the `extra` object, which
+            // already serializes this modeled map. The row declares `extra`
+            // before `headers`, so a link's top-level `headers` replaces the
+            // whole map `extra.headers` carries; export keeps the result
+            // inside `extra`.
+            key: "headers",
+            default: "",
+            require_value: false,
+            validate: None,
+            get: |_| Ok(None),
+            set: |stream, value| {
+                if value.is_empty() {
+                    return Ok(());
+                }
+                stream.xhttp_settings.get_or_insert_default().headers = transport_headers(value)?;
+                Ok(())
+            },
+        },
     ],
     refused: &[],
     is_present: |stream| option_has_fields(&stream.xhttp_settings),
@@ -1834,13 +2311,20 @@ const XDRIVE: TransportSpec = TransportSpec {
     is_present: |stream| option_has_fields(&stream.xdrive_settings),
 };
 
-/// Apply the link's `type` parameter: the row's fields, each with the link's
-/// value or the field's declared default.
+/// Apply the link's `type` parameter: the row's fields in declaration order,
+/// each with the link's value or the field's declared default, so a later
+/// field's value overrides one an earlier field set.
 fn apply_transport_query(q: &Query, stream: &mut StreamModel) -> Result<(), LinkError> {
     let spec = transport_for_type(q.get("type").unwrap_or(DEFAULT_TYPE))?;
     stream.network = spec.network;
     for field in spec.fields {
-        (field.set)(stream, q.get(field.key).unwrap_or(field.default))?;
+        let value = q.get(field.key).unwrap_or(field.default);
+        // A `mode` the selected transport does not carry is the gRPC
+        // template's artifact; it must not reach that transport's setter.
+        if field.key == "mode" && is_template_grpc_mode(spec, value) {
+            continue;
+        }
+        (field.set)(stream, value)?;
     }
     Ok(())
 }
@@ -2037,6 +2521,39 @@ fn unsupported_protocol(protocol: Protocol) -> LinkError {
 
 // ---------- URL-style links (VLESS / VMess / Trojan) ----------
 
+/// The `Host` value the selected transport's settings carry, first entry
+/// when the link wrote a comma-separated list. A TLS link that omits `sni`
+/// falls back to it before the server address.
+fn transport_host(stream: &StreamModel) -> Option<String> {
+    let raw = match stream.network {
+        Network::Ws => stream
+            .ws_settings
+            .as_ref()
+            .map(|settings| settings.host.as_str()),
+        Network::Httpupgrade => stream
+            .httpupgrade_settings
+            .as_ref()
+            .map(|settings| settings.host.as_str()),
+        Network::Xhttp => stream
+            .xhttp_settings
+            .as_ref()
+            .map(|settings| settings.host.as_str()),
+        Network::Raw => stream
+            .raw_settings
+            .as_ref()
+            .and_then(|settings| settings.header.as_ref())
+            .and_then(|header| header.request.as_ref())
+            .and_then(|request| request.headers.get("Host"))
+            .and_then(Value::as_str),
+        _ => None,
+    }?;
+    raw.split(',')
+        .next()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_url_style(
     body: &str,
     proto: Protocol,
@@ -2053,19 +2570,23 @@ fn parse_url_style(
     apply_security(&q, &mut stream, proto == Protocol::Trojan)?;
     apply_transport_query(&q, &mut stream)?;
     apply_finalmask(&q, &mut stream)?;
+    apply_kcp_legacy(&q, &mut stream)?;
+    // The fallback order: an explicit sni, then the transport's Host, then
+    // the server address.
+    let sni_fallback = transport_host(&stream).unwrap_or_else(|| host.clone());
     match stream.security {
         Security::Tls => {
             if let Some(tls) = stream.tls_settings.as_mut()
                 && tls.server_name.is_empty()
             {
-                tls.server_name = host.clone();
+                tls.server_name = sni_fallback;
             }
         }
         Security::Reality => {
             if let Some(reality) = stream.reality_settings.as_mut()
                 && reality.server_name.is_empty()
             {
-                reality.server_name = host.clone();
+                reality.server_name = sni_fallback;
             }
         }
         Security::None => {}
@@ -2188,6 +2709,106 @@ fn trojan_link(p: &ServerProfile, s: &TrojanSettings) -> Result<String, LinkErro
 
 // ---------- VMess legacy Base64-JSON import ----------
 
+/// The transport knobs only one other client models: the transport export it
+/// writes into `throneExtra` carries them, and an Xray outbound has no field
+/// for any. Each is dropped and reported when it carries a value that would
+/// change behavior.
+const LEGACY_EXTRA_UNMODELLED: &[&str] = &["method", "idle_timeout", "ping_timeout"];
+/// Xray's early-data header: the option's alternative spelling
+/// (`early_data_header_name`) names it, and the model cannot carry a different
+/// one.
+const XRAY_EARLY_DATA_HEADER: &str = "Sec-WebSocket-Protocol";
+
+/// Apply the `throneExtra` query onto `stream`.
+///
+/// The key holds the sender's transport export merged with the mux export
+/// and its padding/encoding switches, so the envelope's own
+/// `net`/`type`/`host`/`path` stay authoritative and this layer only fills
+/// what those keys cannot carry — through the same per-transport setters the
+/// URL grammar uses. A key naming a setting the model has no field for is
+/// dropped and reported; a key the grammar does not know at all still
+/// refuses the link, so the envelope stays as strict as the top-level
+/// allowlist.
+fn apply_legacy_extra(
+    extra: &str,
+    envelope_names_mode: bool,
+    stream: &mut StreamModel,
+    ignored: &mut Vec<CompatibilityParameter>,
+) -> Result<(), LinkError> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let q = parse_query(extra)?;
+    let spec = transport_spec(stream.network);
+    for (key, value) in &q.pairs {
+        match key.as_str() {
+            // The envelope's own fields, written from the same transport
+            // state: the top level wins.
+            "type" | "headerType" | "host" | "path" | "serviceName" => continue,
+            // The envelope's `type` doubles as gRPC's `multiMode` and XHTTP's
+            // mode when it names one; the extra fills the absent default
+            // only.
+            "mode" if envelope_names_mode => continue,
+            // The alternative spelling of the early-data cap the
+            // WS/HTTPUpgrade row models as `ed`.
+            "max_early_data" => {
+                match spec.field("ed") {
+                    Some(field) => (field.set)(stream, value)?,
+                    None => {
+                        if ignored_value_is_reported(value) {
+                            record_ignored(ignored, key, value);
+                        }
+                    }
+                }
+                continue;
+            }
+            "early_data_header_name" => {
+                if !value.is_empty()
+                    && !value.eq_ignore_ascii_case(XRAY_EARLY_DATA_HEADER)
+                    && ignored_value_is_reported(value)
+                {
+                    record_ignored(ignored, key, value);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(field) = spec.field(key) {
+            (field.set)(stream, value)?;
+            continue;
+        }
+        // A transport key the selected block has no field for still names a
+        // setting: report it, like the URL grammar does for the same keys.
+        if matches!(key.as_str(), "ed" | "heartbeat_period" | "headers") {
+            if ignored_value_is_reported(value) {
+                record_ignored(ignored, key, value);
+            }
+            continue;
+        }
+        // The mux/padding/encoding switches have no Xray field at all.
+        if drop_ignored_param(ignored, key, value) {
+            continue;
+        }
+        if LEGACY_EXTRA_UNMODELLED.contains(&key.as_str()) {
+            if ignored_value_is_reported(value) {
+                record_ignored(ignored, key, value);
+            }
+            continue;
+        }
+        // The gRPC template artifact the URL grammar also reads past: on this
+        // transport it names no setting, so it joins the compatibility report
+        // with the value the extra spelled.
+        if key == "mode" && is_template_grpc_mode(spec, value) {
+            record_ignored(ignored, key, value);
+            continue;
+        }
+        return Err(LinkError::Unsupported(
+            Diag::new(Key::LinkUnsupportedQueryField).arg(excerpt_debug(key)),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_legacy_vmess(
     body: &str,
     ignored: &mut Vec<CompatibilityParameter>,
@@ -2198,9 +2819,31 @@ fn parse_legacy_vmess(
     let o = v
         .as_object()
         .ok_or_else(|| malformed(Diag::new(Key::LinkVmessObject)))?;
+    // The envelope adds `cs`, `allowInsecure` and `throneExtra` to the common
+    // VMess JSON schema: the TLS suite list, the removed insecure switch, and
+    // the transport query the schema has no room for.
     const LEGACY_FIELDS: &[&str] = &[
-        "v", "ps", "add", "port", "id", "aid", "scy", "net", "type", "host", "path", "tls", "sni",
-        "alpn", "fp", "vcn", "pcs", "insecure",
+        "v",
+        "ps",
+        "add",
+        "port",
+        "id",
+        "aid",
+        "scy",
+        "net",
+        "type",
+        "host",
+        "path",
+        "tls",
+        "sni",
+        "alpn",
+        "fp",
+        "vcn",
+        "pcs",
+        "insecure",
+        "cs",
+        "allowInsecure",
+        "throneExtra",
     ];
     if let Some(field) = o
         .keys()
@@ -2283,6 +2926,9 @@ fn parse_legacy_vmess(
                     if fp.is_empty() { "chrome".into() } else { fp }
                 },
                 alpn: split_alpn(Some(&get("alpn"))),
+                // The envelope maps its suite list to `cs` as well; it is the
+                // same field the URL grammar's `cs` fills.
+                cipher_suites: get("cs"),
                 ..Default::default()
             });
         }
@@ -2296,8 +2942,8 @@ fn parse_legacy_vmess(
     // Client exports write `vcn` / `pcs` on every legacy vmess body (empty
     // when unset) and `insecure` unconditionally. The TLS fields map onto the
     // model when TLS is on; without TLS they name nothing, so they join the
-    // compatibility report. `insecure` has no Xray field at all — the
-    // certificate pin replaces it.
+    // compatibility report. `insecure` and its `allowInsecure` alias have no
+    // Xray field at all — the certificate pin replaces them.
     let vcn = get("vcn");
     let pcs = get("pcs");
     if stream.security == Security::Tls {
@@ -2312,18 +2958,38 @@ fn parse_legacy_vmess(
         if !pcs.is_empty() {
             record_ignored(ignored, "pcs", &pcs);
         }
+        // The envelope writes a suite list whenever the profile holds one,
+        // not only with TLS on; without TLS no block carries it.
+        let cs = get("cs");
+        if !cs.is_empty() {
+            record_ignored(ignored, "cs", &cs);
+        }
     }
-    if let Some(insecure) = o.get("insecure").and_then(Value::as_str)
-        && ignored_value_is_reported(insecure)
-    {
-        record_ignored(ignored, "insecure", insecure);
+    for key in ["insecure", "allowInsecure"] {
+        if let Some(value) = o.get(key).and_then(Value::as_str)
+            && ignored_value_is_reported(value)
+        {
+            record_ignored(ignored, key, value);
+        }
     }
 
     let net = get("net");
     let typ = get("type");
     let host = get("host");
     let path = get("path");
-    match net.to_ascii_lowercase().as_str() {
+    let net_key = net.to_ascii_lowercase();
+    // Whether the envelope's `type` already named a transport mode — gRPC's
+    // `multi`, or an XHTTP mode. The extra's `mode` then fills nothing: the
+    // top level wins.
+    let envelope_names_mode = match net_key.as_str() {
+        "grpc" => typ == "multi",
+        "xhttp" | "splithttp" => {
+            !matches!(typ.as_str(), "" | "none" | "auto")
+                && crate::model::validation::xhttp_mode_supported(&typ)
+        }
+        _ => false,
+    };
+    match net_key.as_str() {
         "" | "tcp" | "raw" => {
             stream.network = Network::Raw;
             match typ.as_str() {
@@ -2470,6 +3136,15 @@ fn parse_legacy_vmess(
             ));
         }
     }
+
+    // The private transport query fills what the envelope's own keys cannot
+    // carry, through the URL grammar's setters.
+    apply_legacy_extra(
+        &get("throneExtra"),
+        envelope_names_mode,
+        &mut stream,
+        ignored,
+    )?;
 
     let name = match get("ps") {
         ps if !ps.is_empty() => match sanitize_profile_name(&ps)? {
@@ -2746,21 +3421,7 @@ fn parse_socks(
 /// is a flat alternating `name,value` list joined by `,`; an odd element count
 /// or a repeated name has no single meaning and is refused.
 fn http_headers(raw: &str) -> Result<Map<String, Value>, LinkError> {
-    let items: Vec<&str> = raw.split(',').collect();
-    let mut headers = Map::new();
-    if !items.len().is_multiple_of(2) {
-        return Err(malformed(Diag::new(Key::LinkHttpHeaders)));
-    }
-    for pair in items.chunks(2) {
-        if pair[0].is_empty()
-            || headers
-                .insert(pair[0].to_string(), Value::String(pair[1].to_string()))
-                .is_some()
-        {
-            return Err(malformed(Diag::new(Key::LinkHttpHeaders)));
-        }
-    }
-    Ok(headers)
+    header_pairs(raw, ',')
 }
 
 /// `http://` / `https://` — the link a client exports for an HTTP CONNECT
@@ -3061,14 +3722,18 @@ fn parse_hysteria_authority(
     Ok((host, first, Some(port_text.to_string())))
 }
 
-/// The salamander packet-size range a Hysteria 2 link carries.
+/// The salamander packet-size range a Hysteria 2 link carries. Links spell
+/// the bounds in snake_case or camelCase; both name the same field, so two
+/// spellings at once are refused rather than silently preferred.
 fn hysteria_packet_size(q: &Query) -> Result<Int32Range, LinkError> {
     let parse = |value: &str| {
         value
             .parse::<i32>()
             .map_err(|_| malformed(Diag::new(Key::LinkHysteriaPacketSize)))
     };
-    match (q.get_ne("minPacketSize"), q.get_ne("maxPacketSize")) {
+    let min = one_of(q, &["minPacketSize", "min_packet_size"])?.filter(|v| !v.is_empty());
+    let max = one_of(q, &["maxPacketSize", "max_packet_size"])?.filter(|v| !v.is_empty());
+    match (min, max) {
         (None, None) => Ok(Int32Range::single(0)),
         (Some(min), None) => Ok(Int32Range::single(parse(min)?)),
         (None, Some(max)) => Ok(Int32Range::single(parse(max)?)),
@@ -3136,9 +3801,14 @@ fn hysteria_finalmask(
     // of disappearing.
     if obfs.is_none()
         && obfs_password.is_none()
-        && let Some(key) = ["minPacketSize", "maxPacketSize"]
-            .into_iter()
-            .find(|key| q.get_ne(key).is_some())
+        && let Some(key) = [
+            "minPacketSize",
+            "maxPacketSize",
+            "min_packet_size",
+            "max_packet_size",
+        ]
+        .into_iter()
+        .find(|key| q.get_ne(key).is_some())
     {
         return Err(LinkError::Unsupported(
             Diag::new(Key::LinkUnsupportedQueryField).arg(key),
@@ -3231,14 +3901,22 @@ fn parse_hysteria2(
         "obfs-password",
         "minPacketSize",
         "maxPacketSize",
+        "min_packet_size",
+        "max_packet_size",
         "mport",
         "hop_interval",
+        "hop_interval_max",
         "upmbps",
         "downmbps",
         "bbr_profile",
         "disable_chrome_parrot",
     ];
     validate_scheme_query(&q, OWN, ignored)?;
+    // Links model the hop interval as a range; the hop mask carries one
+    // interval, so the upper bound has no field and is reported as dropped.
+    if let Some(max) = q.get_ne("hop_interval_max") {
+        record_ignored(ignored, "hop_interval_max", max);
+    }
     // Hysteria runs on QUIC with TLS always on: only an explicit `tls` is a
     // value the grammar can honor.
     match q.get("security") {
@@ -3839,6 +4517,9 @@ fn validate_protocol_exportable(settings: &ProtocolSettings) -> Result<(), LinkE
     Ok(())
 }
 
+/// Advanced TLS state the #716 grammar cannot spell refuses export. That
+/// includes a cipher-suite list: `cs` imports into it, and this one-way
+/// translation is the documented contract.
 fn validate_tls_exportable(tls: &TlsModel) -> Result<(), LinkError> {
     if !tls.min_version.is_empty()
         || !tls.max_version.is_empty()
@@ -4898,6 +5579,164 @@ mod tests {
         .unwrap();
         assert!(parsed.ignored.is_empty());
         assert!(parsed.outbound.stream.raw_settings.is_none());
+    }
+
+    /// The one `mkcp-legacy` mask a KCP link's legacy fields produce.
+    fn kcp_legacy_mask(stream: &StreamModel) -> &crate::model::stream::FinalmaskMkcpLegacy {
+        let finalmask = stream
+            .finalmask
+            .as_ref()
+            .expect("the legacy fields map into the finalmask");
+        match finalmask.udp.as_slice() {
+            [FinalmaskUdpMask::MkcpLegacy { settings, .. }] => settings,
+            other => panic!("expected one mkcp-legacy mask, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kcp_legacy_header_folds_into_the_finalmask() {
+        // A legacy mKCP link writes its header as `headerType=<legacy name>`;
+        // import folds it into the `mkcp-legacy` finalmask. `wechat-video` is
+        // the link spelling of the mask id `wechat`.
+        let (p, canonical) = round_trip(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&headerType=wechat-video"
+        ));
+        assert_eq!(p.outbound.stream.network, Network::Kcp);
+        let settings = kcp_legacy_mask(&p.outbound.stream);
+        assert_eq!(settings.header, "wechat");
+        assert_eq!(settings.value, "");
+        assert!(canonical.contains("type=kcp"), "{canonical}");
+        assert!(canonical.contains("fm="), "{canonical}");
+        assert!(!canonical.contains("headerType"), "{canonical}");
+    }
+
+    #[test]
+    fn kcp_legacy_seed_folds_into_the_finalmask() {
+        // Without a header the mask's `value` is the old AES-128-GCM seed
+        // (`infra/conf/transport_finalmask.go:738-746`); the link spells it
+        // `seed=`.
+        let (p, canonical) = round_trip(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&seed=ZWR1"
+        ));
+        let settings = kcp_legacy_mask(&p.outbound.stream);
+        assert_eq!(settings.header, "");
+        assert_eq!(settings.value, "ZWR1");
+        assert!(canonical.contains("fm="), "{canonical}");
+        assert!(!canonical.contains("seed="), "{canonical}");
+    }
+
+    #[test]
+    fn kcp_legacy_header_and_seed_share_one_mask() {
+        // One KCP link carrying both the legacy header and the seed: one mask
+        // holding both fields, with the transport's default mtu/tti untouched.
+        let (p, canonical) = round_trip(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&headerType=srtp&seed=ZWR1"
+        ));
+        let kcp = p
+            .outbound
+            .stream
+            .kcp_settings
+            .as_ref()
+            .expect("a KCP link carries the block");
+        assert!(
+            kcp.mtu.is_none() && kcp.tti.is_none(),
+            "the link names no mtu/tti"
+        );
+        let settings = kcp_legacy_mask(&p.outbound.stream);
+        assert_eq!(settings.header, "srtp");
+        assert_eq!(settings.value, "ZWR1");
+        assert!(canonical.contains("fm="), "{canonical}");
+        assert!(!canonical.contains("headerType"), "{canonical}");
+        assert!(!canonical.contains("seed="), "{canonical}");
+        let exported = canonical
+            .split('#')
+            .next()
+            .expect("the link has a query")
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("fm="))
+            .expect("the export carries the folded mask");
+        let exported: Value =
+            serde_json::from_str(&pct_decode(exported).expect("the export percent-encodes"))
+                .expect("the exported finalmask is JSON");
+        assert_eq!(
+            exported["udp"][0],
+            serde_json::json!({
+                "type": "mkcp-legacy",
+                "settings": {"header": "srtp", "value": "ZWR1"},
+            })
+        );
+    }
+
+    #[test]
+    fn kcp_legacy_none_and_empty_fields_are_no_ops() {
+        // `none` and an empty value name no obfuscation, so neither builds a
+        // mask nor joins the dropped-parameter report.
+        for suffix in ["&headerType=none", "&headerType=", "&seed="] {
+            let parsed = parse_link(&format!(
+                "vless://{UUID}@kcp.local:443?encryption=none&type=kcp{suffix}"
+            ))
+            .unwrap_or_else(|error| panic!("{suffix}: {error}"));
+            assert!(
+                parsed.outbound.stream.finalmask.is_none(),
+                "{suffix} must not build a mask"
+            );
+            assert!(parsed.ignored.is_empty(), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn kcp_legacy_fields_conflict_with_a_carried_mask() {
+        // Two sources of one mask: the carried `fm` already names it, so the
+        // legacy pair is a duplicate rather than a second entry to merge.
+        let fm = pct_encode(r#"{"udp":[{"type":"mkcp-legacy","settings":{"header":"dtls"}}]}"#);
+        expect_malformed(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&headerType=srtp&fm={fm}"
+        ));
+        // `none` names no mask, so it does not collide with the carried one.
+        round_trip(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&headerType=none&fm={fm}"
+        ));
+    }
+
+    #[test]
+    fn kcp_legacy_fields_stay_refused_off_kcp() {
+        // `headerType` keeps its raw-only and absent-on-other-transports
+        // rule; the seed still names obfuscation no other transport carries.
+        expect_unsupported(&format!(
+            "vless://{UUID}@h.local:443?encryption=none&type=ws&headerType=srtp"
+        ));
+        expect_unsupported(&format!(
+            "vless://{UUID}@h.local:443?encryption=none&type=ws&seed=ZWR1"
+        ));
+        // A header the core's mask never built is refused on KCP too.
+        expect_unsupported(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&headerType=bogus"
+        ));
+    }
+
+    #[test]
+    fn kcp_legacy_mask_precedes_a_carried_chains_last_entry_masks() {
+        // A carried chain without its own `mkcp-legacy` keeps its entries;
+        // the folded mask goes before `xdns`, which resolves the destination
+        // after the header wrapper.
+        let fm = pct_encode(
+            r#"{"udp":[{"type":"salamander","password":"pw"},{"type":"xdns","settings":{"domains":[{"names":["a.example"],"types":[1]}],"resolvers":[{"addrs":["udp://1.1.1.1:53"]}]}}]}"#,
+        );
+        let parsed = parse_link(&format!(
+            "vless://{UUID}@kcp.local:443?encryption=none&type=kcp&headerType=dtls&fm={fm}"
+        ))
+        .unwrap();
+        let udp = &parsed.outbound.stream.finalmask.as_ref().unwrap().udp;
+        assert!(
+            matches!(udp[0], FinalmaskUdpMask::Salamander { .. }),
+            "{udp:?}"
+        );
+        assert!(
+            matches!(&udp[1], FinalmaskUdpMask::MkcpLegacy { settings, .. }
+                if settings.header == "dtls" && settings.value.is_empty()),
+            "{udp:?}"
+        );
+        assert!(matches!(udp[2], FinalmaskUdpMask::Xdns { .. }), "{udp:?}");
     }
 
     #[test]
@@ -6046,6 +6885,112 @@ mod tests {
         assert_eq!(quic.disable_chrome_parrot, Some(true));
     }
 
+    /// A provider template writes its query on an empty path
+    /// (`…:18881/?insecure=0&sni=…&pcs=`) and stamps `insecure=0` with an
+    /// empty pin. The authority ends at that `/` as in every URL grammar, so
+    /// the entry imports with TLS and the given sni; `insecure=0` spells the
+    /// model default and stays unreported.
+    #[test]
+    fn hysteria2_provider_template_on_an_empty_path_imports() {
+        let parsed = parse_link(
+            "hysteria2://letmein@node.example.com:18881/?insecure=0&sni=node.example.com&pcs=#Node%20HY2%20%7C%20200.8",
+        )
+        .expect("the empty path separator must not refuse the entry");
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+        let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
+            panic!("expected a hysteria profile");
+        };
+        assert_eq!(settings.address, "node.example.com");
+        assert_eq!(settings.port, 18881);
+        let stream = &parsed.outbound.stream;
+        assert_eq!(stream.network, Network::Hysteria);
+        assert_eq!(stream.security, Security::Tls);
+        let tls = stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "node.example.com");
+        assert_eq!(tls.pinned_peer_cert_sha256, "");
+        assert_eq!(parsed.name, "Node HY2 | 200.8");
+    }
+
+    /// A provider template stamps `sni` and `servername` side by side and
+    /// writes gRPC's absent `mode=gun` on a RAW link. Neither names a RAW
+    /// setting; the entry imports with REALITY, reports the dropped `mode`
+    /// value, and exports the canonical `sni` alone.
+    #[test]
+    fn provider_template_with_servername_and_gun_mode_imports() {
+        let link = format!(
+            "vless://{UUID}@203.0.113.10:35144?mode=gun&security=reality&encryption=none\
+             &type=tcp&flow=xtls-rprx-vision&pbk=rL5c2g3K9yZ8xN1vQ7wE0tYuIoPaSdFgHjKlZxCvBnM\
+             &sid=0123abcd&sni=www.example.com&servername=www.example.com&spx=%2F&fp=chrome#Provider"
+        );
+        let report = parse_link(&link)
+            .expect("the template artifact must not refuse the entry")
+            .ignored;
+        assert_eq!(report.len(), 1, "{report:?}");
+        assert_eq!(report[0].name, "mode");
+        assert_eq!(report[0].value, "gun");
+        assert!(
+            report[0].raw.starts_with("vless://") && report[0].raw.contains("mode=gun"),
+            "the report carries the link it read, got {:?}",
+            report[0].raw
+        );
+        let (profile, canonical) = round_trip(&link);
+        assert_eq!(profile.name, "Provider");
+        assert_eq!(profile.outbound.stream.network, Network::Raw);
+        let ProtocolSettings::Vless(settings) = &profile.outbound.settings else {
+            panic!("expected a VLESS profile");
+        };
+        assert_eq!(settings.port, 35144);
+        assert_eq!(settings.flow, "xtls-rprx-vision");
+        assert_eq!(settings.encryption, "none");
+        let reality = profile.outbound.stream.reality_settings.as_ref().unwrap();
+        assert_eq!(reality.server_name, "www.example.com");
+        assert_eq!(reality.short_id, "0123abcd");
+        assert_eq!(reality.spider_x, "/");
+        assert_eq!(reality.fingerprint, "chrome");
+        assert!(canonical.contains("sni=www.example.com"));
+        assert!(!canonical.contains("servername="));
+        assert!(!canonical.contains("mode="));
+    }
+
+    /// `gun` and `multi` are the gRPC template artifacts; any other mode
+    /// value is a typo the selected transport cannot carry and still refuses
+    /// the link.
+    #[test]
+    fn a_genuine_mode_typo_still_refuses() {
+        let link = format!(
+            "vless://{UUID}@h.example.com:443?type=tcp&mode=multi2&security=reality&pbk={}&sid=0123abcd&sni=example.com",
+            reality_public_key()
+        );
+        expect_unsupported(&link);
+        expect_malformed(&format!(
+            "vless://{UUID}@h.example.com:443?type=xhttp&path=%2Fx&mode=stream-two"
+        ));
+    }
+
+    /// The empty-path separator is URL structure, not a per-scheme quirk:
+    /// every URL-style parser passes the same split, and each must read the
+    /// authority the way the reference clients' URL parsers do. A non-empty
+    /// path names no field this grammar spells — a transport path travels as
+    /// the `path` query value — so it ends the authority and is dropped.
+    #[test]
+    fn an_empty_path_separator_is_url_structure_not_a_scheme_quirk() {
+        for link in [
+            format!("vless://{UUID}@h.example.com:443/?security=tls&type=tcp"),
+            "trojan://pw@h.example.com:443/?sni=g.example.com".to_string(),
+            "socks5://u:p@h.example.com:1080/".to_string(),
+            "hysteria2://pw@h.example.com:443/".to_string(),
+        ] {
+            parse_link(&link).unwrap_or_else(|error| panic!("{link}: {error}"));
+        }
+        let parsed = parse_link("hysteria2://pw@h.example.com:443/ws")
+            .expect("a URL path is not the authority");
+        let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
+            panic!("expected a hysteria profile");
+        };
+        assert_eq!(settings.address, "h.example.com");
+        assert_eq!(settings.port, 443);
+    }
+
     #[test]
     fn hysteria2_refuses_gecko_realm_and_one_sided_rates() {
         expect_unsupported("hysteria2://pw@h.example.com:443?obfs=gecko&obfs-password=x");
@@ -6272,7 +7217,6 @@ mod tests {
     #[test]
     fn hostile_and_malformed_uri_hosts_are_rejected() {
         for link in [
-            format!("vless://{UUID}@example.com:443/evil"),
             format!("vless://{UUID}@bad@host.example:443"),
             format!("vless://{UUID}@täst.example:443"),
             format!("vless://{UUID}@2001:db8::1:443"),
@@ -6578,8 +7522,8 @@ mod tests {
             .ws_settings
             .as_mut()
             .unwrap()
-            .headers
-            .insert("X-Test".into(), Value::String("value".into()));
+            .extra
+            .insert("unknownSetting".into(), Value::String("value".into()));
         expect_lossy(&profile, "wsSettings");
 
         let mut profile = parse_link(&format!(
@@ -6646,8 +7590,9 @@ mod tests {
 
     #[test]
     fn export_refusals_name_the_transport_block_and_their_own_reason() {
-        // A congestion knob and a header map have no share-link spelling:
-        // each refusal names the block it sits in under its own key.
+        // A congestion knob and an unknown transport setting have no
+        // share-link spelling: each refusal names the block it sits in under
+        // its own key.
         let mut kcp = parse_link(&format!(
             "vless://{UUID}@kcp.local:443?type=kcp&mtu=1400#KCP"
         ))
@@ -6670,8 +7615,8 @@ mod tests {
             .httpupgrade_settings
             .as_mut()
             .unwrap()
-            .headers
-            .insert("X-Test".into(), Value::String("value".into()));
+            .extra
+            .insert("unknownSetting".into(), Value::String("value".into()));
         expect_lossy_message(
             &upgrade,
             Key::LinkLossyHttpupgrade,
@@ -7383,5 +8328,767 @@ mod tests {
             )
         );
         assert_eq!(prefixed.to_string(), prefixed.text(Language::En));
+    }
+
+    // ----- client template spellings -----
+
+    /// Every fixture below carries this synthetic UUID and a host under
+    /// `example.com`; no real subscription value is reproduced.
+    const TEMPLATE_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// A link writes the Xray mux keys beside `mux` when the profile carries
+    /// a custom multiplex. Xray's mux has no share-link field, so the keys are
+    /// dropped with a report and the export keeps none of them.
+    #[test]
+    fn xray_mux_keys_are_dropped_with_a_report() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=node.example.com&fp=chrome&mux=true&mux_concurrency=16\
+             &mux_xudp_concurrency=8&mux_xudp_proxy_udp443=skip#mux-keys"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(
+            ignored_names(&parsed),
+            [
+                "mux",
+                "mux_concurrency",
+                "mux_xudp_concurrency",
+                "mux_xudp_proxy_udp443"
+            ]
+        );
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(parsed.outbound.stream.security, Security::Tls);
+        assert_eq!(tls.server_name, "node.example.com");
+        assert_eq!(tls.fingerprint, "chrome");
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=node.example.com&fp=chrome#mux-keys"
+            )
+        );
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+    }
+
+    /// A link can carry an empty `sni` unconditionally, so a TLS and a
+    /// REALITY export both see one. It names no setting; the absent-`sni`
+    /// fallback to the link host applies and the canonical export writes the
+    /// host.
+    #[test]
+    fn an_empty_sni_is_an_absent_sni() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=&fp=chrome#empty-sni"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(parsed.outbound.stream.security, Security::Tls);
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "node.example.com");
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=node.example.com&fp=chrome#empty-sni"
+            )
+        );
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+
+        // `servername` is the same alias, so an empty value is absent there
+        // too; a valued one still names the server.
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=node.example.com&servername=&fp=chrome#empty-servername"
+        );
+        let parsed = parse_link(&link).unwrap();
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "node.example.com");
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=&servername=edge.example.com&fp=chrome#servername-wins"
+        );
+        let parsed = parse_link(&link).unwrap();
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "edge.example.com");
+
+        // REALITY writes it the same way; the host fills the gap there too.
+        let public_key = reality_public_key();
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=reality&pbk={public_key}&sid=0123456789abcdef&sni=&fp=chrome#empty-reality-sni"
+        );
+        let parsed = parse_link(&link).unwrap();
+        let reality = parsed.outbound.stream.reality_settings.as_ref().unwrap();
+        assert_eq!(reality.server_name, "node.example.com");
+        let canonical = to_link(&parsed).unwrap();
+        assert!(canonical.contains("sni=node.example.com"), "{canonical}");
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+    }
+
+    /// An absent sni fills from the transport Host before the server address;
+    /// a comma list takes its first entry.
+    #[test]
+    fn an_absent_sni_falls_back_to_the_transport_host() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@203.0.113.10:443?encryption=none&type=ws\
+             &security=tls&host=cdn.example.com&path=%2Fws#H"
+        );
+        let (profile, canonical) = round_trip(&link);
+        let tls = profile.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "cdn.example.com");
+        assert!(canonical.contains("sni=cdn.example.com"), "{canonical}");
+
+        // Without a host the address still fills it.
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@203.0.113.10:443?encryption=none&type=ws\
+             &security=tls&path=%2Fws#H2"
+        );
+        let profile = parse_link(&link).unwrap();
+        let tls = profile.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "203.0.113.10");
+
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@203.0.113.10:443?encryption=none&type=ws\
+             &security=tls&host=a.example.com,b.example.com&path=%2Fws#H3"
+        );
+        let profile = parse_link(&link).unwrap();
+        let tls = profile.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "a.example.com");
+    }
+
+    /// Trojan's grammar implies TLS. A link that omits `security` keeps TLS
+    /// rather than following clients that read the absence as plaintext.
+    #[test]
+    fn trojan_without_security_stays_tls() {
+        let link = "trojan://letmein@node.example.com:443?type=tcp#trojan-tls";
+        let (profile, canonical) = round_trip(link);
+        assert_eq!(profile.outbound.stream.security, Security::Tls);
+        let tls = profile.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "node.example.com");
+        assert!(canonical.contains("security=tls"), "{canonical}");
+    }
+
+    /// Hysteria 2 links spell the packet sizes in snake_case or camelCase and
+    /// model the hop interval as a range. The aliases import; the hop mask
+    /// carries one interval, so the upper bound is reported as dropped.
+    #[test]
+    fn hysteria2_accepts_the_snake_case_aliases_and_drops_the_hop_max() {
+        let link = "hysteria2://letmein@node.example.com:20000-30000?obfs=salamander\
+                    &obfs-password=s3cret&min_packet_size=512&max_packet_size=1200\
+                    &hop_interval=30&hop_interval_max=60&upmbps=100&downmbps=200#hysteria-aliases";
+        let parsed = parse_link(link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["hop_interval_max"]);
+        assert_eq!(parsed.ignored[0].value, "60");
+        let ProtocolSettings::Hysteria(settings) = &parsed.outbound.settings else {
+            panic!("expected a hysteria profile");
+        };
+        assert_eq!(settings.address, "node.example.com");
+        assert_eq!(settings.port, 20000);
+        let stream = &parsed.outbound.stream;
+        assert_eq!(
+            stream.tls_settings.as_ref().unwrap().server_name,
+            "node.example.com"
+        );
+        let finalmask = stream.finalmask.as_ref().unwrap();
+        let salamander = finalmask
+            .udp
+            .iter()
+            .find_map(|mask| match mask {
+                FinalmaskUdpMask::Salamander { settings, .. } => Some(settings),
+                _ => None,
+            })
+            .expect("obfs maps onto the salamander mask");
+        assert_eq!(salamander.password, "s3cret");
+        assert_eq!(salamander.packet_size, Int32Range::new(512, 1200));
+        let hop = finalmask
+            .udp
+            .iter()
+            .find_map(|mask| match mask {
+                FinalmaskUdpMask::Udphop { settings, .. } => Some(settings.as_ref()),
+                _ => None,
+            })
+            .expect("the authority range maps onto the udphop mask");
+        assert!(matches!(
+            &hop.remote_ports,
+            FinalmaskPortList::Text(ports) if ports == "20000-30000"
+        ));
+        assert_eq!(hop.mode, "intervalRemote");
+        assert_eq!(hop.interval, Int32Range::single(30));
+        // The scheme is import-only: export is refused by the documented
+        // contract.
+        assert!(matches!(to_link(&parsed), Err(LinkError::Unsupported(_))));
+
+        // Two spellings of the same packet size cannot coexist.
+        expect_malformed(
+            "hysteria2://pw@node.example.com:443?obfs=salamander&obfs-password=p\
+             &minPacketSize=512&min_packet_size=512",
+        );
+    }
+
+    /// The dial fields include `quic_opener`, which Xray has no field for;
+    /// the link imports and the key is reported.
+    #[test]
+    fn quic_opener_is_dropped_with_a_report() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=node.example.com&quic_opener=true&tcp_fast_open=true#quic-opener"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["quic_opener", "tcp_fast_open"]);
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "node.example.com");
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=node.example.com&fp=chrome#quic-opener"
+            )
+        );
+        assert!(!canonical.contains("quic_opener"));
+    }
+
+    /// A shared template stamps gRPC's `mode=gun`/`mode=multi` on a transport
+    /// whose `mode` vocabulary does not contain the value. It names no
+    /// setting there: the transport keeps its default and the report names the
+    /// dropped value.
+    #[test]
+    fn foreign_grpc_mode_is_dropped_with_a_report() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=xhttp\
+             &security=tls&sni=node.example.com&path=%2Fx&mode=gun#grpc-mode-xhttp"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["mode"]);
+        assert_eq!(parsed.ignored[0].value, "gun");
+        let stream = &parsed.outbound.stream;
+        assert_eq!(stream.network, Network::Xhttp);
+        let xhttp = stream.xhttp_settings.as_ref().unwrap();
+        assert_eq!(xhttp.path, "/x");
+        assert_eq!(xhttp.mode, "");
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=node.example.com&fp=chrome\
+                 &type=xhttp&path=%2Fx#grpc-mode-xhttp"
+            )
+        );
+        assert!(!canonical.contains("mode="));
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+
+        // `multi` is the other gRPC spelling; a transport with no `mode`
+        // field at all drops and reports it the same way.
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=node.example.com&mode=multi#grpc-mode-raw"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["mode"]);
+        assert_eq!(parsed.ignored[0].value, "multi");
+        assert_eq!(parsed.outbound.stream.network, Network::Raw);
+        assert!(!to_link(&parsed).unwrap().contains("mode="));
+    }
+
+    /// Provider templates stamp the REALITY keys on TLS links, usually empty,
+    /// because the template is shared. An empty value names no setting and is
+    /// dropped silently; a value the model has no TLS field for still
+    /// refuses.
+    #[test]
+    fn empty_reality_keys_on_a_tls_link_are_no_ops() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none\
+             &security=tls&type=tcp&sni=node.example.com&fp=chrome&pbk=&sid=&spx=#empty-reality-keys"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+        assert_eq!(parsed.outbound.stream.security, Security::Tls);
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "node.example.com");
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=node.example.com&fp=chrome#empty-reality-keys"
+            )
+        );
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+
+        // A value is a REALITY setting the selected security cannot carry.
+        for key in ["pbk", "sid", "spx"] {
+            expect_unsupported(&format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none\
+                 &security=tls&type=tcp&sni=node.example.com&{key}=value#empty-reality-keys"
+            ));
+        }
+    }
+
+    /// WebSocket early data, custom headers, and the heartbeat keepalive
+    /// arrive as their own link keys. Xray stores early data in the path
+    /// query, so import folds `ed` into the path and export pulls it back out;
+    /// the headers map and the heartbeat are model fields already.
+    #[test]
+    fn ws_early_data_heartbeat_and_headers_round_trip() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=ws\
+             &security=tls&sni=cdn.example.net&fp=chrome&host=cdn.example.net\
+             &path=%2Fws&ed=2048&heartbeat_period=30\
+             &headers=User-Agent%7Ccurl%2F8%7CX-Test%7C1#ws-round-trip"
+        );
+        let (parsed, canonical) = round_trip(&link);
+        assert!(parse_link(&link).unwrap().ignored.is_empty());
+        let ws = parsed.outbound.stream.ws_settings.as_ref().unwrap();
+        assert_eq!(ws.host, "cdn.example.net");
+        assert_eq!(ws.path, "/ws?ed=2048");
+        assert_eq!(ws.heartbeat_period, Some(30));
+        assert_eq!(
+            ws.headers.get("User-Agent").and_then(Value::as_str),
+            Some("curl/8")
+        );
+        assert_eq!(ws.headers.get("X-Test").and_then(Value::as_str), Some("1"));
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=cdn.example.net&fp=chrome\
+                 &type=ws&host=cdn.example.net&path=%2Fws&ed=2048\
+                 &headers=User-Agent%7Ccurl%2F8%7CX-Test%7C1&heartbeat_period=30#ws-round-trip"
+            )
+        );
+
+        // Early data has no separate field: a link that spells it inside the
+        // path imports the same way and canonicalizes to the key.
+        let path_only = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=ws\
+             &security=tls&sni=cdn.example.net&path=%2Fws%3Fed%3D2048#path-early-data"
+        );
+        let parsed = parse_link(&path_only).unwrap();
+        let ws = parsed.outbound.stream.ws_settings.as_ref().unwrap();
+        assert_eq!(ws.path, "/ws?ed=2048");
+        assert!(to_link(&parsed).unwrap().contains("&ed=2048"));
+
+        // Zero is the core's "no early data" value, so it names nothing.
+        let zero = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=ws\
+             &security=tls&sni=cdn.example.net&path=%2Fws&ed=0#zero-early-data"
+        );
+        let parsed = parse_link(&zero).unwrap();
+        let ws = parsed.outbound.stream.ws_settings.as_ref().unwrap();
+        assert_eq!(ws.path, "/ws");
+        assert!(!to_link(&parsed).unwrap().contains("ed="));
+
+        // The header list is alternating name/value with no repeated name,
+        // and the numeric keys refuse a non-decimal value.
+        expect_malformed(&format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?type=ws&path=%2Fws&headers=X-A"
+        ));
+        expect_malformed(&format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?type=ws&path=%2Fws\
+             &headers=X-A%7C1%7CX-A%7C2"
+        ));
+        expect_malformed(&format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?type=ws&path=%2Fws&ed=many"
+        ));
+        expect_malformed(&format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?type=ws&path=%2Fws\
+             &heartbeat_period=often"
+        ));
+    }
+
+    /// HTTPUpgrade carries the same early data and headers keys; the block has
+    /// no heartbeat field, so a link carrying one is reported, not refused.
+    #[test]
+    fn httpupgrade_early_data_and_headers_round_trip() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none\
+             &type=httpupgrade&security=tls&sni=node.example.com&path=%2Fup\
+             &ed=1024&headers=X-A%2C1%2CX-B%2C2#httpupgrade-round-trip"
+        );
+        let (parsed, canonical) = round_trip(&link);
+        assert!(parse_link(&link).unwrap().ignored.is_empty());
+        let upgrade = parsed
+            .outbound
+            .stream
+            .httpupgrade_settings
+            .as_ref()
+            .unwrap();
+        assert_eq!(upgrade.path, "/up?ed=1024");
+        assert_eq!(
+            upgrade.headers.get("X-A").and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            upgrade.headers.get("X-B").and_then(Value::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            canonical,
+            format!(
+                "vless://{TEMPLATE_UUID}@node.example.com:443\
+                 ?encryption=none&security=tls&sni=node.example.com&fp=chrome\
+                 &type=httpupgrade&path=%2Fup&ed=1024&headers=X-A%7C1%7CX-B%7C2#httpupgrade-round-trip"
+            )
+        );
+
+        let heartbeat = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none\
+             &type=httpupgrade&security=tls&sni=node.example.com&path=%2Fup\
+             &heartbeat_period=30#httpupgrade-heartbeat"
+        );
+        let parsed = parse_link(&heartbeat).unwrap();
+        assert_eq!(ignored_names(&parsed), ["heartbeat_period"]);
+        let canonical = to_link(&parsed).unwrap();
+        assert!(!canonical.contains("heartbeat_period"));
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+    }
+
+    /// XHTTP spells custom headers as its own key too. The block's canonical
+    /// link carrier is the `extra` object, which already models the same map,
+    /// so import writes the field and export keeps it there.
+    #[test]
+    fn xhttp_headers_import_and_export_through_extra() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=xhttp\
+             &security=tls&sni=node.example.com&path=%2Fx\
+             &headers=User-Agent%7Ccurl%2F8#xhttp-headers"
+        );
+        let (parsed, canonical) = round_trip(&link);
+        assert!(parse_link(&link).unwrap().ignored.is_empty());
+        let xhttp = parsed.outbound.stream.xhttp_settings.as_ref().unwrap();
+        assert_eq!(
+            xhttp.headers.get("User-Agent").and_then(Value::as_str),
+            Some("curl/8")
+        );
+        assert!(!canonical.contains("&headers="), "{canonical}");
+
+        // Early data has no field on this transport: the value is reported
+        // and dropped instead of refusing the link.
+        let early = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=xhttp\
+             &security=tls&sni=node.example.com&path=%2Fx&ed=2048#xhttp-early-data"
+        );
+        let parsed = parse_link(&early).unwrap();
+        assert_eq!(ignored_names(&parsed), ["ed"]);
+        assert!(!to_link(&parsed).unwrap().contains("ed="));
+    }
+
+    /// When both spellings carry headers, the link's top level wins: the row
+    /// declares `extra` before `headers`, so `headers` replaces the whole map
+    /// `extra.headers` set instead of merging into it.
+    #[test]
+    fn xhttp_top_level_headers_replace_the_extra_map() {
+        let extra = pct_encode(r#"{"headers":{"X-Extra":"extra","X-Both":"extra"}}"#);
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=xhttp\
+             &security=tls&sni=node.example.com&path=%2Fx&extra={extra}\
+             &headers=X-Top%7Ctop%7CX-Both%7Ctop#xhttp-top-headers"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+        let xhttp = parsed.outbound.stream.xhttp_settings.as_ref().unwrap();
+        assert_eq!(
+            xhttp.headers.get("X-Top").and_then(Value::as_str),
+            Some("top")
+        );
+        assert_eq!(
+            xhttp.headers.get("X-Both").and_then(Value::as_str),
+            Some("top"),
+            "the top-level spelling decides the shared header"
+        );
+        assert!(
+            !xhttp.headers.contains_key("X-Extra"),
+            "the extra's map does not survive beside the top-level key: {:?}",
+            xhttp.headers
+        );
+        let canonical = to_link(&parsed).unwrap();
+        assert!(!canonical.contains("&headers="), "{canonical}");
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+    }
+
+    /// The Xray link export writes the TLS cipher-suite list as `cs`, which is
+    /// `tlsSettings.cipherSuites` in the model. The #716 grammar has no
+    /// spelling for it, so the value imports and a later export still refuses
+    /// instead of dropping it.
+    #[test]
+    fn tls_cipher_suites_import_but_still_refuse_export() {
+        let link = format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?encryption=none&type=tcp\
+             &security=tls&sni=node.example.com&fp=chrome\
+             &cs=TLS_AES_128_GCM_SHA256%3ATLS_AES_256_GCM_SHA384#cipher-suites"
+        );
+        let parsed = parse_link(&link).unwrap();
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(
+            tls.cipher_suites,
+            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+        );
+        expect_lossy_message(
+            &parsed,
+            Key::LinkLossyTlsAdvanced,
+            "streamSettings.tlsSettings",
+        );
+
+        // An empty list names nothing, and the parameter is TLS-only: a link
+        // for the other security modes has no field to carry it.
+        expect_malformed(&format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?security=tls&sni=node.example.com&cs="
+        ));
+        expect_unsupported(&format!(
+            "vless://{TEMPLATE_UUID}@node.example.com:443?security=none&cs=TLS_AES_128_GCM_SHA256"
+        ));
+    }
+
+    // ----- legacy VMess envelope -----
+
+    /// A synthetic legacy VMess envelope: the common VMess JSON schema plus
+    /// three extra keys. Every value below is fake; no subscription data is
+    /// reproduced.
+    fn legacy_vmess_envelope(fields: Value) -> String {
+        let mut object = serde_json::json!({
+            "v": "2", "add": "node.example.com", "port": "443",
+            "id": TEMPLATE_UUID, "aid": "0", "type": "none",
+            "host": "", "path": "", "sni": "", "alpn": "", "fp": "",
+            "tls": "",
+        });
+        let map = object.as_object_mut().expect("the template is an object");
+        for (key, value) in fields.as_object().expect("the fields are an object") {
+            map.insert(key.clone(), value.clone());
+        }
+        vmess_json(object)
+    }
+
+    /// The envelope writes its transport export into `throneExtra`. The
+    /// envelope's own `net`/`host`/`path` stay authoritative; the extra fills
+    /// what they cannot carry through the URL grammar's own setters, and each
+    /// key the model has no field for is reported.
+    #[test]
+    fn legacy_vmess_extra_carries_the_websocket_shape() {
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "ws-extras", "net": "ws", "host": "cdn.example.net", "path": "/ws",
+            "tls": "tls", "sni": "cdn.example.net", "alpn": "h2", "fp": "chrome",
+            "throneExtra": "type=ws&host=cdn.example.net&path=%2Fws&method=GET\
+                            &ed=2048&headers=User-Agent%7Ccurl%2F8\
+                            &heartbeat_period=30&idle_timeout=30s\
+                            &mux=true&mux_concurrency=8\
+                            &packetEncoding=none&globalPadding=false\
+                            &authenticatedLength=false"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(parsed.outbound.stream.network, Network::Ws);
+        let ws = parsed.outbound.stream.ws_settings.as_ref().unwrap();
+        assert_eq!(ws.host, "cdn.example.net");
+        // Early data lives in the path, the model's own spelling.
+        assert_eq!(ws.path, "/ws?ed=2048");
+        assert_eq!(ws.heartbeat_period, Some(30));
+        assert_eq!(
+            ws.headers.get("User-Agent"),
+            Some(&Value::String("curl/8".into()))
+        );
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(tls.server_name, "cdn.example.net");
+        assert_eq!(tls.alpn, ["h2"]);
+        assert_eq!(tls.fingerprint, "chrome");
+        // The transport knobs and the mux/encoding switches have no Xray
+        // field; the two padding switches spell their off value, so they are
+        // the model default already and stay silent.
+        assert_eq!(
+            ignored_names(&parsed),
+            [
+                "method",
+                "idle_timeout",
+                "mux",
+                "mux_concurrency",
+                "packetEncoding"
+            ]
+        );
+        assert!(parsed.outbound.mux.is_empty());
+        validate_profile(&parsed).unwrap();
+
+        // The extra's `type` and `host`/`path` only repeat the envelope's own
+        // fields, so the canonical export is the app's URL VMess form.
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vmess://{TEMPLATE_UUID}@node.example.com:443\
+                 ?security=tls&sni=cdn.example.net&fp=chrome&alpn=h2\
+                 &type=ws&host=cdn.example.net&path=%2Fws&ed=2048\
+                 &headers=User-Agent%7Ccurl%2F8&heartbeat_period=30#ws-extras"
+            )
+        );
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+    }
+
+    /// The extra also carries the alternative spelling of the WebSocket
+    /// early-data cap (`max_early_data`) and its header name. Xray fixes the
+    /// header to `Sec-WebSocket-Protocol`, so the cap maps onto the row's `ed`
+    /// field and a different header name is reported.
+    #[test]
+    fn legacy_vmess_extra_maps_the_early_data_spelling() {
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "early-data-spelling", "net": "ws", "host": "cdn.example.net", "path": "/ws",
+            "throneExtra": "type=ws&max_early_data=2048\
+                            &early_data_header_name=Sec-WebSocket-Protocol"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        let ws = parsed.outbound.stream.ws_settings.as_ref().unwrap();
+        assert_eq!(ws.path, "/ws?ed=2048");
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "early-data-spelling", "net": "ws", "host": "cdn.example.net", "path": "/ws",
+            "throneExtra": "type=ws&early_data_header_name=X-Early-Data"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["early_data_header_name"]);
+    }
+
+    /// gRPC's `multiMode` is the envelope's `type` when it names one and the
+    /// extra's `mode` otherwise.
+    #[test]
+    fn legacy_vmess_extra_carries_the_grpc_shape() {
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "grpc-multi", "net": "grpc", "path": "svc",
+            "throneExtra": "type=grpc&serviceName=svc&mode=multi"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(parsed.outbound.stream.network, Network::Grpc);
+        let grpc = parsed.outbound.stream.grpc_settings.as_ref().unwrap();
+        assert_eq!(grpc.service_name, "svc");
+        assert_eq!(grpc.multi_mode, Some(true));
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vmess://{TEMPLATE_UUID}@node.example.com:443\
+                 ?type=grpc&serviceName=svc&mode=multi#grpc-multi"
+            )
+        );
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+
+        // The envelope's `type` already names the mode: it wins.
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "envelope-mode", "net": "grpc", "path": "svc", "type": "multi",
+            "throneExtra": "type=grpc&mode=gun"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        let grpc = parsed.outbound.stream.grpc_settings.as_ref().unwrap();
+        assert_eq!(grpc.multi_mode, Some(true));
+
+        // On a transport with no `mode` field the extra's value is the same
+        // template artifact the URL grammar drops: reported, never written.
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "grpc-mode-dropped", "net": "ws", "host": "cdn.example.net", "path": "/ws",
+            "throneExtra": "type=ws&mode=gun"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["mode"]);
+        assert_eq!(parsed.ignored[0].value, "gun");
+        assert_eq!(parsed.outbound.stream.network, Network::Ws);
+        assert!(!to_link(&parsed).unwrap().contains("mode="));
+    }
+
+    /// The extra carries the link-form mKCP knobs the row models.
+    #[test]
+    fn legacy_vmess_extra_carries_the_kcp_shape() {
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "kcp-knobs", "net": "kcp",
+            "throneExtra": "type=kcp&mtu=1350&tti=20"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        let kcp = parsed.outbound.stream.kcp_settings.as_ref().unwrap();
+        assert_eq!(kcp.mtu, Some(1350));
+        assert_eq!(kcp.tti, Some(20));
+        assert!(parsed.ignored.is_empty(), "{:?}", parsed.ignored);
+        let canonical = to_link(&parsed).unwrap();
+        assert_eq!(
+            canonical,
+            format!(
+                "vmess://{TEMPLATE_UUID}@node.example.com:443\
+                 ?type=kcp&mtu=1350&tti=20#kcp-knobs"
+            )
+        );
+        assert_profile_eq(&parsed, &parse_link(&canonical).unwrap());
+    }
+
+    /// The legacy envelope maps the TLS cipher-suite list to `cs` as well,
+    /// and writes `allowInsecure` for the removed Xray switch.
+    #[test]
+    fn legacy_vmess_maps_cs_and_reports_allow_insecure() {
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "cipher-suites", "tls": "tls", "sni": "node.example.com", "fp": "chrome",
+            "cs": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384",
+            "allowInsecure": "1",
+            "throneExtra": "mux=false"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        let tls = parsed.outbound.stream.tls_settings.as_ref().unwrap();
+        assert_eq!(
+            tls.cipher_suites,
+            "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+        );
+        assert_eq!(ignored_names(&parsed), ["allowInsecure"]);
+        // The suite list imports; the URL form has no spelling for it, so a
+        // later export refuses instead of dropping the value.
+        expect_lossy_message(
+            &parsed,
+            Key::LinkLossyTlsAdvanced,
+            "streamSettings.tlsSettings",
+        );
+
+        // `allowInsecure=0` is the default state, and a `cs` on an envelope
+        // with TLS off names no field the model can carry.
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "cipher-suites-no-tls", "cs": "TLS_AES_128_GCM_SHA256", "allowInsecure": "0"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(ignored_names(&parsed), ["cs"]);
+    }
+
+    /// The mux, padding and packet-encoding switches in `throneExtra` are
+    /// another client's settings with no Xray field: dropped and reported,
+    /// never mapped onto the outbound's own mux.
+    #[test]
+    fn legacy_vmess_extra_reports_the_settings_the_model_cannot_carry() {
+        let link = legacy_vmess_envelope(serde_json::json!({
+            "ps": "padding-switches",
+            "throneExtra": "mux=true&mux_padding=true&packetEncoding=packetaddr\
+                            &globalPadding=true&authenticatedLength=true"
+        }));
+        let parsed = parse_link(&link).unwrap();
+        assert_eq!(
+            ignored_names(&parsed),
+            [
+                "mux",
+                "mux_padding",
+                "packetEncoding",
+                "globalPadding",
+                "authenticatedLength"
+            ]
+        );
+        assert!(parsed.outbound.mux.is_empty());
+        assert_eq!(
+            to_link(&parsed).unwrap(),
+            format!("vmess://{TEMPLATE_UUID}@node.example.com:443#padding-switches")
+        );
+    }
+
+    /// The envelope stays strict: a JSON field outside the schema and the
+    /// three extras refuse the link, and so does an unknown key inside
+    /// `throneExtra`.
+    #[test]
+    fn legacy_vmess_envelope_still_refuses_unknown_fields() {
+        expect_unsupported(&legacy_vmess_envelope(serde_json::json!({
+            "ps": "unknown-field", "futureField": "x"
+        })));
+        expect_unsupported(&legacy_vmess_envelope(serde_json::json!({
+            "ps": "unknown-field", "net": "ws", "host": "cdn.example.net", "path": "/ws",
+            "throneExtra": "type=ws&futureKey=1"
+        })));
     }
 }

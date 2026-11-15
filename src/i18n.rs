@@ -6376,7 +6376,7 @@ mod en {
             }
             Key::LinkUnsupportedHysteriaObfs => "The hysteria2 obfuscation {} is not supported.",
             Key::LinkHttpHeaders => {
-                "The http link's headers must be an even-length name,value list with no repeated \
+                "The share link's headers must be an even-length name,value list with no repeated \
                  name."
             }
             Key::LinkWgSecretKey => "The wireguard link is missing its private key.",
@@ -6443,15 +6443,14 @@ mod en {
                 "The {} block holds mKCP options. The #716 grammar carries only mtu and tti."
             }
             Key::LinkLossyWs => {
-                "The {} block holds WebSocket options. The #716 grammar carries only host and path."
+                "The {} block holds WebSocket options the grammar cannot carry: unknown fields."
             }
             Key::LinkLossyGrpc => {
                 "The {} block holds gRPC options. The #716 grammar carries only serviceName, \
                  authority, and the gun or multi mode."
             }
             Key::LinkLossyHttpupgrade => {
-                "The {} block holds HTTPUpgrade options. The #716 grammar carries only host and \
-                 path."
+                "The {} block holds HTTPUpgrade options the grammar cannot carry: unknown fields."
             }
             Key::LinkLossyTransportUnselected => {
                 "The {} block holds settings for a transport that the profile does not select."
