@@ -1086,23 +1086,31 @@ pub static DNS_LEAK_ENTRY_LIST: std::sync::LazyLock<String> =
 /// misconfiguration it names.
 pub const DEFAULT_TUN_LEAK_BLOCK: [&str; 2] = [TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_MISCONFIG_TUN];
 
+/// The protocol one [`LeakPort`] row applies to: the two the core names, or
+/// the bare form both share (`parseLeak`, proxy/tun/wfp_leak.go).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeakProtocol {
+    Tcp,
+    Udp,
+    Both,
+}
+
 /// One port row of the leak editor: the core's `tcp|udp/<low>[-<high>]`
 /// spelling, or the bare `<low>[-<high>]` form both protocols share
 /// (`parseLeak`, proxy/tun/wfp_leak.go). A connection to those ports may only
 /// go through the TUN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeakPort {
-    protocol: Option<&'static str>,
+    protocol: LeakProtocol,
     low: u16,
     high: u16,
 }
 
 impl LeakPort {
-    /// A row built from the editor's controls: `protocol` is `tcp` or `udp`,
-    /// or `None` for the bare form both protocols share. `high` follows `low`
-    /// so a range never points backwards.
-    pub fn new(protocol: Option<&'static str>, low: u16, high: u16) -> Self {
-        debug_assert!(matches!(protocol, None | Some("tcp") | Some("udp")));
+    /// A row built from the editor's controls: the protocol the core matches,
+    /// or [`LeakProtocol::Both`] for the bare form. `high` follows `low` so a
+    /// range never points backwards.
+    pub fn new(protocol: LeakProtocol, low: u16, high: u16) -> Self {
         Self {
             protocol,
             low,
@@ -1110,8 +1118,8 @@ impl LeakPort {
         }
     }
 
-    /// The protocol token the core matches, or `None` for the bare form.
-    pub fn protocol(self) -> Option<&'static str> {
+    /// The protocol the row applies to.
+    pub fn protocol(self) -> LeakProtocol {
         self.protocol
     }
 
@@ -1129,8 +1137,10 @@ impl LeakPort {
 /// The core's spelling of the value.
 impl std::fmt::Display for LeakPort {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(protocol) = self.protocol {
-            write!(formatter, "{protocol}/")?;
+        match self.protocol {
+            LeakProtocol::Tcp => write!(formatter, "tcp/")?,
+            LeakProtocol::Udp => write!(formatter, "udp/")?,
+            LeakProtocol::Both => {}
         }
         write!(formatter, "{}", self.low)?;
         if self.high != self.low {
@@ -1150,9 +1160,9 @@ fn parse_leak_port(value: &str) -> Option<LeakPort> {
         return None;
     }
     let protocol = match leak.name {
-        "tcp" => Some("tcp"),
-        "udp" => Some("udp"),
-        "" => None,
+        "tcp" => LeakProtocol::Tcp,
+        "udp" => LeakProtocol::Udp,
+        "" => LeakProtocol::Both,
         _ => return None,
     };
     Some(LeakPort {
@@ -1176,7 +1186,7 @@ pub fn leak_port(entry: &str) -> Option<LeakPort> {
 /// nothing; `None` means every port is stored or blocked.
 pub fn next_free_leak_port(entries: &[String], scope: LeakScope) -> Option<LeakPort> {
     (1..=u16::MAX)
-        .map(|port| LeakPort::new(Some("tcp"), port, port))
+        .map(|port| LeakPort::new(LeakProtocol::Tcp, port, port))
         .find(|port| {
             let value = port.to_string();
             leak_entry_adds_block(scope, entries, &value)
@@ -1193,10 +1203,12 @@ struct LeakPrefix {
 
 impl LeakPrefix {
     /// Parse the address part with Go's `netip.ParsePrefix` semantics. The
-    /// prefix length is digits only, no sign and no leading zero, which the
-    /// core's parser enforces; the address family must match the bracket
-    /// form, and an IPv4-mapped IPv6 address is refused because Windows
-    /// checks such connections as IPv4.
+    /// prefix length is digits only, no sign and no leading zero — the core's
+    /// parser refuses a multi-character length whose first byte is not 1
+    /// through 9 (`bad bits after slash`) — and the value must fit the
+    /// address width. The address family must match the bracket form, and an
+    /// IPv4-mapped IPv6 address is refused because Windows checks such
+    /// connections as IPv4.
     fn parse(text: &str, ipv6: bool) -> Option<Self> {
         let (address, bits) = text.rsplit_once('/')?;
         if bits.is_empty()
@@ -1996,9 +2008,9 @@ impl TunCfg {
 #[cfg(test)]
 mod tun_tests {
     use super::{
-        DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, LeakScope,
-        TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_MISCONFIG_TUN, TunCfg, leak_detail_count,
-        leak_entry_adds_block, leak_entry_is_valid, leak_hidden_count, leak_scope,
+        DEFAULT_TUN_LEAK_BLOCK, DEFAULT_TUN_NAME, DNS_LEAK_ENTRIES, LeakPort, LeakProtocol,
+        LeakScope, TUN_LEAK_ALL_EXCEPT_LAN, TUN_LEAK_MISCONFIG_TUN, TunCfg, leak_detail_count,
+        leak_entry_adds_block, leak_entry_is_valid, leak_hidden_count, leak_port, leak_scope,
         leak_scope_hides, next_free_leak_port, set_leak_scope,
     };
     use serde_json::json;
@@ -2292,6 +2304,27 @@ mod tun_tests {
             tun.canonical_leak_block(),
             vec!["allexceptlan", "53", "853", "windnsclient", "misconfigtun"]
         );
+    }
+
+    #[test]
+    fn a_port_row_carries_its_protocol_as_a_type() {
+        // The three legal protocols are the three variants: there is no
+        // fourth spelling to construct, and each keeps the core's wording.
+        for (protocol, low, high, text) in [
+            (LeakProtocol::Tcp, 53, 53, "tcp/53"),
+            (LeakProtocol::Udp, 53, 53, "udp/53"),
+            (LeakProtocol::Both, 53, 53, "53"),
+            (LeakProtocol::Tcp, 10, 20, "tcp/10-20"),
+            (LeakProtocol::Udp, 10, 20, "udp/10-20"),
+            (LeakProtocol::Both, 10, 20, "10-20"),
+        ] {
+            let port = LeakPort::new(protocol, low, high);
+            assert_eq!(port.to_string(), text);
+            assert_eq!(port.protocol(), protocol);
+            assert_eq!(leak_port(text), Some(port));
+        }
+        assert_eq!(leak_port("tcp"), None, "a protocol alone names all ports");
+        assert_eq!(leak_port("both/53"), None, "no fourth protocol spelling");
     }
 
     #[test]

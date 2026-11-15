@@ -2,10 +2,10 @@
 
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{
-    LeakPort, LeakScope, TUN_LEAK_ICMP, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT,
-    canonical_leak_entry, canonicalize_leak_entries, is_unprefixed_scope_entry,
-    leak_entry_adds_block, leak_hidden_count, leak_port, leak_scope, leak_scope_hides,
-    next_free_leak_port, set_leak_scope,
+    LeakPort, LeakProtocol, LeakScope, TUN_LEAK_ICMP, TUN_LEAK_MISCONFIG_TUN,
+    TUN_LEAK_WINDNS_CLIENT, canonical_leak_entry, canonicalize_leak_entries,
+    is_unprefixed_scope_entry, leak_entry_adds_block, leak_hidden_count, leak_port, leak_scope,
+    leak_scope_hides, next_free_leak_port, set_leak_scope,
 };
 use crate::model::settings::Language;
 use crate::model::validation::{FindingTarget, ValidationCode};
@@ -37,6 +37,9 @@ pub struct TunScreen {
     /// (the inbounds validation cache precedent) — never on idle repaint
     /// frames.
     validation: widgets::Memo<(u64, u64), ValidationTexts>,
+    /// The add-port control's lowest free port, keyed on the model generation
+    /// and the scope: an idle repaint reuses the value and scans no port.
+    leak_free_port: widgets::Memo<(u64, LeakScope), Option<LeakPort>>,
 }
 
 /// One generation of the TUN screen's per-generation presentation: the
@@ -138,6 +141,18 @@ impl LeakDraft {
     }
 }
 
+/// The add-port control's lowest free port for the current model generation
+/// and scope. An idle repaint compares two words and reuses the value: no
+/// port scan, no allocation.
+fn memoized_free_leak_port(
+    memo: &mut widgets::Memo<(u64, LeakScope), Option<LeakPort>>,
+    generation: u64,
+    entries: &[String],
+    scope: LeakScope,
+) -> Option<LeakPort> {
+    *memo.get(&(generation, scope), || next_free_leak_port(entries, scope))
+}
+
 /// The leak block: a scope selector over the stored list, and, unless the
 /// scope is `Everything outside the tunnel`, the detail editor grouped by what
 /// each row controls. Every authored value goes through the model's parser, so
@@ -147,7 +162,13 @@ impl LeakDraft {
 /// edited under `Custom` and `Everything except the local network`. Only `all`
 /// makes a detail entry redundant; under `allexceptlan` an entry still blocks
 /// inside the local network, which the scope leaves open.
-fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
+fn leak_entries(
+    ui: &mut egui::Ui,
+    lang: Language,
+    entries: &mut Vec<String>,
+    free_port: &mut widgets::Memo<(u64, LeakScope), Option<LeakPort>>,
+    generation: u64,
+) -> bool {
     let mut changed = false;
     let previous = leak_scope(entries);
     let mut scope = previous;
@@ -163,9 +184,17 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
         set_leak_scope(entries, scope);
         changed = true;
     }
+    // `all` offers no add control, so its repair rows need no scan. Every
+    // other scope reads the one memoized port for the button's visibility and
+    // its click.
+    let next_port = if scope == LeakScope::All {
+        None
+    } else {
+        memoized_free_leak_port(free_port, generation, entries, scope)
+    };
     let hidden = match scope {
         LeakScope::Custom | LeakScope::AllExceptLan => {
-            let (edited, counted) = leak_detail_editor(ui, lang, entries, scope);
+            let (edited, counted) = leak_detail_editor(ui, lang, entries, scope, next_port);
             changed |= edited;
             counted
         }
@@ -176,7 +205,7 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
                 .iter()
                 .any(|entry| !is_unprefixed_scope_entry(entry) && !leak_scope_hides(scope, entry));
             if repairs {
-                let (edited, _) = leak_detail_editor(ui, lang, entries, scope);
+                let (edited, _) = leak_detail_editor(ui, lang, entries, scope, next_port);
                 changed |= edited;
             }
             leak_hidden_count(scope, entries)
@@ -212,6 +241,7 @@ fn leak_detail_editor(
     lang: Language,
     entries: &mut Vec<String>,
     scope: LeakScope,
+    next_port: Option<LeakPort>,
 ) -> (bool, usize) {
     let all_scope = scope == LeakScope::All;
     let dns_included = scope == LeakScope::AllExceptLan;
@@ -297,7 +327,8 @@ fn leak_detail_editor(
     if !all_scope {
         // One port or range form: the row's own range control covers a
         // `low-high` value, so the editor needs no separate range button.
-        let next_port = next_free_leak_port(entries, scope);
+        // The one memoized port serves both the button's visibility and its
+        // click.
         if let Some(port) = next_port
             && ui.button(t(lang, Key::TunLeakAddPort)).clicked()
         {
@@ -384,7 +415,7 @@ fn leak_port_row(
     egui::ComboBox::from_id_salt(("leak-protocol", index))
         .selected_text(leak_protocol_label(lang, protocol))
         .show_ui(ui, |ui| {
-            for candidate in [Some("tcp"), Some("udp"), None] {
+            for candidate in [LeakProtocol::Tcp, LeakProtocol::Udp, LeakProtocol::Both] {
                 if ui
                     .selectable_label(protocol == candidate, leak_protocol_label(lang, candidate))
                     .clicked()
@@ -426,8 +457,12 @@ fn leak_port_row(
 }
 
 /// The text of one protocol option in a port row.
-fn leak_protocol_label(lang: Language, protocol: Option<&'static str>) -> &'static str {
-    protocol.unwrap_or(t(lang, Key::TunLeakBothProtocols))
+fn leak_protocol_label(lang: Language, protocol: LeakProtocol) -> &'static str {
+    match protocol {
+        LeakProtocol::Tcp => "tcp",
+        LeakProtocol::Udp => "udp",
+        LeakProtocol::Both => t(lang, Key::TunLeakBothProtocols),
+    }
 }
 
 /// One stored entry the controls cannot express — a CIDR-prefixed value or a
@@ -686,7 +721,13 @@ impl TunScreen {
         widgets::section(ui, t(lang, Key::TunSectionLeakBlock), |ui| {
             let hint = t(lang, Key::TunLeakEntriesHint);
             ui.label(egui::RichText::new(hint).small());
-            changed |= leak_entries(ui, lang, &mut tun.auto_system_wfp_block_leak);
+            changed |= leak_entries(
+                ui,
+                lang,
+                &mut tun.auto_system_wfp_block_leak,
+                &mut self.leak_free_port,
+                generation,
+            );
             // The settings pass's blocking findings — an entry outside the
             // core's grammar — render under the list they judge, in the same
             // bytes the apply gate carries. An entry the load could not
@@ -1385,6 +1426,97 @@ mod tests {
             "the detail editor must come back"
         );
         assert!(harness.query_all_by_label(&note).next().is_none());
+    }
+
+    /// The add-port offer follows the stored list: the memoized port moves
+    /// when an entry lands behind the screen, and a `tcp` entry leaves no port
+    /// to offer.
+    #[test]
+    fn the_add_port_offer_follows_the_stored_list() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak = vec!["tcp/1".into()];
+        let mut harness = leak_harness(rig);
+        let add = t(Language::En, Key::TunLeakAddPort);
+
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, add)
+            .click();
+        harness.run();
+        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
+        assert_eq!(
+            leak.last().map(String::as_str),
+            Some("tcp/2"),
+            "the first free port after tcp/1: {leak:?}"
+        );
+
+        // A list the edit did not build moves the offer with it: a memo that
+        // kept the old key would still append tcp/2 and change nothing.
+        {
+            let rig = &mut harness.state_mut().1;
+            rig.settings.tun.auto_system_wfp_block_leak =
+                vec!["tcp/1".into(), "tcp/2".into(), "tcp/3".into()];
+            rig.edit();
+        }
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, add)
+            .click();
+        harness.run();
+        let leak = &harness.state().1.settings.tun.auto_system_wfp_block_leak;
+        assert_eq!(
+            leak.last().map(String::as_str),
+            Some("tcp/4"),
+            "the offer must follow the changed list: {leak:?}"
+        );
+
+        // A protocol token covers every port, so nothing is left to add.
+        {
+            let rig = &mut harness.state_mut().1;
+            rig.settings.tun.auto_system_wfp_block_leak = vec!["tcp".into()];
+            rig.edit();
+        }
+        harness.run();
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, add)
+                .is_none(),
+            "a covering tcp entry must remove the add control"
+        );
+    }
+
+    /// An invalid entry is not contained by a policy scope, so `all` keeps its
+    /// repair row while hiding the valid entries and offering no add control.
+    #[test]
+    fn a_policy_scope_keeps_an_invalid_entry_editable() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak =
+            vec!["all".into(), "bogus".into(), "udp/53".into()];
+        let harness = leak_harness(rig);
+
+        assert!(
+            harness.query_all_by_value("bogus").next().is_some(),
+            "the invalid entry renders its repair row"
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::CheckBox,
+                    t(Language::En, Key::TunLeakIcmpLabel),
+                )
+                .is_none(),
+            "all contains the named values"
+        );
+        assert!(
+            harness
+                .query_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::TunLeakAddPort),
+                )
+                .is_none(),
+            "all offers no add control"
+        );
     }
 
     /// No control in the leak editor renders disabled, whatever the stored

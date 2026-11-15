@@ -3,11 +3,13 @@
 //! Bind NIC uses the TUN screen's outbound-interface selection and the same
 //! resolver the tunnel guard and the probe use; Native follows the OS stack,
 //! which the tunnel captures while it is up. SOCKS5 exists on the refresh
-//! side. Bind NIC is usable only while TUN mode is on and the leak scope
-//! leaves a bypass: `all` and `allexceptlan` block every destination outside
-//! the tunnel, while a custom list names the dials it blocks. Before the
-//! tunnel connects, or under a catch-all scope, Bind NIC and Native are the
-//! same OS path, so a probe or refresh follows the stack instead of failing.
+//! side. One gate decides whether Bind NIC can bind: it needs TUN mode on,
+//! whose capture it bypasses, and a leak scope that leaves a bypass — `all`
+//! and `allexceptlan` block every destination outside the tunnel, while a
+//! custom list names the dials it blocks. Before the tunnel connects, or under
+//! a catch-all scope, Bind NIC and Native are the same OS path, so a probe or
+//! refresh follows the stack instead of failing. The screen, its note, and the
+//! effective path all read the same gate value, so they cannot disagree.
 //!
 //! Every resolution that cannot produce its carrier fails loudly. The one
 //! equivalent fallback is Bind NIC while no bypass is possible: with no TUN
@@ -17,9 +19,44 @@ use crate::model::{ProbePath, RefreshPath, Socks5Cfg, TunCfg};
 use crate::sys::netif::{NetIf, ProbeUplink, resolve_probe_uplink};
 use crate::sys::subscription::FetchTransport;
 
+/// The one rule for whether Bind NIC can bind. TUN mode supplies the capture
+/// to bypass; while it is on, an emitted catch-all leak scope (`all` or
+/// `allexceptlan`) blocks every destination outside the tunnel
+/// (`blockLeaks`, proxy/tun/tun_windows_wfp.go). `TunOff` wins over
+/// `LeakBlock` because it is the broader rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindNicGate {
+    /// TUN mode is on and the emitted leak scope leaves a bypass.
+    Available,
+    /// TUN mode is off, so there is no capture to bypass.
+    TunOff,
+    /// The emitted leak scope blocks every destination outside the tunnel.
+    LeakBlock,
+}
+
+impl BindNicGate {
+    /// Whether the gate hides Bind NIC: the segment cannot be picked and a
+    /// stored preference reads as Native.
+    pub fn blocks(self) -> bool {
+        self != Self::Available
+    }
+}
+
+/// The one Bind NIC gate. See [`BindNicGate`]: TUN mode supplies the capture
+/// to bypass, and a catch-all leak scope blocks every destination outside the
+/// tunnel while it is on. TUN off wins because it is the broader rule.
+pub fn bind_nic_gate(tun_enabled: bool, leak_block: bool) -> BindNicGate {
+    if !tun_enabled {
+        BindNicGate::TunOff
+    } else if leak_block {
+        BindNicGate::LeakBlock
+    } else {
+        BindNicGate::Available
+    }
+}
+
 /// The two path vocabularies' shared degradation rule: Bind NIC reads as
-/// Native when the tunnel cannot carry a bind or the leak scope blocks every
-/// bypass; every other path stays as stored.
+/// Native while the gate blocks; every other path stays as stored.
 trait PathDegrade: Copy {
     fn native() -> Self;
     fn is_bind_nic(self) -> bool;
@@ -45,30 +82,27 @@ impl PathDegrade for RefreshPath {
     }
 }
 
-fn effective_path<P: PathDegrade>(stored: P, tun_enabled: bool, leak_block: bool) -> P {
-    if stored.is_bind_nic() && (!tun_enabled || leak_block) {
+fn effective_path<P: PathDegrade>(stored: P, gate: BindNicGate) -> P {
+    if stored.is_bind_nic() && gate.blocks() {
         P::native()
     } else {
         stored
     }
 }
 
-/// The effective probe path. Bind NIC binds the physical uplink to bypass the
-/// TUN capture, which only exists while the tunnel is up; when TUN mode is
-/// off, or a catch-all leak scope blocks every bypass, the effective path is
-/// Native.
-pub fn effective_probe_path(stored: ProbePath, tun_enabled: bool, leak_block: bool) -> ProbePath {
-    effective_path(stored, tun_enabled, leak_block)
+/// The effective probe path under `gate`. Bind NIC binds the physical uplink
+/// to bypass the TUN capture, which only exists while the tunnel is up; when
+/// the gate blocks — TUN mode off, or a catch-all leak scope — the effective
+/// path is Native.
+pub fn effective_probe_path(stored: ProbePath, gate: BindNicGate) -> ProbePath {
+    effective_path(stored, gate)
 }
 
-/// The effective refresh path. Bind NIC behaves as it does for the probe;
-/// Native and SOCKS5 stay as stored, because neither bypasses the tunnel.
-pub fn effective_refresh_path(
-    stored: RefreshPath,
-    tun_enabled: bool,
-    leak_block: bool,
-) -> RefreshPath {
-    effective_path(stored, tun_enabled, leak_block)
+/// The effective refresh path under `gate`. Bind NIC behaves as it does for
+/// the probe; Native and SOCKS5 stay as stored, because neither bypasses the
+/// tunnel.
+pub fn effective_refresh_path(stored: RefreshPath, gate: BindNicGate) -> RefreshPath {
+    effective_path(stored, gate)
 }
 
 /// The probe command's `tun_outbound_interface` argument: Bind NIC carries the
@@ -107,10 +141,11 @@ pub enum PathError {
 /// `path` and `socks5` are the values in force (the global setting or the
 /// override's). `tun_enabled` is the TUN mode switch and `tun_live` the live
 /// TUN ownership the caller observes. `leak_block` is whether the emitted TUN
-/// config carries a leak block that blocks every bypass. Bind NIC only binds
-/// while the live capture exists and no such block is on; otherwise it and
-/// Native are the same OS path, so the fetch follows the stack instead of
-/// failing. `interfaces` is the caller's adapter view.
+/// config carries a leak block that blocks every bypass. The gate is built
+/// from those three, so Bind NIC only binds while the live capture exists and
+/// no such block is on; otherwise it and Native are the same OS path, so the
+/// fetch follows the stack instead of failing. `interfaces` is the caller's
+/// adapter view.
 pub fn refresh_transport(
     path: RefreshPath,
     socks5: &Socks5Cfg,
@@ -120,7 +155,8 @@ pub fn refresh_transport(
     leak_block: bool,
     interfaces: &[NetIf],
 ) -> Result<FetchTransport, PathError> {
-    match effective_refresh_path(path, tun_enabled && tun_live, leak_block) {
+    let gate = bind_nic_gate(tun_enabled && tun_live, leak_block);
+    match effective_refresh_path(path, gate) {
         RefreshPath::Native => Ok(FetchTransport::Native),
         RefreshPath::Socks5 => {
             let host = socks5.host.trim();
@@ -217,36 +253,36 @@ mod tests {
     #[test]
     fn bind_nic_degrades_to_native_while_the_tunnel_is_off() {
         assert_eq!(
-            effective_probe_path(ProbePath::BindNic, false, false),
+            effective_probe_path(ProbePath::BindNic, BindNicGate::TunOff),
             ProbePath::Native,
             "Bind NIC cannot bind while there is no capture to bypass"
         );
         assert_eq!(
-            effective_probe_path(ProbePath::BindNic, true, false),
+            effective_probe_path(ProbePath::BindNic, bind_nic_gate(true, false)),
             ProbePath::BindNic
         );
         assert_eq!(
-            effective_probe_path(ProbePath::Native, true, false),
+            effective_probe_path(ProbePath::Native, bind_nic_gate(true, false)),
             ProbePath::Native,
             "an explicit Native preference stays Native"
         );
 
         assert_eq!(
-            effective_refresh_path(RefreshPath::BindNic, false, false),
+            effective_refresh_path(RefreshPath::BindNic, BindNicGate::TunOff),
             RefreshPath::Native
         );
         assert_eq!(
-            effective_refresh_path(RefreshPath::BindNic, true, false),
+            effective_refresh_path(RefreshPath::BindNic, bind_nic_gate(true, false)),
             RefreshPath::BindNic
         );
         // Native and SOCKS5 do not depend on the tunnel.
-        for tun_active in [false, true] {
+        for gate in [BindNicGate::TunOff, bind_nic_gate(true, false)] {
             assert_eq!(
-                effective_refresh_path(RefreshPath::Native, tun_active, false),
+                effective_refresh_path(RefreshPath::Native, gate),
                 RefreshPath::Native
             );
             assert_eq!(
-                effective_refresh_path(RefreshPath::Socks5, tun_active, false),
+                effective_refresh_path(RefreshPath::Socks5, gate),
                 RefreshPath::Socks5
             );
         }
@@ -255,28 +291,42 @@ mod tests {
     #[test]
     fn bind_nic_degrades_to_native_while_the_leak_block_is_on() {
         assert_eq!(
-            effective_probe_path(ProbePath::BindNic, true, true),
+            effective_probe_path(ProbePath::BindNic, BindNicGate::LeakBlock),
             ProbePath::Native,
             "the leak block drops every direct dial Bind NIC makes"
         );
         assert_eq!(
-            effective_refresh_path(RefreshPath::BindNic, true, true),
+            effective_refresh_path(RefreshPath::BindNic, BindNicGate::LeakBlock),
             RefreshPath::Native
         );
         assert_eq!(
-            effective_probe_path(ProbePath::Native, true, true),
+            effective_probe_path(ProbePath::Native, BindNicGate::LeakBlock),
             ProbePath::Native
         );
         assert_eq!(
-            effective_refresh_path(RefreshPath::Socks5, true, true),
+            effective_refresh_path(RefreshPath::Socks5, BindNicGate::LeakBlock),
             RefreshPath::Socks5,
             "SOCKS5 follows the OS stack, which the tunnel captures"
         );
         assert_eq!(
-            effective_probe_path(ProbePath::BindNic, false, true),
+            effective_probe_path(ProbePath::BindNic, bind_nic_gate(false, true)),
             ProbePath::Native,
             "TUN off already degrades, leak list or not"
         );
+    }
+
+    #[test]
+    fn bind_nic_gate_names_tun_off_as_the_broader_reason() {
+        assert_eq!(bind_nic_gate(false, false), BindNicGate::TunOff);
+        assert_eq!(
+            bind_nic_gate(false, true),
+            BindNicGate::TunOff,
+            "TUN off wins over the leak block"
+        );
+        assert_eq!(bind_nic_gate(true, true), BindNicGate::LeakBlock);
+        assert_eq!(bind_nic_gate(true, false), BindNicGate::Available);
+        assert!(bind_nic_gate(true, true).blocks());
+        assert!(!bind_nic_gate(true, false).blocks());
     }
 
     #[test]

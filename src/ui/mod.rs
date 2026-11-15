@@ -547,11 +547,11 @@ impl<'a> ServersCtx<'a> {
         // runtime still checks the live capture: a Bind NIC path chosen before
         // the tunnel connects is the same OS path as Native.
         let tun_enabled = self.settings.mode == crate::model::Mode::Tun;
-        let path = sys::outbound_path::effective_probe_path(
-            self.settings.latency_test_path,
+        let gate = sys::outbound_path::bind_nic_gate(
             tun_enabled,
             self.settings.leak_block_blocks_bind_nic(),
         );
+        let path = sys::outbound_path::effective_probe_path(self.settings.latency_test_path, gate);
         let tun_outbound_interface =
             sys::outbound_path::probe_interface_setting(path, &self.settings.tun);
         let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());

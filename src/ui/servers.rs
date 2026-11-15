@@ -12057,27 +12057,23 @@ impl ServersScreen {
                             t(lang, Key::SrvOutboundOverride),
                         );
                         let tun_on = uictx.settings.mode == Mode::Tun;
-                        let leak_block = uictx.settings.leak_block_blocks_bind_nic();
+                        let gate = crate::sys::outbound_path::bind_nic_gate(
+                            tun_on,
+                            uictx.settings.leak_block_blocks_bind_nic(),
+                        );
                         let global_path = uictx.settings.subscription_path;
                         let effective = if draft.outbound_custom {
                             crate::sys::outbound_path::effective_refresh_path(
                                 draft.outbound_path,
-                                tun_on,
-                                leak_block,
+                                gate,
                             )
                         } else {
-                            crate::sys::outbound_path::effective_refresh_path(
-                                global_path,
-                                tun_on,
-                                leak_block,
-                            )
+                            crate::sys::outbound_path::effective_refresh_path(global_path, gate)
                         };
                         if draft.outbound_custom {
-                            let unavailable = crate::ui::outbound_settings::bind_nic_unavailable(
-                                tun_on, leak_block,
-                            );
-                            let disabled = unavailable
-                                .map(crate::ui::outbound_settings::BindNicUnavailable::hint);
+                            let disabled = gate
+                                .blocks()
+                                .then_some(crate::ui::outbound_settings::bind_nic_hint(gate));
                             let options = [
                                 (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
                                 (RefreshPath::Native, Key::SettingsPathNative, None),
@@ -12094,7 +12090,7 @@ impl ServersScreen {
                                     lang,
                                     effective,
                                     draft.outbound_path,
-                                    unavailable,
+                                    gate,
                                 ))
                                 .small()
                                 .weak(),
@@ -12736,10 +12732,14 @@ const MUX_SEED_CONCURRENCY: i16 = 128;
 const XUDP_SEED_CONCURRENCY: i16 = 16;
 
 /// Turn the mux block on and seed the concurrency the pinned core runs when
-/// the block carries no value of its own. An explicit value stays as typed.
+/// the block carries no usable value of its own. A stored negative value
+/// means TCP mux is off, so enabling with `-1` would keep the transport
+/// direct; it and an absent value both seed [`MUX_SEED_CONCURRENCY`]. An
+/// explicit zero or positive value stays as typed, because the core already
+/// runs `0..=127` as 128 without the app rewriting the user's number.
 fn enable_mux(m: &mut MuxModel) {
     m.enabled = true;
-    if m.concurrency.is_none() {
+    if m.concurrency.is_none_or(|value| value < 0) {
         m.concurrency = Some(MUX_SEED_CONCURRENCY);
     }
 }
@@ -20212,6 +20212,67 @@ Authentication: ML-KEM-768, Post-Quantum
             serde_json::to_value(&mux).unwrap(),
             json!({"enabled": true, "concurrency": MUX_SEED_CONCURRENCY}),
             "the emitted document carries the seeded value"
+        );
+    }
+
+    /// A stored negative concurrency means TCP mux is off. Ticking the switch
+    /// must not leave the transport direct (and must not leave xdrive with
+    /// the blocking negative-concurrency finding): it seeds the effective
+    /// concurrency over the negative value.
+    #[test]
+    fn mux_tab_replaces_a_negative_concurrency_when_the_switch_turns_on() {
+        let mut mux = crate::model::outbound::MuxModel {
+            enabled: false,
+            concurrency: Some(-1),
+            ..Default::default()
+        };
+        let mut harness = harness_builder().build_ui(|ui| {
+            mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableMux))
+            .click();
+        harness.run();
+        drop(harness);
+        assert!(mux.enabled, "the click turns the block on");
+        assert_eq!(
+            mux.concurrency,
+            Some(MUX_SEED_CONCURRENCY),
+            "a negative value keeps TCP mux off, so the switch seeds the effective concurrency"
+        );
+        assert_eq!(
+            serde_json::to_value(&mux).unwrap(),
+            json!({"enabled": true, "concurrency": MUX_SEED_CONCURRENCY}),
+            "the emitted document carries the seeded value"
+        );
+    }
+
+    /// An explicit zero or positive concurrency is the user's number and
+    /// survives the switch: the core already runs `0..=127` as 128, so the
+    /// seed must never overwrite it.
+    #[test]
+    fn mux_tab_keeps_an_explicit_concurrency_when_the_switch_turns_on() {
+        let mut mux = crate::model::outbound::MuxModel {
+            enabled: false,
+            concurrency: Some(8),
+            ..Default::default()
+        };
+        let mut harness = harness_builder().build_ui(|ui| {
+            mux_tab(ui, Language::En, &mut mux, None);
+        });
+        harness.run();
+        harness
+            .get_by_label(t(Language::En, Key::SrvEnableMux))
+            .click();
+        harness.run();
+        drop(harness);
+        assert!(mux.enabled, "the click turns the block on");
+        assert_eq!(mux.concurrency, Some(8), "an explicit value stays as typed");
+        assert_eq!(
+            serde_json::to_value(&mux).unwrap(),
+            json!({"enabled": true, "concurrency": 8}),
+            "the emitted document carries the typed value"
         );
     }
 

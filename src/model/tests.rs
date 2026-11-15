@@ -280,26 +280,26 @@ fn roundtrip_protocol_settings() {
     check::<HysteriaSettings>(json!({"version": 2, "address": "h.example.com", "port": 443}));
 }
 
-/// The legacy `blockDelay` spelling still loads, and the rule saves the one
-/// canonical `delay` key. The pinned core reads `blockDelay`, copies it into
-/// `delay`, and logs a deprecation warning on every start
+/// The deprecated `blockDelay` spelling still loads, and the rule saves the
+/// one canonical `delay` key. The pinned core reads `blockDelay`, copies it
+/// into `delay`, and logs a deprecation warning on every start
 /// (infra/conf/freedom.go:285-288), so re-emitting it would keep warning
 /// about a configuration the app itself wrote.
 #[test]
 fn freedom_final_rule_delay_loads_from_both_spellings_and_saves_as_delay() {
-    let legacy: FreedomFinalRule = serde_json::from_value(json!({
+    let deprecated: FreedomFinalRule = serde_json::from_value(json!({
         "action": "block",
         "blockDelay": "10-20",
     }))
     .expect("a stored blockDelay loads");
-    assert_eq!(legacy.delay, Some(Int32Range::new(10, 20)));
+    assert_eq!(deprecated.delay, Some(Int32Range::new(10, 20)));
     assert!(
-        !legacy.extra.contains_key("blockDelay"),
-        "the flatten map must not retain the legacy spelling: {:?}",
-        legacy.extra
+        !deprecated.extra.contains_key("blockDelay"),
+        "the flatten map must not retain the deprecated spelling: {:?}",
+        deprecated.extra
     );
     assert_eq!(
-        serde_json::to_value(&legacy).unwrap(),
+        serde_json::to_value(&deprecated).unwrap(),
         json!({"action": "block", "delay": "10-20"})
     );
 

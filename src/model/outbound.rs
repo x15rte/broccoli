@@ -730,7 +730,7 @@ pub struct FreedomFinalRule {
     #[serde(skip_serializing_if = "skip_empty_vec")]
     pub ip: Vec<String>,
     /// Block duration for a `block` rule, in the core's `delay` spelling.
-    /// Stored profiles from older builds carry the retired `blockDelay`
+    /// Stored profiles from older builds carry the deprecated `blockDelay`
     /// key: the core still reads it, copies it into `delay`, and logs a
     /// deprecation warning (infra/conf/freedom.go:285-288), so it is
     /// accepted on load and emitted only as `delay`.

@@ -14,7 +14,9 @@ use super::widgets;
 use crate::i18n::{Key, t};
 use crate::model::Settings;
 use crate::model::settings::{Language, ProbePath, RefreshPath};
-use crate::sys::outbound_path::{effective_probe_path, effective_refresh_path};
+use crate::sys::outbound_path::{
+    BindNicGate, bind_nic_gate, effective_probe_path, effective_refresh_path,
+};
 
 /// The shared latency-test and subscription settings surface.
 ///
@@ -56,8 +58,7 @@ impl OutboundSettingsSection {
         tun_enabled: bool,
     ) {
         let lang = settings.language;
-        let tun_on = tun_enabled;
-        let leak_block = settings.leak_block_blocks_bind_nic();
+        let gate = bind_nic_gate(tun_enabled, settings.leak_block_blocks_bind_nic());
 
         widgets::section(ui, t(lang, Key::SettingsLatencyTest), |ui| {
             if widgets::noted(ui, t(lang, Key::SettingsLatencyTestNote), |ui| {
@@ -70,7 +71,7 @@ impl OutboundSettingsSection {
             }) {
                 hooks.mark_dirty();
             }
-            self.latency_path_control(ui, &mut *settings, tun_on, leak_block, &mut *hooks);
+            self.latency_path_control(ui, &mut *settings, gate, &mut *hooks);
         });
 
         widgets::section(ui, t(lang, Key::SettingsSubscriptions), |ui| {
@@ -83,10 +84,8 @@ impl OutboundSettingsSection {
                 hooks.mark_dirty();
             }
             ui.label(RichText::new(t(lang, Key::SettingsSubscriptionUserAgentHint)).weak());
-            self.subscription_path_control(ui, &mut *settings, tun_on, leak_block, &mut *hooks);
-            if effective_refresh_path(settings.subscription_path, tun_on, leak_block)
-                == RefreshPath::Socks5
-            {
+            self.subscription_path_control(ui, &mut *settings, gate, &mut *hooks);
+            if effective_refresh_path(settings.subscription_path, gate) == RefreshPath::Socks5 {
                 self.socks5_fields(ui, &mut *settings, &mut *hooks);
             } else {
                 // The block is not in force, so its transient reveal and
@@ -101,22 +100,20 @@ impl OutboundSettingsSection {
     /// probe never dials through SOCKS5.
     ///
     /// The control shows the effective path, so a stored Bind NIC preference
-    /// reads as Native while TUN mode is off or the leak scope is catch-all.
-    /// Bind NIC is then disabled, and only an actual click writes: the stored
-    /// preference stays until the user picks Native, which replaces it.
+    /// reads as Native while the gate hides Bind NIC. Bind NIC is then
+    /// disabled, and only an actual click writes: the stored preference stays
+    /// until the user picks Native, which replaces it.
     fn latency_path_control(
         &mut self,
         ui: &mut Ui,
         settings: &mut Settings,
-        tun_on: bool,
-        leak_block: bool,
+        gate: BindNicGate,
         hooks: &mut FrameHooks<'_>,
     ) {
         let lang = settings.language;
         let stored = settings.latency_test_path;
-        let unavailable = bind_nic_unavailable(tun_on, leak_block);
-        let effective = effective_probe_path(stored, tun_on, leak_block);
-        let disabled = unavailable.map(BindNicUnavailable::hint);
+        let effective = effective_probe_path(stored, gate);
+        let disabled = gate.blocks().then_some(bind_nic_hint(gate));
         let options = [
             (ProbePath::BindNic, Key::SettingsPathBindNic, disabled),
             (ProbePath::Native, Key::SettingsPathNative, None),
@@ -128,7 +125,7 @@ impl OutboundSettingsSection {
             hooks.mark_dirty();
         }
         ui.label(
-            RichText::new(probe_path_note(lang, effective, stored, unavailable))
+            RichText::new(probe_path_note(lang, effective, stored, gate))
                 .small()
                 .weak(),
         );
@@ -141,15 +138,13 @@ impl OutboundSettingsSection {
         &mut self,
         ui: &mut Ui,
         settings: &mut Settings,
-        tun_on: bool,
-        leak_block: bool,
+        gate: BindNicGate,
         hooks: &mut FrameHooks<'_>,
     ) {
         let lang = settings.language;
         let stored = settings.subscription_path;
-        let unavailable = bind_nic_unavailable(tun_on, leak_block);
-        let effective = effective_refresh_path(stored, tun_on, leak_block);
-        let disabled = unavailable.map(BindNicUnavailable::hint);
+        let effective = effective_refresh_path(stored, gate);
+        let disabled = gate.blocks().then_some(bind_nic_hint(gate));
         let options = [
             (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
             (RefreshPath::Native, Key::SettingsPathNative, None),
@@ -162,7 +157,7 @@ impl OutboundSettingsSection {
             hooks.mark_dirty();
         }
         ui.label(
-            RichText::new(refresh_path_note(lang, effective, stored, unavailable))
+            RichText::new(refresh_path_note(lang, effective, stored, gate))
                 .small()
                 .weak(),
         );
@@ -242,47 +237,25 @@ fn password_reveal(ui: &mut Ui, lang: Language, revealed: &mut bool) {
     }
 }
 
-/// Why the Bind NIC segment cannot be picked. Both states also make a stored
-/// Bind NIC preference read as Native.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindNicUnavailable {
-    /// TUN mode is off, so there is no capture to bypass.
-    TunOff,
-    /// The emitted leak scope covers every destination outside the tunnel, so
-    /// the bypass itself is blocked.
-    LeakBlock,
-}
-
-impl BindNicUnavailable {
-    pub(crate) fn hint(self) -> Key {
-        match self {
-            Self::TunOff => Key::SettingsPathBindNicDisabledHint,
-            Self::LeakBlock => Key::SettingsPathBindNicLeakBlockHint,
-        }
-    }
-
-    fn note(self) -> Key {
-        match self {
-            Self::TunOff => Key::SettingsPathNoteBindNicTunOff,
-            Self::LeakBlock => Key::SettingsPathNoteBindNicLeakBlock,
-        }
+/// The hover hint a disabled Bind NIC segment carries. `Available` has no
+/// disabled segment; it names the segment's own note so the mapping stays
+/// total.
+pub(crate) fn bind_nic_hint(gate: BindNicGate) -> Key {
+    match gate {
+        BindNicGate::TunOff => Key::SettingsPathBindNicDisabledHint,
+        BindNicGate::LeakBlock => Key::SettingsPathBindNicLeakBlockHint,
+        BindNicGate::Available => Key::SettingsPathNoteBindNic,
     }
 }
 
-/// The Bind NIC gate. TUN mode supplies the capture to bypass; when it is on,
-/// an emitted catch-all leak scope (`all` or `allexceptlan`) blocks every
-/// destination outside the tunnel (`blockLeaks`, proxy/tun/tun_windows_wfp.go).
-/// TUN off wins because it is the broader rule.
-pub(crate) fn bind_nic_unavailable(
-    tun_enabled: bool,
-    leak_block: bool,
-) -> Option<BindNicUnavailable> {
-    if !tun_enabled {
-        Some(BindNicUnavailable::TunOff)
-    } else if leak_block {
-        Some(BindNicUnavailable::LeakBlock)
-    } else {
-        None
+/// The note a stored Bind NIC preference that reads as Native carries: the
+/// reason the gate names. `Available` cannot hide Bind NIC, so it names the
+/// Bind NIC note instead.
+fn bind_nic_note(gate: BindNicGate) -> Key {
+    match gate {
+        BindNicGate::TunOff => Key::SettingsPathNoteBindNicTunOff,
+        BindNicGate::LeakBlock => Key::SettingsPathNoteBindNicLeakBlock,
+        BindNicGate::Available => Key::SettingsPathNoteBindNic,
     }
 }
 
@@ -414,14 +387,13 @@ fn probe_path_note(
     lang: Language,
     effective: ProbePath,
     stored: ProbePath,
-    unavailable: Option<BindNicUnavailable>,
+    gate: BindNicGate,
 ) -> &'static str {
     match effective {
         ProbePath::BindNic => t(lang, Key::SettingsPathNoteBindNic),
-        ProbePath::Native if stored == ProbePath::BindNic => match unavailable {
-            Some(block) => t(lang, block.note()),
-            None => t(lang, Key::SettingsPathNoteNative),
-        },
+        ProbePath::Native if stored == ProbePath::BindNic && gate.blocks() => {
+            t(lang, bind_nic_note(gate))
+        }
         ProbePath::Native => t(lang, Key::SettingsPathNoteNative),
     }
 }
@@ -431,15 +403,14 @@ pub(crate) fn refresh_path_note(
     lang: Language,
     effective: RefreshPath,
     stored: RefreshPath,
-    unavailable: Option<BindNicUnavailable>,
+    gate: BindNicGate,
 ) -> &'static str {
     match effective {
         RefreshPath::BindNic => t(lang, Key::SettingsPathNoteBindNic),
         RefreshPath::Socks5 => t(lang, Key::SettingsSubscriptionPathNoteSocks5),
-        RefreshPath::Native if stored == RefreshPath::BindNic => match unavailable {
-            Some(block) => t(lang, block.note()),
-            None => t(lang, Key::SettingsPathNoteNative),
-        },
+        RefreshPath::Native if stored == RefreshPath::BindNic && gate.blocks() => {
+            t(lang, bind_nic_note(gate))
+        }
         RefreshPath::Native => t(lang, Key::SettingsPathNoteNative),
     }
 }
@@ -715,6 +686,35 @@ mod tests {
             ProbePath::Native
         );
         assert!(harness.state().1.requests.dirty);
+    }
+
+    #[test]
+    fn tun_off_names_its_own_reason_while_a_catch_all_leak_scope_is_stored() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Off;
+        rig.settings.latency_test_path = ProbePath::BindNic;
+        assert!(
+            !rig.settings.tun.auto_system_wfp_block_leak.is_empty(),
+            "the seeded leak block is in force too"
+        );
+        let mut harness = harness(rig, OutboundSettingsSection::default());
+        harness.run();
+
+        let lang = Language::En;
+        assert!(
+            harness
+                .query_all_by_label(t(lang, Key::SettingsPathNoteBindNicTunOff))
+                .next()
+                .is_some(),
+            "TUN off is the broader rule and names the reason"
+        );
+        assert!(
+            harness
+                .query_all_by_label(t(lang, Key::SettingsPathNoteBindNicLeakBlock))
+                .next()
+                .is_none(),
+            "the leak block would misname why Bind NIC is off"
+        );
     }
 
     #[test]
