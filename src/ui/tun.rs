@@ -3,9 +3,9 @@
 use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::inbound::{
     LeakPort, LeakScope, TUN_LEAK_ICMP, TUN_LEAK_MISCONFIG_TUN, TUN_LEAK_WINDNS_CLIENT,
-    canonical_leak_entry, canonicalize_leak_entries, is_unprefixed_scope_entry, leak_hidden_count,
-    leak_port, leak_scope, leak_scope_hides, next_free_leak_port, next_free_leak_range,
-    set_leak_scope,
+    canonical_leak_entry, canonicalize_leak_entries, is_unprefixed_scope_entry,
+    leak_entry_adds_block, leak_hidden_count, leak_port, leak_scope, leak_scope_hides,
+    next_free_leak_port, set_leak_scope,
 };
 use crate::model::settings::Language;
 use crate::model::validation::{FindingTarget, ValidationCode};
@@ -163,9 +163,11 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
         set_leak_scope(entries, scope);
         changed = true;
     }
-    match scope {
+    let hidden = match scope {
         LeakScope::Custom | LeakScope::AllExceptLan => {
-            changed |= leak_detail_editor(ui, lang, entries, scope);
+            let (edited, counted) = leak_detail_editor(ui, lang, entries, scope);
+            changed |= edited;
+            counted
         }
         LeakScope::All => {
             // A valid entry is contained by the scope; an invalid one is not,
@@ -174,18 +176,18 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
                 .iter()
                 .any(|entry| !is_unprefixed_scope_entry(entry) && !leak_scope_hides(scope, entry));
             if repairs {
-                changed |= leak_detail_editor(ui, lang, entries, scope);
+                let (edited, _) = leak_detail_editor(ui, lang, entries, scope);
+                changed |= edited;
             }
-            let hidden = leak_hidden_count(scope, entries);
-            // The selected scope and its hover already explain an empty
-            // detail list, so the note appears only when entries stay behind.
-            if hidden > 0 {
-                let count = hidden.to_string();
-                ui.label(
-                    egui::RichText::new(t_fmt(lang, Key::TunLeakHiddenNote, &[&count])).small(),
-                );
-            }
+            leak_hidden_count(scope, entries)
         }
+    };
+    // A stored entry the scope already produces is not editable here; name
+    // the ones that stay behind, under any scope, so a value the scope hides
+    // never vanishes without an explanation.
+    if hidden > 0 {
+        let count = hidden.to_string();
+        ui.label(egui::RichText::new(t_fmt(lang, Key::TunLeakHiddenNote, &[&count])).small());
     }
     if changed {
         // The parser owns the stored spelling: a port is written from its
@@ -200,26 +202,35 @@ fn leak_entries(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) ->
 /// note when the scope already blocks them), the other named values, the port
 /// rows, and the text rows. Visibility is the model's containment relation
 /// ([`leak_scope_hides`]): a control appears only when its entry adds a block
-/// the scope does not already produce, so no control ever reads off while the
+/// scope does not already produce, so no control ever reads off while the
 /// scope blocks it. Invalid entries stay visible under every scope for repair.
+/// Returns whether an edit changed the list, and how many stored entries the
+/// scope already produces: the same pass that classifies the rows counts the
+/// hidden ones.
 fn leak_detail_editor(
     ui: &mut egui::Ui,
     lang: Language,
     entries: &mut Vec<String>,
     scope: LeakScope,
-) -> bool {
+) -> (bool, usize) {
     let all_scope = scope == LeakScope::All;
     let dns_included = scope == LeakScope::AllExceptLan;
+    let mut hidden = 0;
     let mut dns_rows = Vec::new();
     let mut port_rows = Vec::new();
     let mut text_rows = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        // Named values own a switch; the unprefixed scope values own the radio;
-        // an entry the scope contains is hidden by definition.
-        if is_named_leak(entry)
-            || is_unprefixed_scope_entry(entry)
-            || leak_scope_hides(scope, entry)
-        {
+        // The unprefixed scope values own the radio; an entry the scope
+        // contains is hidden by definition, named values included; the named
+        // values that survive own a switch.
+        if is_unprefixed_scope_entry(entry) {
+            continue;
+        }
+        if leak_scope_hides(scope, entry) {
+            hidden += 1;
+            continue;
+        }
+        if is_named_leak(entry) {
             continue;
         }
         match leak_port(entry) {
@@ -280,19 +291,22 @@ fn leak_detail_editor(
         changed = true;
     }
     // `all` contains every valid entry a button could add, so it offers no
-    // add control; only repair rows stay editable under it.
+    // add control; only repair rows stay editable under it. Everywhere else a
+    // control appears only when the value it stores adds a block the scope
+    // does not already produce.
     if !all_scope {
-        if ui.button(t(lang, Key::TunLeakAddPort)).clicked() {
-            entries.push(next_free_leak_port(entries).to_string());
+        // One port or range form: the row's own range control covers a
+        // `low-high` value, so the editor needs no separate range button.
+        let next_port = next_free_leak_port(entries, scope);
+        if let Some(port) = next_port
+            && ui.button(t(lang, Key::TunLeakAddPort)).clicked()
+        {
+            entries.push(port.to_string());
             changed = true;
         }
-        if ui.button(t(lang, Key::TunLeakAddRange)).clicked() {
-            entries.push(next_free_leak_range(entries).to_string());
-            changed = true;
-        }
-        changed |= leak_raw_add(ui, lang, entries);
+        changed |= leak_raw_add(ui, lang, entries, scope);
     }
-    changed
+    (changed, hidden)
 }
 
 /// Whether `entry` is one of the named values a toggle owns rather than a
@@ -456,30 +470,44 @@ fn leak_delete(ui: &mut egui::Ui, lang: Language, index: usize, remove: &mut Opt
 }
 
 /// The raw entry row: a value typed in the core's grammar and added only when
-/// the model's parser accepts it. The draft lives in egui memory, so an
-/// in-progress spelling survives repaints and never reaches the stored list.
-fn leak_raw_add(ui: &mut egui::Ui, lang: Language, entries: &mut Vec<String>) -> bool {
+/// the model's parser accepts it and the value adds a block: a spelling the
+/// list already stores, or one the scope already produces, gets no add button.
+/// The draft lives in egui memory, so an in-progress spelling survives
+/// repaints and never reaches the stored list.
+fn leak_raw_add(
+    ui: &mut egui::Ui,
+    lang: Language,
+    entries: &mut Vec<String>,
+    scope: LeakScope,
+) -> bool {
     let id = ui.make_persistent_id("leak-raw-add");
     let mut added = false;
+    let mut draft: String = ui.data(|data| data.get_temp(id).unwrap_or_default());
+    let values = canonical_leak_entry(&draft);
+    let adds_block = values.as_ref().is_some_and(|values| {
+        values
+            .iter()
+            .any(|value| leak_entry_adds_block(scope, entries, value))
+    });
     ui.horizontal(|ui| {
         let label = ui.label(t(lang, Key::TunLeakRawLabel));
-        let mut draft: String = ui.data(|data| data.get_temp(id).unwrap_or_default());
         ui.add(
             egui::TextEdit::singleline(&mut draft)
                 .hint_text(t(lang, Key::TunLeakRawHint))
                 .desired_width(220.0),
         )
         .labelled_by(label.id);
-        let values = canonical_leak_entry(&draft);
-        if ui.button(t(lang, Key::TunLeakAddEntry)).clicked()
+        if adds_block
+            && ui.button(t(lang, Key::TunLeakAddEntry)).clicked()
             && let Some(values) = values
         {
             entries.extend(values);
             draft.clear();
             added = true;
         }
-        ui.data_mut(|data| data.insert_temp(id, draft));
     });
+    ui.data_mut(|data| data.insert_temp(id, draft));
+    ui.label(egui::RichText::new(t(lang, Key::TunLeakRawHelp)).small());
     added
 }
 
@@ -1360,8 +1388,7 @@ mod tests {
     }
 
     /// No control in the leak editor renders disabled, whatever the stored
-    /// list: the old covered state disabled entries and the raw add button
-    /// waited for a valid draft.
+    /// list: a control that cannot act is absent, never greyed out.
     #[test]
     fn the_leak_editor_disables_no_control() {
         let mut rig = UiTestRig::default();
@@ -1405,19 +1432,43 @@ mod tests {
                 "{key:?} must stay enabled"
             );
         }
-        for key in [
-            Key::TunLeakAddPort,
-            Key::TunLeakAddRange,
-            Key::TunLeakAddEntry,
-        ] {
-            assert!(
-                !harness
-                    .get_by_role_and_label(egui::accesskit::Role::Button, t(Language::En, key))
-                    .accesskit_node()
-                    .is_disabled(),
-                "{key:?} must stay enabled"
-            );
-        }
+        // Add port appears while a free port the scope does not block exists,
+        // and it is live.
+        assert!(
+            !harness
+                .get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    t(Language::En, Key::TunLeakAddPort)
+                )
+                .accesskit_node()
+                .is_disabled(),
+            "Add port must stay enabled"
+        );
+        // The raw add button appears only for an addable draft; while it
+        // shows, it is live.
+        let add_entry = t(Language::En, Key::TunLeakAddEntry);
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::Button, add_entry)
+                .is_none(),
+            "an empty draft has nothing to add"
+        );
+        let raw = t(Language::En, Key::TunLeakRawLabel);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, raw)
+            .click();
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::TextInput, raw)
+            .type_text("1.1.1.0/24:443");
+        harness.run_steps(2);
+        assert!(
+            !harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, add_entry)
+                .accesskit_node()
+                .is_disabled(),
+            "an addable draft shows a live button"
+        );
         for button in harness.query_all_by_label(t(Language::En, Key::DeleteRow)) {
             assert!(
                 !button.accesskit_node().is_disabled(),

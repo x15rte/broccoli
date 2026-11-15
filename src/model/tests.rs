@@ -650,7 +650,7 @@ fn roundtrip_inbounds() {
         "autoSystemRoutingTable": ["0.0.0.0/1", "128.0.0.0/1"],
         "autoOutboundsInterface": "auto",
         "autoSystemWfpBlockLeak": [
-            "udp/53", "tcp/53", "windnsclient", "tcp/853", "udp/853", "misconfigtun"
+            "53", "853", "windnsclient", "misconfigtun"
         ],
         "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
     }));

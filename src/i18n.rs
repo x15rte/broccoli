@@ -506,9 +506,9 @@ keys! {
     TunLeakHiddenNote 1,
     TunLeakRangeLabel 0,
     TunLeakBothProtocols 0,
-    TunLeakAddRange 0,
     TunLeakRawLabel 0,
     TunLeakRawHint 0,
+    TunLeakRawHelp 0,
     TunLeakAddEntry 0,
     TunLeakInstallFailed 1,
     TunLeakInstallRemedy 0,
@@ -3614,7 +3614,7 @@ mod en {
             Key::TunLeakEntriesHint => {
                 "The core blocks traffic that tries to leave through another adapter. The dns \
                  entry covers ports 53 and 853 and the Windows DNS Client service. A profile \
-                 stores those five entries rather than dns."
+                 stores those three entries rather than dns."
             }
             Key::TunLeakAddPort => "Add port",
             Key::TunLeakWindnsClientLabel => "Block the Windows DNS Client service",
@@ -3648,13 +3648,17 @@ mod en {
             Key::TunLeakIcmpLabel => "Block ping and traceroute",
             Key::TunLeakIcmpNote => "ICMP traffic leaves through another adapter otherwise.",
             Key::TunLeakHiddenNote => {
-                "{} stored entries stay hidden. Switch to another scope to edit them."
+                "Stored entries hidden by the selected scope: {}. Switch to another scope to \
+                 edit them."
             }
             Key::TunLeakRangeLabel => "port range",
             Key::TunLeakBothProtocols => "TCP + UDP",
-            Key::TunLeakAddRange => "Add range",
-            Key::TunLeakRawLabel => "Entry limited to an address range",
+            Key::TunLeakRawLabel => "Address-limited entry",
             Key::TunLeakRawHint => "1.1.1.0/24:53",
+            Key::TunLeakRawHelp => {
+                "Blocks one CIDR range at a port. Write it as prefix:port, for example \
+                 1.1.1.0/24:53. The block drops duplicates."
+            }
             Key::TunLeakAddEntry => "Add entry",
             Key::TunLeakInstallFailed => "The core could not install the leak filters: {}",
             Key::TunLeakInstallRemedy => "Turn these filters off and retry",
@@ -4353,12 +4357,14 @@ mod en {
             }
             Key::SettingsPathBindNicDisabledHint => "Bind NIC needs TUN mode.",
             Key::SettingsPathBindNicLeakBlockHint => {
-                "Bind NIC is unavailable while the TUN leak scope blocks every destination."
+                "Bind NIC is unavailable while the TUN leak scope blocks every destination \
+                 outside the local network."
             }
             Key::SettingsPathNoteBindNicLeakBlock => {
-                "Bind NIC is off while the TUN leak scope blocks every destination: it bypasses \
-                 the tunnel the scope protects. Switch the scope to Custom entries or clear the \
-                 list to use Bind NIC again. Native follows the OS stack now."
+                "Bind NIC is off while the TUN leak scope blocks every destination outside the \
+                 local network: it bypasses the tunnel the scope protects. Switch the scope to \
+                 Custom entries or clear the list to use Bind NIC again. Native follows the OS \
+                 stack now."
             }
             Key::SettingsRawOverrideActive => {
                 "⚠ RAW OVERRIDE ACTIVE. The app ignores all other settings on every screen."
@@ -5966,7 +5972,7 @@ mod en {
             Key::SettingsTunLeakValueUnknown => {
                 "The core does not accept {}. Use dns, windnsclient, misconfigtun, all, \
                  allexceptlan, icmp, tcp, udp, a port, or a port range. Put tcp or udp before \
-                 a port. Add an address range in front, like 1.1.1.0/24:53."
+                 a port. Add a CIDR prefix in front, like 1.1.1.0/24:53."
             }
             Key::SettingsTunLeakDnsAliasExpanded => "The profile stores the dns entry as {}.",
             Key::SettingsTunLeakMisconfigTunOff => {

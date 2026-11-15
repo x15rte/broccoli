@@ -150,14 +150,19 @@ fn press_leak_button(h: &mut Harness<'static, BroccoliApp>, key: Key) {
     h.run_steps(4);
 }
 
-/// Type `text` into the leak block's raw entry row and press its add button.
-fn add_raw_leak(h: &mut Harness<'static, BroccoliApp>, text: &str) {
+/// Type `text` into the leak block's raw entry row.
+fn type_raw_leak(h: &mut Harness<'static, BroccoliApp>, text: &str) {
     let label = t(Language::En, Key::TunLeakRawLabel);
     h.get_by_role_and_label(Role::TextInput, label).click();
     h.run();
     h.get_by_role_and_label(Role::TextInput, label)
         .type_text(text);
     h.run_steps(4);
+}
+
+/// Type `text` into the leak block's raw entry row and press its add button.
+fn add_raw_leak(h: &mut Harness<'static, BroccoliApp>, text: &str) {
+    type_raw_leak(h, text);
     press_leak_button(h, Key::TunLeakAddEntry);
 }
 
@@ -219,7 +224,14 @@ fn the_leak_rows_round_trip_into_the_state_file_and_the_generated_config() {
     assert_eq!(saved_leak(), seeded);
     assert_eq!(
         tun_wire(&tun_settings())["autoSystemWfpBlockLeak"],
-        serde_json::json!(seeded)
+        serde_json::json!([
+            TUN_LEAK_ALL_EXCEPT_LAN,
+            "53",
+            "853",
+            TUN_LEAK_WINDNS_CLIENT,
+            TUN_LEAK_MISCONFIG_TUN
+        ]),
+        "the wire follows the alias with the DNS entries the core adds"
     );
 
     // The scope radio reads the stored alias and the detail editor stays open:
@@ -414,8 +426,13 @@ fn the_leak_controls_author_named_values_ports_ranges_and_prefixed_entries() {
     delete_leak_row(&mut h, 0);
     assert!(saved_leak().is_empty());
 
-    // A range row: the button appends the lowest free two-port range.
-    press_leak_button(&mut h, Key::TunLeakAddRange);
+    // The row's own range control turns that port into a range: the core has
+    // one port-or-range grammar, so the editor needs no separate button.
+    press_leak_button(&mut h, Key::TunLeakAddPort);
+    assert_eq!(saved_leak(), vec!["tcp/1".to_string()]);
+    h.get_by_role_and_label(Role::CheckBox, t(Language::En, Key::TunLeakRangeLabel))
+        .click();
+    h.run_steps(4);
     assert_eq!(saved_leak(), vec!["tcp/1-2".to_string()]);
     delete_leak_row(&mut h, 0);
     assert!(saved_leak().is_empty());
@@ -426,6 +443,45 @@ fn the_leak_controls_author_named_values_ports_ranges_and_prefixed_entries() {
     assert_eq!(saved_leak(), vec!["1.1.1.0/24:53".to_string()]);
     delete_leak_row(&mut h, 0);
     assert!(saved_leak().is_empty());
+}
+
+#[test]
+fn the_raw_add_control_appears_only_for_an_addable_entry() {
+    let mut settings = tun_settings();
+    settings.tun.auto_system_wfp_block_leak = Vec::new();
+    let (_lock, _tmp, mut h) = boot(settings);
+    select_scope(&mut h, Key::TunLeakScopeCustomLabel);
+
+    // An empty draft and a spelling the core refuses have nothing to add.
+    let add = t(Language::En, Key::TunLeakAddEntry);
+    assert!(h.query_by_role_and_label(Role::Button, add).is_none());
+    type_raw_leak(&mut h, "bogus");
+    assert!(h.query_by_role_and_label(Role::Button, add).is_none());
+}
+
+#[test]
+fn a_raw_entry_the_alias_already_blocks_offers_no_control() {
+    // The seeded alias already blocks port 53, so a CIDR-limited port-53
+    // value adds nothing and gets no control.
+    let (_lock, _tmp, mut h) = boot(tun_settings());
+    type_raw_leak(&mut h, "1.1.1.0/24:53");
+    assert!(
+        h.query_by_role_and_label(Role::Button, t(Language::En, Key::TunLeakAddEntry))
+            .is_none(),
+        "the scope already produces the entry"
+    );
+}
+
+#[test]
+fn a_raw_entry_the_scope_leaves_open_is_added() {
+    // The alias leaves the local network open, so a CIDR-limited port the
+    // alias does not block still gets a control and is stored.
+    let (_lock, _tmp, mut h) = boot(tun_settings());
+    type_raw_leak(&mut h, "1.1.1.0/24:443");
+    h.get_by_role_and_label(Role::Button, t(Language::En, Key::TunLeakAddEntry))
+        .click();
+    h.run_steps(4);
+    assert!(saved_leak().contains(&"1.1.1.0/24:443".to_string()));
 }
 
 #[test]
@@ -569,8 +625,8 @@ fn selecting_allexceptlan_keeps_the_detail_editable() {
         "the DNS Client control would read off while the alias blocks it"
     );
     assert!(
-        !rendered(&h, &hidden_note(2)),
-        "nothing is hidden under the alias"
+        rendered(&h, &hidden_note(1)),
+        "the DNS port the alias implies is counted as hidden"
     );
 
     // A detail entry still adds LAN-level blocking, so ICMP can join the alias.
@@ -579,7 +635,19 @@ fn selecting_allexceptlan_keeps_the_detail_editable() {
     with_icmp.push(TUN_LEAK_ALL_EXCEPT_LAN.to_string());
     with_icmp.push("icmp".to_string());
     assert_eq!(saved_leak(), with_icmp);
-    assert_eq!(saved_wire_leak(), serde_json::json!(with_icmp));
+    assert_eq!(
+        saved_wire_leak(),
+        serde_json::json!([
+            "udp/53",
+            "tcp/443",
+            TUN_LEAK_ALL_EXCEPT_LAN,
+            "53",
+            "853",
+            TUN_LEAK_WINDNS_CLIENT,
+            "icmp"
+        ]),
+        "the wire follows the alias with the DNS entries the core adds"
+    );
     assert_eq!(detail_rows(&h), 1);
 
     // The custom scope drops only the alias; every detail stays.

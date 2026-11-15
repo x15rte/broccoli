@@ -357,12 +357,12 @@ fn settings_extra_shadow(
 
 /// True when the emitted document carries the leak block without anything
 /// that keeps an unrouted address family inside the tunnel — the state
-/// [`ValidationCode::TunLeakMisconfigTunOff`] reports. A non-custom scope
-/// blocks every destination outside the local network, so it satisfies the
-/// advisory as the `misconfigtun` entry does. The generator writes the key
-/// only while the TUN inbound and the DNS module are both present
-/// (`emit::dns_inbound_emitted`), so this is the exact predicate the settings
-/// pass judges.
+/// [`ValidationCode::TunLeakMisconfigTunOff`] reports. The `all` scope blocks
+/// every destination, so it satisfies the advisory as the `misconfigtun`
+/// entry does; `allexceptlan` permits the local network, where such a family
+/// can still leave. The generator writes the key only while the TUN inbound
+/// and the DNS module are both present (`emit::dns_inbound_emitted`), so this
+/// is the exact predicate the settings pass judges.
 fn tun_leak_misconfig_tun_off(settings: &Settings) -> bool {
     emit::dns_inbound_emitted(settings) && !settings.tun.leak_blocks_unrouted_family()
 }

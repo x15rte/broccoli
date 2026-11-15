@@ -337,11 +337,8 @@ fn the_wire_carries_the_core_canonical_leak_form() {
             "[2001:db8::/32]:tcp/443-500",
             "tcp",
             "udp/10-20",
-            "1.1.1.0/24:udp/53",
-            "1.1.1.0/24:tcp/53",
+            "1.1.1.0/24:853",
             "1.1.1.0/24:windnsclient",
-            "1.1.1.0/24:tcp/853",
-            "1.1.1.0/24:udp/853",
         ])
     );
 }
@@ -424,14 +421,14 @@ fn a_list_without_the_family_entry_warns_with_what_reopens() {
     );
     generate(&settings).expect("a list without the family entry must not block generation");
 
-    // A non-custom scope blocks every destination outside the local network,
-    // so it keeps the unrouted family inside the tunnel and the advisory
-    // clears. A prefixed scope value limits itself to its own addresses and
-    // leaves the advisory in place.
+    // The `all` scope blocks every destination, so it keeps the unrouted
+    // family inside the tunnel and the advisory clears. `allexceptlan` leaves
+    // the local network open, where such a family can still leave, and a
+    // prefixed scope value limits itself to its own addresses.
     for (value, warns) in [
         ("misconfigtun", false),
         ("all", false),
-        ("allexceptlan", false),
+        ("allexceptlan", true),
         ("1.1.1.0/24:all", true),
     ] {
         let settings = leak_settings(vec![value.into()]);

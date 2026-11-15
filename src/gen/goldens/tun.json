@@ -45,6 +45,9 @@
         ],
         "autoSystemWfpBlockLeak": [
           "allexceptlan",
+          "53",
+          "853",
+          "windnsclient",
           "misconfigtun"
         ],
         "desc": "Wintun",

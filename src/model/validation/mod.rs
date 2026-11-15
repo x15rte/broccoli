@@ -687,7 +687,7 @@ pub enum ValidationCode {
     TunLeakValueUnknown(String),
     /// A profile that carried the `dns` alias after the load-time migration
     /// expanded it — a raw edit or an import. The app accepts the alias in
-    /// memory and saves the five entries it stands for. Advisory
+    /// memory and saves the three entries it stands for. Advisory
     /// (Severity::Warning): the core loads the alias itself.
     TunLeakDnsAliasExpanded,
     /// The emitted leak block leaves the unrouted-family entry out: an address

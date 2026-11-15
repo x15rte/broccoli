@@ -3509,7 +3509,8 @@ fn tun_with_dns_module_emits_the_leak_block_the_predicate_describes() {
     let settings_obj = tun_settings(&cfg);
     assert_eq!(
         settings_obj["autoSystemWfpBlockLeak"],
-        json!(["allexceptlan", "misconfigtun"])
+        json!(["allexceptlan", "53", "853", "windnsclient", "misconfigtun"]),
+        "the wire follows the alias with the DNS entries the core adds"
     );
     assert!(
         settings_obj.get("autoSystemDnsToGateway").is_none(),
@@ -3560,8 +3561,8 @@ fn a_switched_off_leak_entry_leaves_the_key_without_it() {
 #[test]
 fn a_stored_dns_alias_is_emitted_as_the_entries_it_stands_for() {
     // A settings file written before the alias was expanded still names it.
-    // The load replaces it in place, so the emitted document carries the five
-    // entries the core would have expanded it into, in the core's order.
+    // The load replaces it in place, so the emitted document carries the
+    // three entries the core expands it into, in the core's order.
     let mut settings = base_settings();
     settings.mode = Mode::Tun;
     settings.tun.auto_system_wfp_block_leak = vec!["DNS".into(), "Tcp/053".into()];
@@ -3573,7 +3574,7 @@ fn a_stored_dns_alias_is_emitted_as_the_entries_it_stands_for() {
 
     assert_eq!(
         tun_settings(&cfg)["autoSystemWfpBlockLeak"],
-        json!(["udp/53", "tcp/53", "windnsclient", "tcp/853", "udp/853"])
+        json!(["53", "853", "windnsclient", "tcp/53"])
     );
 }
 
