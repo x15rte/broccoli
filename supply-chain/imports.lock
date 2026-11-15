@@ -168,6 +168,11 @@ version = "0.14.9"
 when = "2026-10-29"
 trusted-publisher = "github:grpc/grpc-rust"
 
+[[publisher.tonic-prost]]
+version = "0.14.9"
+when = "2026-10-29"
+trusted-publisher = "github:grpc/grpc-rust"
+
 [[publisher.tonic-prost-build]]
 version = "0.14.7"
 when = "2026-10-27"
