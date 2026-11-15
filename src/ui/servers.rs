@@ -11894,6 +11894,11 @@ impl ServersScreen {
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("servers.refresh-report.rows")
+                        // The body follows the window width: a report's rows
+                        // are one column, and shrinking this scroll area to
+                        // the longest row leaves the rest of a wide window
+                        // blank.
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
                             let mut ignored_drawn = false;
                             for (index, row) in report.rows.iter().enumerate() {
@@ -13608,6 +13613,51 @@ Authentication: ML-KEM-768, Post-Quantum
             "an ignored row keeps its bounded raw source line"
         );
         assert!(harness.query_by_label("Feed report").is_some());
+    }
+
+    #[test]
+    fn the_report_rows_fill_the_window_width() {
+        use crate::model::servers::{RefreshReport, ReportKind, ReportRow};
+
+        let rows = (0..40)
+            .map(|index| ReportRow {
+                kind: ReportKind::Added,
+                name: format!("server {index:02} with a long enough name"),
+                key: String::new(),
+                raw: String::new(),
+            })
+            .collect();
+        let report = RefreshReport {
+            added: 40,
+            rows,
+            ..Default::default()
+        };
+        let screen = ServersScreen {
+            report_view: Some(ReportView::new("Feed report".into(), report)),
+            ..ServersScreen::default()
+        };
+        let mut harness = screen_harness(UiTestRig::default(), screen);
+        harness.run();
+
+        let summary = t_fmt(
+            Language::En,
+            Key::SrvReportSummary,
+            &[&40usize, &0usize, &0usize, &0usize, &0usize, &0usize],
+        );
+        let summary_right = harness.get_by_label(&summary).rect().right();
+        let bars: Vec<_> = harness
+            .get_all_by_role(egui::accesskit::Role::ScrollBar)
+            .collect();
+        assert!(
+            !bars.is_empty(),
+            "the overflowing report must expose a scroll bar"
+        );
+        for bar in bars {
+            assert!(
+                bar.rect().right() >= summary_right,
+                "the report's scroll area must span the window, not shrink to its longest row"
+            );
+        }
     }
 
     /// A trojan profile whose JSON carries a credential and an unknown
