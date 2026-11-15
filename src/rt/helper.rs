@@ -5268,26 +5268,28 @@ mod tests {
         assert_eq!(decoded.mask, FILE_ALL_ACCESS.0, "the mask is decoded");
     }
 
-    /// The GUI binary these probes spawn: the running test executable lives in
-    /// `target/<triple>/debug/deps`, so the bin target sits one directory up.
+    /// The GUI binary these probes spawn. Cargo 1.100 moved test executables
+    /// from `target/<triple>/debug/deps` into
+    /// `target/<triple>/debug/build/<package>/<hash>/out`, while final
+    /// artifacts stay in the profile directory, so walk up until a directory
+    /// holds `broccoli.exe` instead of counting levels.
     /// `CARGO_BIN_EXE_*` is set for integration tests only, and
     /// `CARGO_MANIFEST_DIR/target/debug` misses the per-target layout that
     /// `--target` produces — the layout CI builds, where that path never
     /// exists.
     fn gui_binary() -> std::path::PathBuf {
-        let exe = std::env::current_exe()
-            .expect("locate the running test executable")
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the test executable lives in target/<triple>/debug/deps")
-            .join("broccoli.exe");
-        assert!(
-            exe.is_file(),
+        let exe = std::env::current_exe().expect("locate the running test executable");
+        for dir in exe.ancestors().skip(1).take(6) {
+            let candidate = dir.join("broccoli.exe");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        panic!(
             "these probes spawn the GUI binary; build it for the same target first — \
              `cargo test` and `cargo test --all-targets` build it, `cargo test --lib` does not: {}",
             exe.display()
         );
-        exe
     }
 
     #[test]

@@ -2920,7 +2920,7 @@ mod tests {
             pair("access\tkey", "secret-key"),
             pair("access-key", "secret\rkey"),
         ] {
-            let verdict = with_secrets(secrets.clone());
+            let verdict = with_secrets(secrets);
             let issue = finding(&verdict, &ValidationCode::XdriveS3SecretsInvalid)
                 .unwrap_or_else(|| panic!("a secrets list must be refused: {verdict:#?}"));
             assert_eq!(issue.path.as_deref(), Some("stream.xdriveSettings.secrets"));
@@ -2933,7 +2933,7 @@ mod tests {
                 "token".to_string(),
             ],
         ] {
-            let verdict = with_secrets(secrets.clone());
+            let verdict = with_secrets(secrets);
             assert!(
                 finding(&verdict, &ValidationCode::XdriveS3SecretsInvalid).is_none(),
                 "{verdict:#?}"
