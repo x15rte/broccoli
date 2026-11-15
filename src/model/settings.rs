@@ -25,7 +25,9 @@ pub enum Mode {
 /// outbound interface (the same selection and resolver the tunnel uses), so
 /// the probe's dials bypass the capture; `Native` follows the OS stack, so the
 /// tunnel captures them and the probe measures through it. This is the OS
-/// stack, not Xray's direct route.
+/// stack, not Xray's direct route. Bind NIC only takes effect while TUN mode is
+/// on and the emitted leak scope leaves a bypass: `all` and `allexceptlan`
+/// block every destination outside the tunnel, so the value reads as Native.
 ///
 /// Serializes camelCase ("bindNic" | "native"). The retired
 /// `latencyTestBindInterface` boolean also loads here (true → BindNic,
@@ -612,6 +614,17 @@ impl Settings {
         } else {
             &self.probe_url
         }
+    }
+
+    /// Whether the emitted TUN config carries a leak block that leaves no
+    /// direct dial outside the tunnel. The generator writes
+    /// `autoSystemWfpBlockLeak` only in the TUN inbound with the DNS module
+    /// (`gen::inbounds`), and a non-custom leak scope then blocks every
+    /// destination outside the LAN. Bind NIC bypasses the tunnel, so it is
+    /// unavailable in that state; a custom list leaves the dials it does not
+    /// name possible.
+    pub fn leak_block_blocks_bind_nic(&self) -> bool {
+        crate::model::emit::dns_inbound_emitted(self) && self.tun.leak_scope_blocks_direct_dials()
     }
 
     /// Rewrite every exact outbound-tag reference named in `renames`
@@ -1237,6 +1250,48 @@ mod tests {
         let absent: Settings = serde_json::from_value(json!({ "mode": "off" })).expect("settings");
         assert_eq!(absent.latency_test_path, ProbePath::BindNic);
         assert_eq!(absent.subscription_path, RefreshPath::BindNic);
+    }
+
+    #[test]
+    fn only_an_emitted_catch_all_leak_scope_blocks_bind_nic() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.mode, Mode::Off);
+        assert!(
+            !settings.leak_block_blocks_bind_nic(),
+            "without a TUN inbound no leak key is emitted"
+        );
+
+        settings.mode = Mode::Tun;
+        assert!(
+            settings.leak_block_blocks_bind_nic(),
+            "the seeded catch-all scope and the DNS module emit the block"
+        );
+
+        settings.tun.auto_system_wfp_block_leak = vec!["tcp/853".into()];
+        assert!(
+            !settings.leak_block_blocks_bind_nic(),
+            "a custom detail entry does not name every destination"
+        );
+
+        settings.tun.auto_system_wfp_block_leak = vec!["all".into()];
+        assert!(settings.leak_block_blocks_bind_nic());
+
+        let mut no_dns = Settings {
+            mode: Mode::Tun,
+            ..Default::default()
+        };
+        no_dns.dns.servers.clear();
+        no_dns.dns.enable_parallel_query = false;
+        no_dns.dns.serve_stale = false;
+        no_dns.dns.serve_expired_ttl = None;
+        assert!(
+            no_dns.dns.is_effectively_empty(),
+            "clearing the resolvers and their flags empties the DNS module"
+        );
+        assert!(
+            !no_dns.leak_block_blocks_bind_nic(),
+            "the generator writes no leak key without the DNS module"
+        );
     }
 
     #[test]

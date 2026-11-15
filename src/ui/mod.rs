@@ -542,13 +542,16 @@ impl<'a> ServersCtx<'a> {
         let probe_url = self.settings.ping_test_probe_url().to_owned();
         let lang = self.settings.language;
         // The probe carries the TUN adapter's own name so its resolution can
-        // exclude that adapter, and — while the stored path is Bind NIC and TUN
-        // mode is on — the TUN screen's outbound interface. The probe runtime
-        // still checks the live capture: a Bind NIC path chosen before the
-        // tunnel connects is the same OS path as Native.
+        // exclude that adapter, and — while Bind NIC is usable (TUN mode on and
+        // no leak block) — the TUN screen's outbound interface. The probe
+        // runtime still checks the live capture: a Bind NIC path chosen before
+        // the tunnel connects is the same OS path as Native.
         let tun_enabled = self.settings.mode == crate::model::Mode::Tun;
-        let path =
-            sys::outbound_path::effective_probe_path(self.settings.latency_test_path, tun_enabled);
+        let path = sys::outbound_path::effective_probe_path(
+            self.settings.latency_test_path,
+            tun_enabled,
+            self.settings.leak_block_blocks_bind_nic(),
+        );
         let tun_outbound_interface =
             sys::outbound_path::probe_interface_setting(path, &self.settings.tun);
         let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
@@ -2423,6 +2426,9 @@ mod tests {
         let mut rig = UiTestRig::default();
         rig.settings.mode = crate::model::Mode::Tun;
         rig.phase = CorePhase::Running;
+        // The seeded leak block blocks Bind NIC; this test isolates the path
+        // rules, and the leak case adds it back at the end.
+        rig.settings.tun.auto_system_wfp_block_leak.clear();
         let profile = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(profile.clone());
 
@@ -2488,7 +2494,7 @@ mod tests {
         rig.phase = CorePhase::Stopped;
         rig.ctx()
             .servers()
-            .request_latency_probe_for(profile)
+            .request_latency_probe_for(profile.clone())
             .expect("probe request");
         if let CoreCmd::ProbeLatency {
             tun_outbound_interface,
@@ -2499,6 +2505,48 @@ mod tests {
                 tun_outbound_interface.as_deref(),
                 Some("auto"),
                 "the probe must carry the chosen bind; its runtime decides Native vs bind"
+            );
+        } else {
+            panic!("expected ProbeLatency, got a different command");
+        }
+
+        // With the leak block on, Bind NIC's bypass is blocked, so the probe
+        // follows the tunnel instead and carries no bind.
+        rig.settings.latency_test_path = crate::model::settings::ProbePath::BindNic;
+        rig.settings.tun.auto_system_wfp_block_leak = vec!["allexceptlan".into()];
+        rig.ctx()
+            .servers()
+            .request_latency_probe_for(profile.clone())
+            .expect("probe request");
+        if let CoreCmd::ProbeLatency {
+            tun_outbound_interface,
+            ..
+        } = rig._cmd_rx.try_recv().expect("probe command")
+        {
+            assert_eq!(
+                tun_outbound_interface, None,
+                "a blocked bind must not be requested"
+            );
+        } else {
+            panic!("expected ProbeLatency, got a different command");
+        }
+
+        // A custom detail entry leaves the dials it does not name open, so
+        // Bind NIC stays selectable and the request carries it.
+        rig.settings.tun.auto_system_wfp_block_leak = vec!["tcp/853".into()];
+        rig.ctx()
+            .servers()
+            .request_latency_probe_for(profile)
+            .expect("probe request");
+        if let CoreCmd::ProbeLatency {
+            tun_outbound_interface,
+            ..
+        } = rig._cmd_rx.try_recv().expect("probe command")
+        {
+            assert_eq!(
+                tun_outbound_interface.as_deref(),
+                Some("auto"),
+                "a custom entry does not block every destination"
             );
         } else {
             panic!("expected ProbeLatency, got a different command");

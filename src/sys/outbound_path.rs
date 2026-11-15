@@ -3,12 +3,14 @@
 //! Bind NIC uses the TUN screen's outbound-interface selection and the same
 //! resolver the tunnel guard and the probe use; Native follows the OS stack,
 //! which the tunnel captures while it is up. SOCKS5 exists on the refresh
-//! Bind NIC is selectable while TUN mode is on; before the tunnel connects it
-//! and Native are the same OS path, so a probe or refresh simply follows the
-//! OS stack instead of failing.
+//! side. Bind NIC is usable only while TUN mode is on and the leak scope
+//! leaves a bypass: `all` and `allexceptlan` block every destination outside
+//! the tunnel, while a custom list names the dials it blocks. Before the
+//! tunnel connects, or under a catch-all scope, Bind NIC and Native are the
+//! same OS path, so a probe or refresh follows the stack instead of failing.
 //!
 //! Every resolution that cannot produce its carrier fails loudly. The one
-//! equivalent fallback is Bind NIC before the live capture: with no TUN
+//! equivalent fallback is Bind NIC while no bypass is possible: with no TUN
 //! traffic to bypass it and Native are the same OS path.
 
 use crate::model::{ProbePath, RefreshPath, Socks5Cfg, TunCfg};
@@ -16,8 +18,8 @@ use crate::sys::netif::{NetIf, ProbeUplink, resolve_probe_uplink};
 use crate::sys::subscription::FetchTransport;
 
 /// The two path vocabularies' shared degradation rule: Bind NIC reads as
-/// Native when the tunnel cannot carry a bind; every other path stays as
-/// stored.
+/// Native when the tunnel cannot carry a bind or the leak scope blocks every
+/// bypass; every other path stays as stored.
 trait PathDegrade: Copy {
     fn native() -> Self;
     fn is_bind_nic(self) -> bool;
@@ -43,8 +45,8 @@ impl PathDegrade for RefreshPath {
     }
 }
 
-fn effective_path<P: PathDegrade>(stored: P, tun_enabled: bool) -> P {
-    if stored.is_bind_nic() && !tun_enabled {
+fn effective_path<P: PathDegrade>(stored: P, tun_enabled: bool, leak_block: bool) -> P {
+    if stored.is_bind_nic() && (!tun_enabled || leak_block) {
         P::native()
     } else {
         stored
@@ -52,16 +54,21 @@ fn effective_path<P: PathDegrade>(stored: P, tun_enabled: bool) -> P {
 }
 
 /// The effective probe path. Bind NIC binds the physical uplink to bypass the
-/// TUN capture, which only exists while the tunnel is up; when there is no
-/// live capture, or TUN mode is off, the effective path is Native.
-pub fn effective_probe_path(stored: ProbePath, tun_enabled: bool) -> ProbePath {
-    effective_path(stored, tun_enabled)
+/// TUN capture, which only exists while the tunnel is up; when TUN mode is
+/// off, or a catch-all leak scope blocks every bypass, the effective path is
+/// Native.
+pub fn effective_probe_path(stored: ProbePath, tun_enabled: bool, leak_block: bool) -> ProbePath {
+    effective_path(stored, tun_enabled, leak_block)
 }
 
 /// The effective refresh path. Bind NIC behaves as it does for the probe;
-/// Native and SOCKS5 stay as stored, because neither needs the tunnel.
-pub fn effective_refresh_path(stored: RefreshPath, tun_enabled: bool) -> RefreshPath {
-    effective_path(stored, tun_enabled)
+/// Native and SOCKS5 stay as stored, because neither bypasses the tunnel.
+pub fn effective_refresh_path(
+    stored: RefreshPath,
+    tun_enabled: bool,
+    leak_block: bool,
+) -> RefreshPath {
+    effective_path(stored, tun_enabled, leak_block)
 }
 
 /// The probe command's `tun_outbound_interface` argument: Bind NIC carries the
@@ -98,19 +105,22 @@ pub enum PathError {
 
 /// Resolve the effective refresh path into the fetch client's transport.
 /// `path` and `socks5` are the values in force (the global setting or the
-/// `tun_enabled` is the TUN mode switch and `tun_live` the live TUN ownership
-/// the caller observes. Bind NIC only binds while the live capture exists;
-/// before that it and Native are the same OS path, so the fetch follows the
-/// stack instead of failing. `interfaces` is the caller's adapter view.
+/// override's). `tun_enabled` is the TUN mode switch and `tun_live` the live
+/// TUN ownership the caller observes. `leak_block` is whether the emitted TUN
+/// config carries a leak block that blocks every bypass. Bind NIC only binds
+/// while the live capture exists and no such block is on; otherwise it and
+/// Native are the same OS path, so the fetch follows the stack instead of
+/// failing. `interfaces` is the caller's adapter view.
 pub fn refresh_transport(
     path: RefreshPath,
     socks5: &Socks5Cfg,
     tun: &TunCfg,
     tun_enabled: bool,
     tun_live: bool,
+    leak_block: bool,
     interfaces: &[NetIf],
 ) -> Result<FetchTransport, PathError> {
-    match effective_refresh_path(path, tun_enabled && tun_live) {
+    match effective_refresh_path(path, tun_enabled && tun_live, leak_block) {
         RefreshPath::Native => Ok(FetchTransport::Native),
         RefreshPath::Socks5 => {
             let host = socks5.host.trim();
@@ -181,13 +191,16 @@ mod tests {
         tun_active: bool,
         interfaces: &[NetIf],
     ) -> Result<FetchTransport, PathError> {
-        super::refresh_transport(path, socks5, tun, tun_active, tun_active, interfaces)
+        super::refresh_transport(path, socks5, tun, tun_active, tun_active, false, interfaces)
     }
 
     fn tun(setting: &str) -> TunCfg {
         TunCfg {
             name: "broccoli0".into(),
             auto_outbounds_interface: setting.into(),
+            // The seed leak list is non-empty; these tests isolate the path
+            // rules, so the leak block is off unless a case turns it on.
+            auto_system_wfp_block_leak: Vec::new(),
             ..Default::default()
         }
     }
@@ -204,39 +217,117 @@ mod tests {
     #[test]
     fn bind_nic_degrades_to_native_while_the_tunnel_is_off() {
         assert_eq!(
-            effective_probe_path(ProbePath::BindNic, false),
+            effective_probe_path(ProbePath::BindNic, false, false),
             ProbePath::Native,
             "Bind NIC cannot bind while there is no capture to bypass"
         );
         assert_eq!(
-            effective_probe_path(ProbePath::BindNic, true),
+            effective_probe_path(ProbePath::BindNic, true, false),
             ProbePath::BindNic
         );
         assert_eq!(
-            effective_probe_path(ProbePath::Native, true),
+            effective_probe_path(ProbePath::Native, true, false),
             ProbePath::Native,
             "an explicit Native preference stays Native"
         );
 
         assert_eq!(
-            effective_refresh_path(RefreshPath::BindNic, false),
+            effective_refresh_path(RefreshPath::BindNic, false, false),
             RefreshPath::Native
         );
         assert_eq!(
-            effective_refresh_path(RefreshPath::BindNic, true),
+            effective_refresh_path(RefreshPath::BindNic, true, false),
             RefreshPath::BindNic
         );
         // Native and SOCKS5 do not depend on the tunnel.
         for tun_active in [false, true] {
             assert_eq!(
-                effective_refresh_path(RefreshPath::Native, tun_active),
+                effective_refresh_path(RefreshPath::Native, tun_active, false),
                 RefreshPath::Native
             );
             assert_eq!(
-                effective_refresh_path(RefreshPath::Socks5, tun_active),
+                effective_refresh_path(RefreshPath::Socks5, tun_active, false),
                 RefreshPath::Socks5
             );
         }
+    }
+
+    #[test]
+    fn bind_nic_degrades_to_native_while_the_leak_block_is_on() {
+        assert_eq!(
+            effective_probe_path(ProbePath::BindNic, true, true),
+            ProbePath::Native,
+            "the leak block drops every direct dial Bind NIC makes"
+        );
+        assert_eq!(
+            effective_refresh_path(RefreshPath::BindNic, true, true),
+            RefreshPath::Native
+        );
+        assert_eq!(
+            effective_probe_path(ProbePath::Native, true, true),
+            ProbePath::Native
+        );
+        assert_eq!(
+            effective_refresh_path(RefreshPath::Socks5, true, true),
+            RefreshPath::Socks5,
+            "SOCKS5 follows the OS stack, which the tunnel captures"
+        );
+        assert_eq!(
+            effective_probe_path(ProbePath::BindNic, false, true),
+            ProbePath::Native,
+            "TUN off already degrades, leak list or not"
+        );
+    }
+
+    #[test]
+    fn refresh_transport_follows_the_leak_block_when_bind_nic_is_stored() {
+        let interfaces = [
+            test_iface("broccoli0", 9, false, true, &["10.255.0.1"]),
+            test_iface("Ethernet", 2, false, true, &["10.0.0.7"]),
+        ];
+        let mut tun = tun("Ethernet");
+        tun.auto_system_wfp_block_leak = vec!["allexceptlan".into()];
+        assert_eq!(
+            super::refresh_transport(
+                RefreshPath::BindNic,
+                &Socks5Cfg::default(),
+                &tun,
+                true,
+                true,
+                true,
+                &interfaces,
+            ),
+            Ok(FetchTransport::Native),
+            "a blocked bind must follow the tunnel, not fail the fetch"
+        );
+    }
+
+    #[test]
+    fn refresh_transport_keeps_bind_nic_for_a_custom_narrow_leak_list() {
+        let interfaces = [
+            test_iface("broccoli0", 9, false, true, &["10.255.0.1"]),
+            test_iface("Ethernet", 2, false, true, &["10.0.0.7"]),
+        ];
+        let mut tun = tun("Ethernet");
+        tun.auto_system_wfp_block_leak = vec!["tcp/853".into()];
+        let leak_block = tun.leak_scope_blocks_direct_dials();
+        assert!(
+            !leak_block,
+            "a custom detail entry does not name every destination"
+        );
+        assert_eq!(
+            super::refresh_transport(
+                RefreshPath::BindNic,
+                &Socks5Cfg::default(),
+                &tun,
+                true,
+                true,
+                leak_block,
+                &interfaces,
+            ),
+            Ok(FetchTransport::Bind("10.0.0.7".parse().expect("ipv4"))),
+            "an entry that cannot match the dial leaves Bind NIC working"
+        );
     }
 
     #[test]
@@ -403,6 +494,7 @@ mod tests {
             &Socks5Cfg::default(),
             &tun("Ethernet"),
             true,
+            false,
             false,
             std::slice::from_ref(&ethernet),
         );

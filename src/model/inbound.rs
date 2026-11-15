@@ -1775,6 +1775,16 @@ impl TunCfg {
             || leak_scope(&self.auto_system_wfp_block_leak) != LeakScope::Custom
     }
 
+    /// Whether the stored leak scope covers every destination outside the
+    /// local network. `all` blocks every destination; `allexceptlan` blocks
+    /// every destination except the LAN. A custom list names specific
+    /// destinations, so a dial it does not match leaves the tunnel and works;
+    /// the app cannot know what a probe or subscription resolves to, so it
+    /// does not disable on a guess.
+    pub fn leak_scope_blocks_direct_dials(&self) -> bool {
+        leak_scope(&self.auto_system_wfp_block_leak) != LeakScope::Custom
+    }
+
     /// Whether an in-memory list still carries the `dns` alias — a model
     /// built by hand rather than loaded. The settings pass warns for it
     /// exactly as it does for a load that expanded the alias.

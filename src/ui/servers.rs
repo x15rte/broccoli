@@ -2883,6 +2883,7 @@ impl ServersScreen {
             &uictx.settings.tun,
             tun_enabled,
             tun_live,
+            uictx.settings.leak_block_blocks_bind_nic(),
             &interfaces,
         ) {
             Ok(transport) => transport,
@@ -12051,18 +12052,27 @@ impl ServersScreen {
                             t(lang, Key::SrvOutboundOverride),
                         );
                         let tun_on = uictx.settings.mode == Mode::Tun;
+                        let leak_block = uictx.settings.leak_block_blocks_bind_nic();
                         let global_path = uictx.settings.subscription_path;
                         let effective = if draft.outbound_custom {
                             crate::sys::outbound_path::effective_refresh_path(
                                 draft.outbound_path,
                                 tun_on,
+                                leak_block,
                             )
                         } else {
-                            crate::sys::outbound_path::effective_refresh_path(global_path, tun_on)
+                            crate::sys::outbound_path::effective_refresh_path(
+                                global_path,
+                                tun_on,
+                                leak_block,
+                            )
                         };
                         if draft.outbound_custom {
-                            let disabled =
-                                (!tun_on).then_some(Key::SettingsPathBindNicDisabledHint);
+                            let unavailable = crate::ui::outbound_settings::bind_nic_unavailable(
+                                tun_on, leak_block,
+                            );
+                            let disabled = unavailable
+                                .map(crate::ui::outbound_settings::BindNicUnavailable::hint);
                             let options = [
                                 (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
                                 (RefreshPath::Native, Key::SettingsPathNative, None),
@@ -12079,6 +12089,7 @@ impl ServersScreen {
                                     lang,
                                     effective,
                                     draft.outbound_path,
+                                    unavailable,
                                 ))
                                 .small()
                                 .weak(),
@@ -15477,6 +15488,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn the_servers_settings_enables_bind_nic_while_tun_mode_is_on_but_the_core_is_stopped() {
         let mut rig = UiTestRig::default();
         rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak.clear();
         rig.phase = crate::rt::CorePhase::Stopped;
         rig.settings.latency_test_path = crate::model::settings::ProbePath::BindNic;
         rig.settings.subscription_path = crate::model::settings::RefreshPath::BindNic;
@@ -15502,6 +15514,48 @@ Authentication: ML-KEM-768, Post-Quantum
                 "TUN mode, not the live connection, enables Bind NIC"
             );
         }
+    }
+
+    #[test]
+    fn the_servers_settings_disables_bind_nic_while_the_leak_block_is_on() {
+        let mut rig = UiTestRig::default();
+        rig.settings.mode = Mode::Tun;
+        rig.phase = crate::rt::CorePhase::Stopped;
+        rig.settings.latency_test_path = crate::model::settings::ProbePath::BindNic;
+        rig.settings.subscription_path = crate::model::settings::RefreshPath::BindNic;
+        assert!(
+            !rig.settings.tun.auto_system_wfp_block_leak.is_empty(),
+            "the seeded leak block is the state under test"
+        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+
+        let lang = Language::En;
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                t(lang, Key::SrvHeaderSettings),
+            )
+            .click();
+        harness.run();
+        let bind_nic = t(lang, Key::SettingsPathBindNic);
+        let segments: Vec<_> = harness
+            .get_all_by_role_and_label(egui::accesskit::Role::Button, bind_nic)
+            .collect();
+        assert_eq!(segments.len(), 2, "both path controls must render");
+        for node in segments {
+            assert!(
+                node.accesskit_node().is_disabled(),
+                "the leak block blocks Bind NIC even though TUN mode is on"
+            );
+        }
+        assert!(
+            harness
+                .query_all_by_label(t(lang, Key::SettingsPathNoteBindNicLeakBlock))
+                .next()
+                .is_some(),
+            "the note must name the leak block"
+        );
     }
 
     #[test]
@@ -15605,6 +15659,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn enabling_the_override_writes_the_subscription_fields() {
         let (mut rig, feed, _at) = subscription_view_rig(None, false);
         rig.settings.mode = Mode::Tun;
+        rig.settings.tun.auto_system_wfp_block_leak.clear();
         rig.phase = crate::rt::CorePhase::Running;
         rig.settings.subscription_path = crate::model::settings::RefreshPath::Native;
         let mut harness = screen_harness(rig, ServersScreen::default());
@@ -15830,6 +15885,52 @@ Authentication: ML-KEM-768, Post-Quantum
         assert_eq!(
             subscription.outbound_path,
             crate::model::settings::RefreshPath::Native
+        );
+    }
+
+    #[test]
+    fn the_override_disables_bind_nic_while_the_leak_block_is_on() {
+        let (mut rig, feed, _at) = subscription_view_rig(None, false);
+        rig.settings.mode = Mode::Tun;
+        {
+            let subscription = feed_subscription_mut(&mut rig, &feed);
+            subscription.outbound_custom = true;
+            subscription.outbound_path = crate::model::settings::RefreshPath::BindNic;
+        }
+        assert!(
+            !rig.settings.tun.auto_system_wfp_block_leak.is_empty(),
+            "the seeded leak block is the state under test"
+        );
+        let mut harness = screen_harness(rig, ServersScreen::default());
+        harness.run();
+        open_subscription_editor(&mut harness);
+
+        let lang = Language::En;
+        let bind_nic = t(lang, Key::SettingsPathBindNic);
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, bind_nic)
+                .accesskit_node()
+                .is_disabled(),
+            "the leak block blocks the override's Bind NIC dials too"
+        );
+        assert!(
+            harness
+                .query_all_by_label(t(lang, Key::SettingsPathNoteBindNicLeakBlock))
+                .next()
+                .is_some(),
+            "the override states the leak block as the reason"
+        );
+        let draft = harness
+            .state()
+            .0
+            .group_dialog
+            .as_ref()
+            .expect("the dialog is open");
+        assert_eq!(
+            draft.outbound_path,
+            crate::model::settings::RefreshPath::BindNic,
+            "the stored override must survive a leak-block frame"
         );
     }
 

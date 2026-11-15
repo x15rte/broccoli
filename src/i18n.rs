@@ -1010,6 +1010,8 @@ keys! {
     SettingsPathNoteBindNicTunOff 0,
     SettingsPathNoteNative 0,
     SettingsPathBindNicDisabledHint 0,
+    SettingsPathBindNicLeakBlockHint 0,
+    SettingsPathNoteBindNicLeakBlock 0,
     SettingsRawOverrideActive 0,
     SettingsRawOverrideHeader 0,
     SettingsRawOverrideExplain 0,
@@ -4350,6 +4352,14 @@ mod en {
                 "Native follows the OS stack. While TUN mode is on, the tunnel captures this path."
             }
             Key::SettingsPathBindNicDisabledHint => "Bind NIC needs TUN mode.",
+            Key::SettingsPathBindNicLeakBlockHint => {
+                "Bind NIC is unavailable while the TUN leak scope blocks every destination."
+            }
+            Key::SettingsPathNoteBindNicLeakBlock => {
+                "Bind NIC is off while the TUN leak scope blocks every destination: it bypasses \
+                 the tunnel the scope protects. Switch the scope to Custom entries or clear the \
+                 list to use Bind NIC again. Native follows the OS stack now."
+            }
             Key::SettingsRawOverrideActive => {
                 "⚠ RAW OVERRIDE ACTIVE. The app ignores all other settings on every screen."
             }
