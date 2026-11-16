@@ -946,7 +946,8 @@ pub enum ValidationCode {
     // see deserialized values — so this model pass is the single
     // validation seam. Error tier where Xray refuses the config at load,
     // Warning tier where Xray rewrites a value at run time or leaves part
-    // of the block in force.
+    // of the block in force, and Info tier where the block does exactly
+    // what the chosen values say.
     /// Mux `xudpProxyUDP443` outside {`reject`, `allow`, `skip`}: Xray's
     /// mux Build refuses unknown values at conf load (infra/conf/xray.go
     /// MuxConfig.Build — an exact, case-sensitive switch). Empty is legal
@@ -970,12 +971,15 @@ pub enum ValidationCode {
     MuxXudpKnobsInert,
     /// Mux `concurrency` negative while `mux.enabled`: TCP mux is off, but
     /// the block is not inert — XUDP and the UDP/443 policy still apply
-    /// (app/proxyman/outbound/handler.go). Advisory (Severity::Warning).
+    /// (app/proxyman/outbound/handler.go). The state follows from the
+    /// chosen value, so it is a configuration note (Severity::Info).
     MuxTcpMuxDisabled,
     /// Mux XUDP enabled (`xudpConcurrency` > 0) with `xudpProxyUDP443`
     /// unset, empty, or `reject`: the pinned core refuses every UDP flow
     /// to port 443 with `XUDP rejected UDP/443 traffic`
-    /// (app/proxyman/outbound/handler.go). Advisory (Severity::Warning).
+    /// (app/proxyman/outbound/handler.go). The policy is the chosen one
+    /// (reject is also the wire default), so it is a configuration note
+    /// (Severity::Info).
     MuxUdp443Rejected,
     // ---- extra-passthrough scans (validate_outbound per-settings extras +
     //      validate_stream transport extras) ----
@@ -1375,12 +1379,15 @@ pub enum ValidationCode {
 }
 
 /// Advisory tier of a [`ValidationIssue`]. `Error` findings block
-/// save/import/generation/apply; `Warning` findings never gate
-/// anything — they render amber and advisory wherever issues render.
+/// save/import/generation/apply; `Warning` findings name a possible
+/// misconfiguration; `Info` findings state the behavior a chosen value
+/// produces. Neither non-blocking tier gates anything: a warning renders
+/// amber, a note renders muted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
     Error,
     Warning,
+    Info,
 }
 
 /// Where one finding lives in the model: the structural locator a consumer
@@ -1406,9 +1413,9 @@ pub enum FindingTarget {
 
 /// One validation finding: a rule, the rendered location the generator
 /// prefixes (absent for whole-model findings), the structural row it judges
-/// ([`ValidationIssue::target`]), and its advisory tier. Every non-warning
-/// rule is [`Severity::Error`]; only the new configuration-warning rules are
-/// [`Severity::Warning`].
+/// ([`ValidationIssue::target`]), and its advisory tier. Every rule that
+/// refuses the configuration is [`Severity::Error`]; the configuration-warning
+/// and configuration-note rules carry the other two tiers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationIssue {
     pub code: ValidationCode,
@@ -1506,6 +1513,14 @@ impl Verdict {
             .filter(|issue| issue.severity == Severity::Warning)
     }
 
+    /// The notes — [`Severity::Info`]: legal configurations whose effect
+    /// follows from the user's choice, surfaced as a statement of behavior.
+    pub fn notes(&self) -> impl Iterator<Item = &ValidationIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| issue.severity == Severity::Info)
+    }
+
     /// Whether any finding refuses the configuration.
     pub fn has_blocking(&self) -> bool {
         self.issues
@@ -1521,24 +1536,21 @@ impl Verdict {
             .find(|issue| issue.severity == Severity::Error)
     }
 
-    /// The verdict split into its two tiers, consuming it: `(blocking,
-    /// advisory)`, each in pass order. A caller that needs both halves — a
-    /// refusal and the warnings it reports beside it — consumes the verdict
-    /// instead of cloning the advisory list to keep it past
-    /// [`Self::into_first_blocking`]; order within each tier is the pass
+    /// The verdict split into its tiers, consuming it. A caller that needs a
+    /// tier consumes the verdict instead of cloning the lists to keep them
+    /// past [`Self::into_first_blocking`]; order within each tier is the pass
     /// order, so the first blocking finding is the same one
     /// [`Self::into_first_blocking`] names.
-    pub fn into_tiers(self) -> (Vec<ValidationIssue>, Vec<ValidationIssue>) {
-        let mut blocking = Vec::new();
-        let mut advisory = Vec::new();
+    pub fn into_tiers(self) -> Tiers {
+        let mut tiers = Tiers::default();
         for issue in self.issues {
-            if issue.severity == Severity::Error {
-                blocking.push(issue);
-            } else {
-                advisory.push(issue);
+            match issue.severity {
+                Severity::Error => tiers.blocking.push(issue),
+                Severity::Warning => tiers.advisory.push(issue),
+                Severity::Info => tiers.notes.push(issue),
             }
         }
-        (blocking, advisory)
+        tiers
     }
 
     /// The findings as the plain list, for the callers that store or extend
@@ -1554,6 +1566,16 @@ impl std::ops::Deref for Verdict {
     fn deref(&self) -> &Self::Target {
         &self.issues
     }
+}
+
+/// A [`Verdict`] split into its tiers, each list in pass order. Named fields
+/// rather than a tuple of three same-typed vectors: a caller that wants one
+/// tier states which one it takes, and no binding order can silently swap two.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Tiers {
+    pub blocking: Vec<ValidationIssue>,
+    pub advisory: Vec<ValidationIssue>,
+    pub notes: Vec<ValidationIssue>,
 }
 
 impl IntoIterator for Verdict {
@@ -1588,6 +1610,15 @@ fn warning(code: ValidationCode, path: Option<String>) -> ValidationIssue {
         code,
         path,
         severity: Severity::Warning,
+        target: FindingTarget::Document,
+    }
+}
+
+fn note(code: ValidationCode, path: Option<String>) -> ValidationIssue {
+    ValidationIssue {
+        code,
+        path,
+        severity: Severity::Info,
         target: FindingTarget::Document,
     }
 }
@@ -1781,6 +1812,7 @@ mod tests {
         let verdict = Verdict::from_issues(vec![
             warning(ValidationCode::ServerNameImplausible, Some("first".into())),
             issue(ValidationCode::ServerAddressRequired, Some("a".into())),
+            note(ValidationCode::MuxTcpMuxDisabled, Some("mux".into())),
             warning(ValidationCode::ServerNameImplausible, Some("second".into())),
             issue(ValidationCode::MuxWithVisionFlow, Some("b".into())),
         ]);
@@ -1793,21 +1825,22 @@ mod tests {
             ))
         );
 
-        let (blocking, advisory) = verdict.into_tiers();
+        let tiers = verdict.into_tiers();
         assert_eq!(
-            codes(&blocking),
+            codes(&tiers.blocking),
             vec![
                 ValidationCode::ServerAddressRequired,
                 ValidationCode::MuxWithVisionFlow,
             ]
         );
         assert_eq!(
-            codes(&advisory),
+            codes(&tiers.advisory),
             vec![
                 ValidationCode::ServerNameImplausible,
                 ValidationCode::ServerNameImplausible,
             ]
         );
-        assert_eq!(blocking.first(), first_blocking.as_ref());
+        assert_eq!(codes(&tiers.notes), vec![ValidationCode::MuxTcpMuxDisabled]);
+        assert_eq!(tiers.blocking.first(), first_blocking.as_ref());
     }
 }

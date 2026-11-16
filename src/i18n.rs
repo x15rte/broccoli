@@ -1261,6 +1261,7 @@ keys! {
     SrvPrepareDraftFailed 1,
     SrvFixBeforeValidate 0,
     SrvConfigurationWarningsHeader 0,
+    SrvConfigurationNotesHeader 0,
     SrvValidateAndSave 0,
     SrvValidateAndSaveHint 0,
     SrvDiscardChanges 0,
@@ -4692,6 +4693,9 @@ mod en {
             Key::SrvConfigurationWarningsHeader => {
                 "Configuration warnings. The profile can still be validated and saved:"
             }
+            Key::SrvConfigurationNotesHeader => {
+                "Configuration notes. These describe how the core runs this profile:"
+            }
             Key::SrvValidateAndSave => "Validate and save",
             Key::SrvValidateAndSaveHint => {
                 "Runs xray run -test on an isolated candidate before saving"
@@ -5405,9 +5409,9 @@ mod en {
             Key::ListenAddressInvalid => {
                 "listen address must be an IP address, for example 127.0.0.1, 0.0.0.0, or ::1"
             }
-            // Configuration warnings (Severity::Warning): advisory messages
-            // name the incompatibility, the fix, and the XUDP exception /
-            // per-block plausible-value guidance.
+            // Configuration findings (Severity::Warning and Info): messages
+            // name the incompatibility or the behavior, the fix, and the XUDP
+            // exception / per-block plausible-value guidance.
             Key::OutboundMuxWithVisionFlow => {
                 "VLESS Vision carries only UDP over Mux.Cool. The server closes the mux \
                  connection on the first TCP session, so TCP keeps redialing and failing. \
@@ -5592,10 +5596,10 @@ mod en {
                  block to turn all of it off."
             }
             Key::OutboundMuxUdp443Rejected => {
-                "This profile runs XUDP (xudpConcurrency above 0) with the default reject policy. \
-                 Every UDP flow to port 443 (QUIC and HTTP/3) fails with \"XUDP rejected UDP/443 \
-                 traffic\". Set xudpProxyUDP443 to allow to let QUIC through, or to skip to send \
-                 UDP/443 outside mux."
+                "XUDP is on with the reject policy, so the core refuses every UDP flow to port \
+                 443 (QUIC and HTTP/3) with \"XUDP rejected UDP/443 traffic\". Set \
+                 xudpProxyUDP443 to allow to pass QUIC through mux, or to skip to send UDP/443 \
+                 outside mux."
             }
             Key::FinalmaskQuicCongestionInvalid => "choose reno, bbr, brutal, or force-brutal",
             Key::FinalmaskQuicBbrProfileInvalid => "choose conservative, standard, or aggressive",
@@ -7585,12 +7589,12 @@ mod tests {
         );
     }
 
-    /// Configuration-warning pins: the Severity::Warning codes render
+    /// Configuration-finding pins: the Warning and Info codes render
     /// through the same seam, prefixed by their wire path, and name the
-    /// incompatibility, the fix, and the XUDP exception / per-block
-    /// plausible-value guidance.
+    /// incompatibility or the behavior, the fix, and the XUDP exception /
+    /// per-block plausible-value guidance.
     #[test]
-    fn configuration_warning_messages_name_the_incompatibility_and_the_fix() {
+    fn configuration_finding_messages_name_the_behavior_or_the_fix() {
         use crate::model::validation::{Severity, ValidationIssue};
 
         let mux_issue = ValidationIssue {
@@ -7621,7 +7625,7 @@ mod tests {
         let tcp_off = ValidationIssue {
             code: ValidationCode::MuxTcpMuxDisabled,
             path: Some("mux.concurrency".into()),
-            severity: Severity::Warning,
+            severity: Severity::Info,
             target: crate::model::validation::FindingTarget::Document,
         };
         assert_eq!(
@@ -7634,15 +7638,15 @@ mod tests {
         let udp443 = ValidationIssue {
             code: ValidationCode::MuxUdp443Rejected,
             path: Some("mux.xudpProxyUDP443".into()),
-            severity: Severity::Warning,
+            severity: Severity::Info,
             target: crate::model::validation::FindingTarget::Document,
         };
         assert_eq!(
             validation_issue_message(&udp443, Language::En),
-            "mux.xudpProxyUDP443: This profile runs XUDP (xudpConcurrency above 0) with the \
-             default reject policy. Every UDP flow to port 443 (QUIC and HTTP/3) fails with \
-             \"XUDP rejected UDP/443 traffic\". Set xudpProxyUDP443 to allow to let QUIC \
-             through, or to skip to send UDP/443 outside mux."
+            "mux.xudpProxyUDP443: XUDP is on with the reject policy, so the core refuses every \
+             UDP flow to port 443 (QUIC and HTTP/3) with \"XUDP rejected UDP/443 traffic\". Set \
+             xudpProxyUDP443 to allow to pass QUIC through mux, or to skip to send UDP/443 \
+             outside mux."
         );
 
         for (path, guidance) in [

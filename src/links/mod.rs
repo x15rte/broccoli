@@ -4426,11 +4426,14 @@ fn validate_profile_inner(
         // first finding in pass order, and the advisory tier is the caller's
         // whole answer.
         AdvisoryReport::Collected => {
-            let (blocking, advisories) = verdict.into_tiers();
-            if let Some(issue) = blocking.into_iter().next() {
+            let tiers = verdict.into_tiers();
+            if let Some(issue) = tiers.blocking.into_iter().next() {
                 return Err(model_refusal(issue));
             }
-            advisories
+            // Notes are editor-only by contract: a note states the behavior a
+            // chosen value produces, and the import log carries the warnings
+            // the user may need to repair.
+            tiers.advisory
         }
         // The gate only asks for the refusal, so the verdict is consumed as
         // it is: no advisory list is built for a caller that drops it.

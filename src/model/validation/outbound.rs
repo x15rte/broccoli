@@ -12,7 +12,7 @@ use super::stream::{
 };
 use super::{
     ValidationCode, ValidationIssue, Verdict, excerpt, extra_has_key, extra_key_set,
-    is_vision_flow, issue, shadowed_keys, warning,
+    is_vision_flow, issue, note, shadowed_keys, warning,
 };
 use crate::model::inbound::Sniffing;
 use crate::model::outbound::{
@@ -1685,13 +1685,13 @@ pub fn validate_outbound_with_blocks(o: &OutboundModel) -> (Verdict, StreamBlock
         ));
     }
     if mux_tcp_mux_disabled(&o.mux) {
-        issues.push(warning(
+        issues.push(note(
             ValidationCode::MuxTcpMuxDisabled,
             Some("mux.concurrency".into()),
         ));
     }
     if mux_udp443_rejected(&o.mux) {
-        issues.push(warning(
+        issues.push(note(
             ValidationCode::MuxUdp443Rejected,
             Some("mux.xudpProxyUDP443".into()),
         ));
@@ -4919,7 +4919,7 @@ mod tests {
     }
 
     #[test]
-    fn negative_concurrency_with_enabled_mux_warns_that_tcp_mux_is_off() {
+    fn negative_concurrency_with_enabled_mux_notes_that_tcp_mux_is_off() {
         for value in [Some(-1), Some(-2), Some(-32768)] {
             let mut outbound = vless_over_tls();
             outbound.mux.enabled = true;
@@ -4931,7 +4931,7 @@ mod tests {
                 "concurrency {value:?} must raise the TCP-mux-off note: {issues:#?}"
             );
             let finding = finding(&issues, &ValidationCode::MuxTcpMuxDisabled).unwrap();
-            assert_eq!(finding.severity, Severity::Warning);
+            assert_eq!(finding.severity, Severity::Info);
             assert_eq!(finding.path.as_deref(), Some("mux.concurrency"));
         }
 
@@ -4956,7 +4956,7 @@ mod tests {
     }
 
     #[test]
-    fn xudp_with_the_default_udp443_policy_warns_that_udp443_is_refused() {
+    fn xudp_with_the_default_udp443_policy_notes_that_udp443_is_refused() {
         // XUDP enabled with the unset, empty, or explicit default policy
         // refuses every UDP/443 flow (`XUDP rejected UDP/443 traffic`).
         for mode in [None, Some(""), Some("reject")] {
@@ -4969,10 +4969,10 @@ mod tests {
             assert_eq!(
                 codes(&issues),
                 vec![ValidationCode::MuxUdp443Rejected],
-                "xudpProxyUDP443 {mode:?} with XUDP enabled must warn exactly once: {issues:#?}"
+                "xudpProxyUDP443 {mode:?} with XUDP enabled must note exactly once: {issues:#?}"
             );
             let finding = finding(&issues, &ValidationCode::MuxUdp443Rejected).unwrap();
-            assert_eq!(finding.severity, Severity::Warning);
+            assert_eq!(finding.severity, Severity::Info);
             assert_eq!(finding.path.as_deref(), Some("mux.xudpProxyUDP443"));
         }
 

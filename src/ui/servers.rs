@@ -208,6 +208,9 @@ struct EditorValidationFindings {
     /// Advisory findings (Severity::Warning) — rendered amber under their own
     /// header; never gate anything.
     advisory: Vec<ValidationIssue>,
+    /// Configuration notes (Severity::Info) — rendered muted under their own
+    /// header; never gate anything.
+    notes: Vec<ValidationIssue>,
     /// The Advanced tab's inline finalmask verdict: `validate_finalmask`
     /// findings in model order (TCP masks, UDP masks, QUIC params).
     finalmask: Verdict,
@@ -219,7 +222,7 @@ struct EditorValidationFindings {
 }
 
 /// The rendered form of one sweep: one `path: message` string per finding, in
-/// the sweep's order, and the two list halves already composed with their
+/// the sweep's order, and the three list halves already composed with their
 /// bullet. Rebuilt when the draft generation or the language moves, so no
 /// paint path renders or formats a finding.
 #[derive(Default)]
@@ -230,6 +233,8 @@ struct EditorValidationRender {
     blocking: Vec<String>,
     /// The warnings list's lines, bulleted like `blocking`.
     advisory: Vec<String>,
+    /// The notes list's lines, bulleted like `blocking`.
+    notes: Vec<String>,
     finalmask: Vec<String>,
     stream_sockopt: Vec<String>,
     ech_sockopt: Vec<String>,
@@ -265,6 +270,45 @@ fn render_findings<'a>(
         .collect()
 }
 
+/// Render one non-blocking finding tier under its own header: the header and
+/// the lines in the tier's colour, inside a bounded scroll area when
+/// `scroll_id` names one (the editor window's fixed height), plain otherwise
+/// (the add window grows with its content).
+fn render_finding_tier(
+    ui: &mut egui::Ui,
+    header: &str,
+    color: egui::Color32,
+    lines: &[String],
+    scroll_id: Option<&str>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    ui.separator();
+    ui.colored_label(color, header);
+    match scroll_id {
+        Some(id) => {
+            egui::ScrollArea::vertical()
+                .id_salt(id)
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    for line in lines {
+                        ui.colored_label(color, line);
+                    }
+                });
+        }
+        None => {
+            for line in lines {
+                ui.colored_label(color, line);
+            }
+        }
+    }
+}
+
+/// The height one finding tier reserves under the editor's tab content: the
+/// header, a 140-point scroll list, and their separators.
+const FINDING_TIER_RESERVE: f32 = 190.0;
+
 /// True for the rules the Basic tab renders inline under the protocol fields —
 /// the public-endpoint transport-security findings and the freedom fragment
 /// and noise blocks the tab's own editors fill in. These are the same findings
@@ -287,6 +331,7 @@ impl EditorValidationFindings {
         EditorValidationRender {
             blocking: render_bulleted(self.blocking.iter(), lang),
             advisory: render_bulleted(self.advisory.iter(), lang),
+            notes: render_bulleted(self.notes.iter(), lang),
             finalmask: render_findings(self.finalmask.iter(), lang),
             stream_sockopt: render_findings(self.stream_sockopt.iter(), lang),
             ech_sockopt: render_findings(self.ech_sockopt.iter(), lang),
@@ -301,18 +346,20 @@ impl EditorValidationFindings {
 }
 
 /// The editor's one model sweep for a draft: the aggregated verdict (the
-/// error and warning lists) plus the stream blocks the tabs render inline.
+/// error, warning, and note lists) plus the stream blocks the tabs render
+/// inline.
 /// Both come from the same `validate_outbound_with_blocks` pass, so a block's
 /// inline rows are the sweep's own findings — never a second validation of
 /// the same block, and never a verdict that can drift from the error list.
 fn editor_validation_findings(profile: &ServerProfile) -> EditorValidationFindings {
     let (model, blocks) = validate_outbound_with_blocks(&profile.outbound);
-    // The two list halves are the aggregate verdict consumed, not cloned: the
-    // lists own exactly the findings the sweep produced, in pass order.
-    let (blocking, advisory) = model.into_tiers();
+    // The three list halves are the aggregate verdict consumed, not cloned:
+    // the lists own exactly the findings the sweep produced, in pass order.
+    let tiers = model.into_tiers();
     EditorValidationFindings {
-        blocking,
-        advisory,
+        blocking: tiers.blocking,
+        advisory: tiers.advisory,
+        notes: tiers.notes,
         finalmask: blocks.finalmask,
         stream_sockopt: blocks.sockopt,
         ech_sockopt: blocks.ech_sockopt,
@@ -8104,10 +8151,13 @@ impl ServersScreen {
         let mut reserved = 0.0;
         if let Some(rendered) = draft.validation.as_ref().map(|cached| &cached.rendered) {
             if !rendered.blocking.is_empty() {
-                reserved += 190.0;
+                reserved += FINDING_TIER_RESERVE;
             }
             if !rendered.advisory.is_empty() {
-                reserved += 190.0;
+                reserved += FINDING_TIER_RESERVE;
+            }
+            if !rendered.notes.is_empty() {
+                reserved += FINDING_TIER_RESERVE;
             }
         }
         if draft.profile.outbound.retired_proxy_settings.is_some() {
@@ -8262,6 +8312,7 @@ impl ServersScreen {
         };
         let validation_errors = &cached.rendered.blocking;
         let validation_warnings = &cached.rendered.advisory;
+        let validation_notes = &cached.rendered.notes;
 
         let mut dismissed_retired_key = false;
         let mut dismissed_retired_hop = false;
@@ -8291,23 +8342,22 @@ impl ServersScreen {
                 });
             }
         }
-        // Configuration warnings render amber under their own header;
-        // unlike the error block above they never gate Validate-and-save.
-        if !validation_warnings.is_empty() {
-            ui.separator();
-            ui.colored_label(
-                status_colors_of(ui).warn,
-                t(lang, Key::SrvConfigurationWarningsHeader),
-            );
-            egui::ScrollArea::vertical()
-                .id_salt("servers.editor.validation-warnings")
-                .max_height(140.0)
-                .show(ui, |ui| {
-                    for warning in validation_warnings {
-                        ui.colored_label(status_colors_of(ui).warn, warning);
-                    }
-                });
-        }
+        // Configuration warnings render amber and configuration notes muted;
+        // unlike the error block above, neither gates Validate-and-save.
+        render_finding_tier(
+            ui,
+            t(lang, Key::SrvConfigurationWarningsHeader),
+            status_colors_of(ui).warn,
+            validation_warnings,
+            Some("servers.editor.validation-warnings"),
+        );
+        render_finding_tier(
+            ui,
+            t(lang, Key::SrvConfigurationNotesHeader),
+            ui.visuals().weak_text_color(),
+            validation_notes,
+            Some("servers.editor.validation-notes"),
+        );
         // The retired `quicParams.udpHop` advisory's other way out: a user who
         // wants no hop at all drops the key here instead of building the mask.
         // The key applies normally, so the control renders whenever it is
@@ -11121,6 +11171,7 @@ impl ServersScreen {
                     };
                     let errors = &cached.rendered.blocking;
                     let warnings = &cached.rendered.advisory;
+                    let notes = &cached.rendered.notes;
                     let gate = draft.gate(&self.seeded_buffers, validating, core_busy);
                     if !errors.is_empty() {
                         ui.separator();
@@ -11132,18 +11183,23 @@ impl ServersScreen {
                             ui.colored_label(status_colors_of(ui).err, error);
                         }
                     }
-                    // Configuration warnings never gate Validate-and-add;
-                    // they render amber under their own header.
-                    if !warnings.is_empty() {
-                        ui.separator();
-                        ui.colored_label(
-                            status_colors_of(ui).warn,
-                            t(lang, Key::SrvConfigurationWarningsHeader),
-                        );
-                        for warning in warnings {
-                            ui.colored_label(status_colors_of(ui).warn, warning);
-                        }
-                    }
+                    // Configuration warnings and notes never gate
+                    // Validate-and-add; the add window grows with its content,
+                    // so neither list scrolls.
+                    render_finding_tier(
+                        ui,
+                        t(lang, Key::SrvConfigurationWarningsHeader),
+                        status_colors_of(ui).warn,
+                        warnings,
+                        None,
+                    );
+                    render_finding_tier(
+                        ui,
+                        t(lang, Key::SrvConfigurationNotesHeader),
+                        ui.visuals().weak_text_color(),
+                        notes,
+                        None,
+                    );
                     if core_busy {
                         ui.colored_label(
                             status_colors_of(ui).warn,
@@ -20077,12 +20133,15 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(findings.blocking.is_empty());
         assert_eq!(
             codes_of(&findings.advisory),
-            vec![
-                ValidationCode::MuxTcpMuxDisabled,
-                ValidationCode::ServerNameImplausible
-            ],
+            vec![ValidationCode::ServerNameImplausible],
             "{:#?}",
             findings.advisory
+        );
+        assert_eq!(
+            codes_of(&findings.notes),
+            vec![ValidationCode::MuxTcpMuxDisabled],
+            "{:#?}",
+            findings.notes
         );
 
         // A plausible serverName clears the remaining server-name warning;
@@ -20093,11 +20152,16 @@ Authentication: ML-KEM-768, Post-Quantum
         });
         let findings = editor_validation_findings(&profile);
         assert!(findings.blocking.is_empty());
+        assert!(
+            findings.advisory.is_empty(),
+            "a plausible serverName leaves no warning: {:#?}",
+            findings.advisory
+        );
         assert_eq!(
-            codes_of(&findings.advisory),
+            codes_of(&findings.notes),
             vec![ValidationCode::MuxTcpMuxDisabled],
             "{:#?}",
-            findings.advisory
+            findings.notes
         );
 
         // A blocking finding still lands in the error half while a warning
@@ -20128,6 +20192,46 @@ Authentication: ML-KEM-768, Post-Quantum
             ],
             "{:#?}",
             findings.advisory
+        );
+    }
+
+    /// A mux state that follows the chosen values renders under the notes
+    /// header in the editor window, not under the warnings header, and the
+    /// save command stays live because a note never gates.
+    #[test]
+    fn mux_state_notes_render_under_the_notes_header_and_never_gate() {
+        let mut rig = UiTestRig::default();
+        let mut profile = ServerProfile::new("Mux off", OutboundModel::new(Protocol::Freedom));
+        profile.enabled = true;
+        profile.outbound.mux.enabled = true;
+        profile.outbound.mux.concurrency = Some(-1);
+        rig.servers.profiles.push(profile);
+        let mut harness = unsaved_harness(rig);
+        harness.run_steps(2);
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvConfigurationNotesHeader))
+                .is_some(),
+            "the mux state note must render under its own header"
+        );
+        assert!(
+            harness.query_by_label_contains("TCP mux is off").is_some(),
+            "the note must state the behavior it describes"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::SrvConfigurationWarningsHeader))
+                .is_none(),
+            "a note is not a warning"
+        );
+        // A dirty draft is what makes Save live; with a note present and no
+        // blocking finding it stays live.
+        edit_existing_draft(&mut harness.state_mut().0);
+        harness.run();
+        assert_eq!(
+            action_row_disabled(&harness),
+            (false, false),
+            "a note never gates save"
         );
     }
 
