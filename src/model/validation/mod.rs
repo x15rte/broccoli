@@ -149,7 +149,7 @@ pub enum ValidationCode {
     ShadowsocksSettingsIncomplete,
     /// VLESS/VMess `settings.port` of 0: Xray accepts it (`run -test`
     /// passes — live repro 2026-09-05, Xray 26.7.28) but dial :0 can never
-    /// connect (class A), so the model refuses it like the import grammar.
+    /// connect, so the model refuses it like the import grammar.
     SettingsPortZero,
     /// VLESS/VMess `settings.id` that is non-empty and not a canonical
     /// UUID: Xray silently sha1-maps short strings to a deterministic v5
