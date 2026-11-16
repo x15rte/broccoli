@@ -3927,6 +3927,23 @@ mod route_test_ui_tests {
         assert!(route_test_request(Language::En, &draft, &duplicate_rows).is_err());
     }
 }
+
+#[cfg(test)]
+impl RoutingScreen {
+    /// A screen whose managed geo data is already settled. Render tests must
+    /// not read the machine's geo data: the load worker requests a repaint
+    /// when it finishes, and that poke can land inside any `harness.run`,
+    /// exceeding its four-step budget when the runner is loaded. A settled
+    /// screen with no snapshot renders the same absent-catalog view a machine
+    /// without an installed core shows.
+    fn with_settled_geodata(mut self) -> Self {
+        if matches!(self.geodata_load_state, GeodataLoadState::Idle) {
+            self.geodata_load_state = GeodataLoadState::Ready;
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod geodata_load_state_tests {
     use super::{
@@ -4823,8 +4840,11 @@ mod routing_grammar_tests {
             },
             ..Default::default()
         });
-        let mut harness =
-            screen_harness_at(egui::vec2(900.0, 700.0), rig, RoutingScreen::default());
+        let mut harness = screen_harness_at(
+            egui::vec2(900.0, 700.0),
+            rig,
+            RoutingScreen::default().with_settled_geodata(),
+        );
         harness.run();
 
         let label = t(Language::En, Key::BurstObservatory);
@@ -6467,8 +6487,9 @@ mod routing_control_render_tests {
     use tokio::sync::oneshot;
 
     fn harness_for(
-        state: (RoutingScreen, UiTestRig),
+        mut state: (RoutingScreen, UiTestRig),
     ) -> Harness<'static, (RoutingScreen, UiTestRig)> {
+        state.0 = state.0.with_settled_geodata();
         let mut harness = harness_builder()
             .with_size(egui::vec2(900.0, 1600.0))
             .build_ui_state(
@@ -7399,7 +7420,11 @@ mod routing_local_os_tests {
             outbound_tag: "direct".into(),
             ..Rule::default()
         }];
-        let mut harness = screen_harness_at(egui::vec2(900.0, 1600.0), rig, screen);
+        let mut harness = screen_harness_at(
+            egui::vec2(900.0, 1600.0),
+            rig,
+            screen.with_settled_geodata(),
+        );
         harness.run();
         harness
     }
@@ -7474,7 +7499,11 @@ mod routing_inbound_selector_tests {
             enabled: true,
             ..DokodemoCfg::default()
         });
-        let mut harness = screen_harness_at(egui::vec2(900.0, 1600.0), rig, screen);
+        let mut harness = screen_harness_at(
+            egui::vec2(900.0, 1600.0),
+            rig,
+            screen.with_settled_geodata(),
+        );
         harness.run();
         harness
     }
