@@ -3400,6 +3400,12 @@ version = "2.5.0"
 criteria = "safe-to-deploy"
 version = "0.10.2"
 
+[[audits.constant_time_eq]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "0.6.1"
+notes = "Reviewed the whole crate. It compares byte slices in constant time: the generic path reads unaligned words and folds differences with another xor pass, the x86 path wraps the SSE2 compare/and/movemask sequence in inline asm so the optimizer cannot reintroduce an early exit, and the aarch64 path enables the DIT/SB features around the comparison when the CPU advertises them. Unsafe surface is limited to unaligned reads over byte slices with documented invariants and the asm blocks; no IO, network, or process spawning. The build script only derives rustc cfg flags from CARGO_CFG_TARGET_ARCH and rustversion."
+
 [[audits.core-graphics]]
 criteria = "safe-to-deploy"
 version = "0.23.2"
@@ -5566,6 +5572,12 @@ version = "0.1.7"
 [[audits.zeroize]]
 criteria = "safe-to-deploy"
 version = "1.9.0"
+
+[[audits.zeroize_derive]]
+who = "x15rte <x15rte@outlook.com>"
+criteria = "safe-to-deploy"
+version = "1.5.0"
+notes = "Reviewed the whole crate. It is a proc macro under forbid(unsafe_code) that expands Zeroize and ZeroizeOnDrop impls, skipping fields marked with the zeroize skip attribute and honoring custom trait bounds; the expansion contains no IO, network, or process work."
 
 [[audits.zerotrie]]
 criteria = "safe-to-deploy"
