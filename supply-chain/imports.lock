@@ -141,6 +141,13 @@ user-id = 95389
 user-login = "tauri-bot"
 user-name = "tauri"
 
+[[publisher.objc2-uniform-type-identifiers]]
+version = "0.3.2"
+when = "2025-10-04"
+user-id = 36629
+user-login = "madsmtm"
+user-name = "Mads Marquart"
+
 [[publisher.rand]]
 version = "0.10.2"
 when = "2026-07-02"
@@ -150,6 +157,13 @@ trusted-publisher = "github:rust-random/rand"
 version = "0.10.1"
 when = "2026-04-13"
 trusted-publisher = "github:rust-random/rand_core"
+
+[[publisher.rfd]]
+version = "0.18.0"
+when = "2026-11-07"
+user-id = 89114
+user-login = "PolyMeilex"
+user-name = "Bartłomiej Maryńczak"
 
 [[publisher.serde_spanned]]
 version = "1.1.3"
