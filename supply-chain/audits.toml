@@ -312,7 +312,7 @@ end = "2027-09-16"
 [[wildcard-audits.block2]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2021-11-19"
 end = "2027-09-16"
 
@@ -480,7 +480,7 @@ end = "2027-09-16"
 [[wildcard-audits.dispatch2]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1166,7 +1166,7 @@ end = "2027-09-16"
 [[wildcard-audits.keyboard-types]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2026-09-16"
 end = "2027-09-16"
 
@@ -1404,147 +1404,147 @@ end = "2027-09-16"
 [[wildcard-audits.objc-sys]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2021-11-19"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-app-kit]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-cloud-kit]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-contacts]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-core-data]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-core-foundation]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-05-04"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-core-graphics]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-12-10"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-core-image]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-05-14"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-core-location]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-encode]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2021-11-19"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-foundation]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2021-11-19"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-io-kit]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2025-04-08"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-io-surface]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-12-10"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-link-presentation]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-18"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-metal]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-quartz-core]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-symbols]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2026-09-16"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-ui-kit]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-17"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-uniform-type-identifiers]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-18"
 end = "2027-09-16"
 
 [[wildcard-audits.objc2-user-notifications]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-04-18"
 end = "2027-09-16"
 
@@ -1817,7 +1817,7 @@ end = "2027-09-16"
 [[wildcard-audits.raw-window-metal]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 36629
+user-id = 36629 # Mads Marquart (madsmtm)
 start = "2024-09-09"
 end = "2027-09-16"
 
@@ -1866,7 +1866,7 @@ end = "2027-09-16"
 [[wildcard-audits.rfd]]
 who = "x15rte <x15rte@outlook.com>"
 criteria = "safe-to-deploy"
-user-id = 89114
+user-id = 89114 # Bartłomiej Maryńczak (PolyMeilex)
 start = "2026-09-16"
 end = "2027-09-16"
 
