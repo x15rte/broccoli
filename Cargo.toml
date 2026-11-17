@@ -131,7 +131,7 @@ base64 = "0.23"
 url = "2"
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
-rfd = "0.17"
+rfd = "0.18"
 human-panic = "2"
 # The generic encoders the app's own seams share instead of each re-deriving
 # them: percent-encoding for the share-link grammar, ipnet for the CIDR rules,
