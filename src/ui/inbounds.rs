@@ -3,7 +3,7 @@
 //! listen address (default 127.0.0.1, any IP literal allowed); dokodemo also
 //! supports UNIX sockets.
 
-use crate::i18n::{Key, safety_message, t, t_fmt, validation_issue_message, validation_message};
+use crate::i18n::{Key, safety_message, t, t_fmt, validation_message};
 use crate::model::emit;
 use crate::model::inbound::{
     API_INBOUND_TAG, DokodemoNetwork, is_wildcard_listen, listen_endpoints_conflict,
@@ -19,6 +19,7 @@ use crate::model::{
     LocalInboundProtocol, Settings, Sniffing,
 };
 use crate::ui::InboundsCtx;
+use crate::ui::findings::{Generations, render_findings};
 use crate::ui::servers::finalmask_editors::filter_settings_editor;
 use crate::ui::widgets;
 use serde_json::Map;
@@ -27,10 +28,9 @@ use serde_json::Map;
 pub struct InboundsScreen {
     /// Transient port_map rows per dokodemo entry (synced on edit).
     port_map_rows: Vec<Vec<(String, String)>>,
-    /// Cross-listener validation references, rebuilt whenever the model
-    /// generation moves — never on idle repaint frames. `None` until the
-    /// first frame.
-    validation: Option<ValidationCache>,
+    /// Cross-listener validation references, keyed on the frame's
+    /// [`Generations`] and the row counts the payload is indexed by.
+    validation: widgets::Memo<(Generations, usize, usize), ValidationCache>,
     /// The reveal control's state: `true` while the user asked to see the
     /// account credentials this screen hides. Transient — leaving the screen
     /// hides them again.
@@ -45,15 +45,6 @@ pub struct InboundsScreen {
 /// rules the settings walk reports are *not* cached here: the row asks
 /// `ctx.verdict.for_target(..)` for those.
 struct ValidationCache {
-    /// The model generation these verdicts were derived from.
-    generation: u64,
-    /// The generation the shell's published verdict judged when this cache
-    /// was built. A separate key from `generation`: the persist publishes a
-    /// verdict after the edit frame, stamped with the edit generation, so
-    /// verdict-backed rows must rebuild when either moved — the edit's own
-    /// frame sees the earlier verdict's generation, and the publish that
-    /// follows stamps a generation an edit-keyed cache already holds.
-    verdict_generation: u64,
     non_loopback: bool,
     /// One collision verdict per local endpoint list entry, in list order.
     local_collisions: Vec<Option<String>>,
@@ -92,28 +83,6 @@ struct ValidationCache {
     doko_warnings: Vec<Option<String>>,
 }
 
-impl ValidationCache {
-    /// Whether these verdicts still describe `settings` at the frame's two
-    /// generations.
-    ///
-    /// Three conditions, all the cache's own: it was derived from the current
-    /// model generation (the mutation hook moves it, so an edit inside the
-    /// persist throttle window is covered), from the verdict the shell
-    /// published at `verdict_generation` (a separate stamp — the publish that
-    /// follows a throttled edit lands at a generation an edit-keyed cache
-    /// already holds), and it holds exactly one entry per rendered row — the
-    /// render indexes these vectors by the live list index, so a row count
-    /// that outgrew them would be an out-of-bounds read, and the cache states
-    /// that precondition itself rather than trusting every caller to fold the
-    /// counts into a key.
-    fn is_current(&self, generation: u64, verdict_generation: u64, settings: &Settings) -> bool {
-        self.generation == generation
-            && self.verdict_generation == verdict_generation
-            && self.local_collisions.len() == settings.local_inbounds.len()
-            && self.doko_collisions.len() == settings.dokodemo.len()
-    }
-}
-
 impl InboundsScreen {
     /// Hide the account credentials again. The shell calls this when the user
     /// leaves the screen, so a reveal never outlives the visit.
@@ -128,18 +97,15 @@ impl InboundsScreen {
         // row. The reference is copied out before the model is borrowed
         // mutably below.
         let verdict = ctx.verdict;
-        // Its own stamp, beside the edit generation: the persist publishes a
-        // verdict after the edit frame, so the two keys move independently.
-        let verdict_generation = ctx.verdict_generation;
-        // The validation references are rebuilt when either generation moves
-        // — the frame after any edit, and the frame the throttled persist
-        // publishes — and never on idle repaint frames; the cache validates
-        // its own row correspondence.
-        let generation = ctx.hooks.model_generation();
-        if !matches!(
-            &self.validation,
-            Some(cache) if cache.is_current(generation, verdict_generation, ctx.settings)
-        ) {
+        // The row counts ride in the key because the render indexes the
+        // payload's vectors by the live list index: a list that changed
+        // length without a generation bump would be an out-of-bounds read.
+        let key = (
+            Generations::new(ctx.hooks.model_generation(), ctx.verdict_generation),
+            ctx.settings.local_inbounds.len(),
+            ctx.settings.dokodemo.len(),
+        );
+        let validation = self.validation.get(&key, || {
             let snapshot = listeners(ctx.settings, lang);
             // The shell's verdict for this generation: the exposure warnings
             // below are the one slice of it this screen renders, and the
@@ -168,9 +134,7 @@ impl InboundsScreen {
             // row's collision verdict, keyed by the row it judged; the cache
             // keeps the per-list vectors its render paths index by position.
             let collisions = listener_collisions(&snapshot, lang);
-            self.validation = Some(ValidationCache {
-                generation,
-                verdict_generation,
+            ValidationCache {
                 non_loopback: any_non_loopback_listen(ctx.settings),
                 local_collisions: (0..ctx.settings.local_inbounds.len())
                     .map(|index| collisions.get(&ListenerKey::Local(index)).cloned())
@@ -188,10 +152,8 @@ impl InboundsScreen {
                             .finalmask
                             .as_ref()
                             .map(|finalmask| {
-                                validate_finalmask(finalmask)
-                                    .iter()
-                                    .map(|issue| validation_issue_message(issue, lang))
-                                    .collect()
+                                let issues = validate_finalmask(finalmask);
+                                render_findings(issues.iter(), lang)
                             })
                             .unwrap_or_default()
                     })
@@ -248,12 +210,8 @@ impl InboundsScreen {
                             .map(|finding| safety_message(&finding.code, lang))
                     })
                     .collect(),
-            });
-        }
-        let validation = match &self.validation {
-            Some(cache) => cache,
-            None => unreachable!("validation is built when absent, above"),
-        };
+            }
+        });
         ui.add_space(4.0);
         // The scope is pushed unconditionally so its auto-id slot is always
         // consumed: the sections below (CollapsingHeader internals wrap each
@@ -1623,14 +1581,11 @@ mod listener_validation_tests {
         assert_eq!(rig.borrow().settings.local_inbounds[1].accounts.len(), 1);
     }
 
-    /// The validation references are generation-gated: an idle frame
-    /// re-renders the cached verdicts (the same allocation — nothing is
-    /// recomputed), and an edit — recorded through the shell's mutation hook,
-    /// as a screen records one — rebuilds them once. An app boot plus a frame
-    /// window is not needed to see that: the gate, its key and its cached
-    /// vectors are all reachable from the screen itself.
+    /// The rendered verdicts follow the model: an idle frame keeps the
+    /// collision labels, and an edit — recorded through the shell's mutation
+    /// hook, as a screen records one — rebuilds the cache and clears them.
     #[test]
-    fn validation_cache_is_generation_gated() {
+    fn an_idle_frame_keeps_the_verdicts_and_an_edit_rebuilds_them() {
         let rig = Rc::new(RefCell::new(UiTestRig::default()));
         {
             let mut rig = rig.borrow_mut();
@@ -1653,47 +1608,35 @@ mod listener_validation_tests {
             "the cached HTTP collision verdict must render on its row"
         );
 
-        let (generation, verdicts) = {
-            let cache = harness
-                .state()
-                .validation
-                .as_ref()
-                .expect("the first frame builds the cache");
-            assert!(
-                cache.local_collisions.iter().any(Option::is_some),
-                "the seeded port collision must be in the cached verdicts"
-            );
-            (cache.generation, cache.local_collisions.as_ptr())
-        };
-
-        // An idle frame keeps the key and the verdict allocation.
+        // An idle frame keeps rendering the same verdicts.
         harness.run();
-        {
-            let cache = harness.state().validation.as_ref().unwrap();
-            assert_eq!(cache.generation, generation);
-            assert_eq!(
-                cache.local_collisions.as_ptr(),
-                verdicts,
-                "an unchanged generation must re-render the cached verdicts"
-            );
-        }
+        assert!(
+            harness
+                .query_by_label_contains("conflicts with HTTP")
+                .is_some()
+                && harness
+                    .query_by_label_contains("conflicts with SOCKS")
+                    .is_some(),
+            "an idle frame must keep the cached verdicts"
+        );
 
         // One edit, recorded through the mutation hook: the cache rebuilds
-        // once and the cleared collision is gone.
+        // and the cleared collision is gone.
         {
             let mut rig = rig.borrow_mut();
             rig.settings.local_inbounds[1].port = 10899;
             rig.edit();
         }
         harness.run();
-        {
-            let cache = harness.state().validation.as_ref().unwrap();
-            assert_ne!(cache.generation, generation, "an edit must move the key");
-            assert!(
-                cache.local_collisions.iter().all(Option::is_none),
-                "the cleared collision must be gone from the rebuilt cache"
-            );
-        }
+        assert!(
+            harness
+                .query_by_label_contains("conflicts with HTTP")
+                .is_none()
+                && harness
+                    .query_by_label_contains("conflicts with SOCKS")
+                    .is_none(),
+            "the cleared collision must be gone from the rebuilt cache"
+        );
     }
 
     /// Unticking Require auth on the trapped row clears the error the same

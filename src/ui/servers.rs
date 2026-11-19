@@ -8,7 +8,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::i18n::{Key, t, t_fmt, validation_issue_message, validation_message};
+use crate::i18n::{Key, t, t_fmt, validation_message};
 use crate::links;
 use crate::model::go_std_base64_decodes;
 use crate::model::outbound::{
@@ -44,6 +44,7 @@ use crate::rt::{
     ProfileValidationRequest, ToolTarget,
 };
 use crate::tls_ping::{ca_pins_from_probe_output, leaf_pin_from_probe_output};
+use crate::ui::findings::{render_bulleted, render_finding_tier, render_findings};
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::inbounds::sniffing_editor;
 use crate::ui::outbound_settings::OutboundSettingsSection;
@@ -59,6 +60,7 @@ use egui::{Color32, RichText, Stroke, StrokeKind};
 pub(crate) mod finalmask_editors;
 mod keygen;
 mod raw_editor;
+mod selection;
 mod tls_editor;
 mod validators;
 mod xmux;
@@ -70,6 +72,7 @@ use finalmask_editors::{
 };
 use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
 use raw_editor::{FieldKey, RawField, SeededBuffers};
+use selection::{Selection, VisibleRows};
 use validators::{
     v_masque_remote_dns_entry, v_masque_warp_address_entry, v_masque_warp_private_key,
     v_masque_warp_public_key, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
@@ -243,66 +246,6 @@ struct EditorValidationRender {
     /// rules and the freedom fragment and noise blocks. Inline text stays
     /// bare: the tab renders the message itself, without the list's bullet.
     basic_inline: Vec<String>,
-}
-
-/// Render one finding list as the editor's list lines: the shared bullet
-/// composed with the finding's message, once per (draft generation,
-/// language).
-fn render_bulleted<'a>(
-    findings: impl Iterator<Item = &'a ValidationIssue>,
-    lang: Language,
-) -> Vec<String> {
-    findings
-        .map(|issue| {
-            let message = validation_issue_message(issue, lang);
-            t_fmt(lang, Key::ErrorBullet, &[&message])
-        })
-        .collect()
-}
-
-/// Render one finding list through the shared i18n seam.
-fn render_findings<'a>(
-    findings: impl Iterator<Item = &'a ValidationIssue>,
-    lang: Language,
-) -> Vec<String> {
-    findings
-        .map(|issue| validation_issue_message(issue, lang))
-        .collect()
-}
-
-/// Render one non-blocking finding tier under its own header: the header and
-/// the lines in the tier's colour, inside a bounded scroll area when
-/// `scroll_id` names one (the editor window's fixed height), plain otherwise
-/// (the add window grows with its content).
-fn render_finding_tier(
-    ui: &mut egui::Ui,
-    header: &str,
-    color: egui::Color32,
-    lines: &[String],
-    scroll_id: Option<&str>,
-) {
-    if lines.is_empty() {
-        return;
-    }
-    ui.separator();
-    ui.colored_label(color, header);
-    match scroll_id {
-        Some(id) => {
-            egui::ScrollArea::vertical()
-                .id_salt(id)
-                .max_height(140.0)
-                .show(ui, |ui| {
-                    for line in lines {
-                        ui.colored_label(color, line);
-                    }
-                });
-        }
-        None => {
-            for line in lines {
-                ui.colored_label(color, line);
-            }
-        }
-    }
 }
 
 /// The height one finding tier reserves under the editor's tab content: the
@@ -1341,7 +1284,7 @@ struct ProfileDraft {
     /// The profile id, mirrored from `profile.id`. Profile ids are immutable
     /// (a rename changes only the display name), so this never drifts. The
     /// copy lets the tab closures borrow the id (for tool targets and the
-    /// tag list) without either cloning `self.selected` per repaint or
+    /// tag list) without either cloning the focused row's id per repaint or
     /// overlapping `&mut draft.profile`.
     id: String,
     /// The outbound tag of the profile this draft carries, derived from
@@ -1759,6 +1702,23 @@ struct AdvancedTabCtx<'a> {
     /// Whether the tab's credentials (the finalmask passwords) render masked
     /// (the reveal control).
     masked: bool,
+}
+
+/// What the selected profile's editor and the add-server dialog differ in
+/// when they render the same five tabs: the live tab field, the draft
+/// identity the tab's requests stage against, the reveal state masking the
+/// tab, and the scroll area's salt and bound (the editor's leaves room for
+/// the finding tiers it reserves; the add window is fixed). Everything else
+/// the tabs read comes from the draft itself.
+#[derive(Clone, Copy)]
+struct DraftTabPolicy<'a> {
+    tab: EditorTab,
+    kind: DraftKind,
+    mask: widgets::Mask,
+    scroll_id: &'a str,
+    height: f32,
+    /// The model generation the Advanced tab's chain-target memo keys on.
+    generation: u64,
 }
 
 /// What one finalmask list needs that the other does not: its wording and
@@ -2380,18 +2340,9 @@ pub struct ServersScreen {
     /// The shared latency-test and subscription settings surface, mounted on
     /// the Settings side. It owns its own drafts and reveal state.
     outbound_settings: OutboundSettingsSection,
-    selected: Option<String>,
-    /// The rows selected in the current tab, by profile id. Scoped to the tab
-    /// and to what the search shows: a row that leaves the visible set leaves
-    /// the selection, and a tab switch clears it.
-    selection: std::collections::BTreeSet<String>,
-    /// The row a Shift-click extends from. `None` until a plain or Ctrl click
-    /// names one.
-    selection_anchor: Option<String>,
-    /// Whether the opening focus was filled in. The screen focuses the active
-    /// server (or the first row) once; switching tabs clears the focus and
-    /// does not bring it back.
-    selection_initialized: bool,
+    /// The focused row, the selected rows, and the anchor a Shift-click
+    /// extends from — the rows a table command acts on (see [`Selection`]).
+    selection: Selection,
     /// The active tab. Opening the screen starts on `Emitted`.
     view: ServerTab,
     /// The screen's view sort, persisted with the UI preferences: it
@@ -3981,16 +3932,12 @@ impl ServersScreen {
         // Keep the focus, the multi-selection and the open editor pointing at
         // real profiles. A stale selection id can only come from a model
         // change, so the selection sweep runs when the generation moves,
-        // never on every repaint.
-        if let Some(id) = &self.selected
-            && !ctx.servers.profiles.iter().any(|profile| &profile.id == id)
-        {
-            self.selected = None;
-        }
+        // never on every repaint; the focus is cheap to check every frame.
+        self.selection.retain_focus(&ctx.servers.profiles);
         let generation = ctx.hooks.model_generation();
         if self.selection_generation != Some(generation) {
             self.selection_generation = Some(generation);
-            self.retain_existing_selection(ctx.servers);
+            self.selection.retain_profiles(&ctx.servers.profiles);
         }
         if self.existing.draft().is_some_and(|draft| {
             !ctx.servers
@@ -4006,22 +3953,18 @@ impl ServersScreen {
             ctx.servers.active_route_repaired = false;
             self.set_status(StatusLine::err(t(lang, Key::SrvActiveRouteReset)));
         }
-        if !self.selection_initialized {
-            self.selection_initialized = true;
-            if self.selected.is_none() {
-                self.selected = ctx
-                    .servers
-                    .active
-                    .clone()
-                    .filter(|id| ctx.servers.profiles.iter().any(|profile| &profile.id == id))
-                    .or_else(|| {
-                        ctx.servers
-                            .profiles
-                            .first()
-                            .map(|profile| profile.id.clone())
-                    });
-            }
-        }
+        self.selection.initialize_focus(|| {
+            ctx.servers
+                .active
+                .clone()
+                .filter(|id| ctx.servers.profiles.iter().any(|profile| &profile.id == id))
+                .or_else(|| {
+                    ctx.servers
+                        .profiles
+                        .first()
+                        .map(|profile| profile.id.clone())
+                })
+        });
         // The view sort is a UI preference: the screen reads it once, from
         // the settings, so the table opens in the order the user left it.
         if !self.sort_initialized {
@@ -4104,9 +4047,7 @@ impl ServersScreen {
             return;
         }
         self.view = tab;
-        self.selected = None;
         self.selection.clear();
-        self.selection_anchor = None;
         self.tab_rows_cache = None;
     }
 
@@ -4678,13 +4619,9 @@ impl ServersScreen {
                 }
                 // The route is chosen from the selection, like the row menu's
                 // item: one selected server that is not already the route.
-                let single_selected = if self.selection.len() == 1 {
-                    self.selection.iter().next()
-                } else {
-                    None
-                };
-                let can_set_active = single_selected
-                    .is_some_and(|id| Some(id.as_str()) != ctx.servers.active.as_deref());
+                let single_selected = self.selection.only();
+                let can_set_active =
+                    single_selected.is_some_and(|id| Some(id) != ctx.servers.active.as_deref());
                 if ui
                     .add_enabled(
                         can_set_active,
@@ -4694,7 +4631,7 @@ impl ServersScreen {
                     .clicked()
                     && let Some(id) = single_selected
                 {
-                    action = Some(ListAction::SetActive(id.clone()));
+                    action = Some(ListAction::SetActive(id.to_owned()));
                 }
             });
         }
@@ -4932,7 +4869,8 @@ impl ServersScreen {
         // row list's own rebuild can change which rows are visible, so the
         // sweep rides on it instead of running selection × rows every frame.
         if stale_rows {
-            self.retain_visible_selection(&display_rows, profiles);
+            self.selection
+                .retain_visible(VisibleRows::new(&display_rows, profiles));
         }
         // One clone per frame instead of a lookup per row: the menu's switch
         // label asks which selected rows are locked, and the route is one of
@@ -5223,9 +5161,7 @@ impl ServersScreen {
                                 let id = &p.id;
                                 let mut menu = |ui: &mut egui::Ui| {
                                     if !self.selection.contains(id.as_str()) {
-                                        self.selection.clear();
-                                        self.selection.insert(id.clone());
-                                        self.selection_anchor = Some(id.clone());
+                                        self.selection.isolate(id);
                                     }
                                     if ui.button(t(lang, Key::SrvEdit)).clicked() {
                                         action = Some(ListAction::Edit(id.clone()));
@@ -5236,7 +5172,7 @@ impl ServersScreen {
                                         ui.close();
                                     }
                                     let set_active = ui.add_enabled(
-                                        self.is_single_selection(id),
+                                        self.selection.is_single(id),
                                         egui::Button::new(t(lang, Key::SrvSetActive)),
                                     );
                                     if set_active.clicked() {
@@ -5458,10 +5394,9 @@ impl ServersScreen {
                 action = Some(ListAction::SelectAllVisible);
             }
             if ui.input(|i| i.key_pressed(egui::Key::Enter))
-                && self.selection.len() == 1
-                && let Some(id) = self.selection.iter().next()
+                && let Some(id) = self.selection.only()
             {
-                action = Some(ListAction::SetActive(id.clone()));
+                action = Some(ListAction::SetActive(id.to_owned()));
             }
         }
         // apply deferred list actions (needs &mut profiles)
@@ -5471,24 +5406,23 @@ impl ServersScreen {
                 // and its resolution performs the selection.
                 self.guard_select(id);
             }
-            Some(ListAction::ToggleSelection(id)) => self.toggle_selection(&id),
+            Some(ListAction::ToggleSelection(id)) => self.selection.toggle(&id),
             Some(ListAction::ExtendSelection(id)) => {
-                self.extend_selection(&id, &display_rows, profiles);
+                self.selection
+                    .extend(&id, VisibleRows::new(&display_rows, profiles));
             }
             Some(ListAction::SelectAllVisible) => {
-                self.select_all_visible(&display_rows, profiles);
+                self.selection
+                    .select_all(VisibleRows::new(&display_rows, profiles));
             }
-            Some(ListAction::ClearSelection) => {
-                self.selection.clear();
-                self.selection_anchor = None;
-                self.selected = None;
-            }
+            Some(ListAction::ClearSelection) => self.selection.clear(),
             Some(ListAction::ProbeLatency(id)) => {
                 // A menu opened on a row outside the selection replaced the
                 // selection with that row first; a menu click inside a
                 // multi-selection probes the whole selection.
                 let ids = if self.selection.len() > 1 {
-                    self.selected_ids(&display_rows, profiles)
+                    self.selection
+                        .ids_in_order(VisibleRows::new(&display_rows, profiles))
                 } else {
                     vec![id]
                 };
@@ -5498,7 +5432,9 @@ impl ServersScreen {
                 // The toolbar command targets the selection, or the whole
                 // current tab when nothing is selected. Its feedback always
                 // names the target count, even when the target is one row.
-                let selected = self.selected_ids(&display_rows, profiles);
+                let selected = self
+                    .selection
+                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
                 let ids = if selected.is_empty() {
                     display_rows
                         .iter()
@@ -5510,19 +5446,27 @@ impl ServersScreen {
                 self.probe_rows(ctx, &ids, false);
             }
             Some(ListAction::SetSelectionEnabled(enabled)) => {
-                let ids = self.selected_ids(&display_rows, profiles);
+                let ids = self
+                    .selection
+                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
                 self.set_selected_enabled(ctx, &ids, enabled);
             }
             Some(ListAction::ExportSelection) => {
-                let ids = self.selected_ids(&display_rows, profiles);
+                let ids = self
+                    .selection
+                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
                 self.export_rows(ui, ctx, lang, &ids);
             }
             Some(ListAction::CopySelection) => {
-                let ids = self.selected_ids(&display_rows, profiles);
+                let ids = self
+                    .selection
+                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
                 self.open_copy_dialog(&ids, ctx.servers);
             }
             Some(ListAction::DeleteSelection) => {
-                let ids = self.selected_ids(&display_rows, profiles);
+                let ids = self
+                    .selection
+                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
                 self.open_delete_dialog(ctx.servers, ctx.settings, lang, ids);
             }
             Some(ListAction::Duplicate(id)) => {
@@ -5636,122 +5580,6 @@ impl ServersScreen {
         self.draft_unsaved(DraftKind::Existing, false) || self.draft_unsaved(DraftKind::Add, false)
     }
 
-    /// Focus one row and make it the sole selection: the plain-click,
-    /// editor-open and resolved leave-action path.
-    fn focus_row(&mut self, id: &str) {
-        self.selected = Some(id.to_owned());
-        self.selection.clear();
-        self.selection.insert(id.to_owned());
-        self.selection_anchor = Some(id.to_owned());
-    }
-
-    /// Drop every selected id no profile backs any more, so a deleted profile
-    /// cannot be acted on through a stale selection.
-    fn retain_existing_selection(&mut self, servers: &ServersFile) {
-        self.selection
-            .retain(|id| servers.profiles.iter().any(|profile| &profile.id == id));
-        if self
-            .selection_anchor
-            .as_deref()
-            .is_some_and(|anchor| !self.selection.contains(anchor))
-        {
-            self.selection_anchor = None;
-        }
-    }
-
-    /// Keep the selection inside the rows the current tab shows: a search that
-    /// filters a row out also removes it from the selection.
-    fn retain_visible_selection(&mut self, rows: &[usize], profiles: &[ServerProfile]) {
-        self.selection.retain(|id| {
-            rows.iter()
-                .any(|&index| profiles[index].id.as_str() == id.as_str())
-        });
-        if self
-            .selection_anchor
-            .as_deref()
-            .is_some_and(|anchor| !self.selection.contains(anchor))
-        {
-            self.selection_anchor = None;
-        }
-    }
-
-    /// The selection in display order, the order every batch command applies.
-    /// Built only by the commands that read it, so a repaint that clicks
-    /// nothing never clones the selected ids.
-    fn selected_ids(&self, rows: &[usize], profiles: &[ServerProfile]) -> Vec<String> {
-        rows.iter()
-            .map(|&index| &profiles[index])
-            .filter(|profile| self.selection.contains(profile.id.as_str()))
-            .map(|profile| profile.id.clone())
-            .collect()
-    }
-
-    /// Ctrl-click: add the row to the selection, or remove it.
-    fn toggle_selection(&mut self, id: &str) {
-        if self.selection.remove(id) {
-            if self.selection_anchor.as_deref() == Some(id) {
-                self.selection_anchor = None;
-            }
-            if self.selected.as_deref() == Some(id) {
-                self.selected = self.selection.iter().next().cloned();
-            }
-        } else {
-            self.selection.insert(id.to_owned());
-            self.selected = Some(id.to_owned());
-            self.selection_anchor = Some(id.to_owned());
-        }
-    }
-
-    /// Shift-click: select every visible row between the anchor and `id`.
-    /// Without a usable anchor the row becomes the whole selection.
-    fn extend_selection(&mut self, id: &str, rows: &[usize], profiles: &[ServerProfile]) {
-        let Some(target) = rows
-            .iter()
-            .position(|&index| profiles[index].id.as_str() == id)
-        else {
-            return;
-        };
-        let anchor = self
-            .selection_anchor
-            .as_deref()
-            .and_then(|anchor| {
-                rows.iter()
-                    .position(|&index| profiles[index].id.as_str() == anchor)
-            })
-            .unwrap_or(target);
-        let (start, end) = if anchor <= target {
-            (anchor, target)
-        } else {
-            (target, anchor)
-        };
-        self.selection.clear();
-        for index in &rows[start..=end] {
-            self.selection.insert(profiles[*index].id.clone());
-        }
-        self.selection_anchor = Some(profiles[rows[anchor]].id.clone());
-        self.selected = Some(id.to_owned());
-    }
-
-    /// Ctrl+A: select every row the current tab shows.
-    fn select_all_visible(&mut self, rows: &[usize], profiles: &[ServerProfile]) {
-        self.selection.clear();
-        let mut first = None;
-        for &index in rows {
-            let id = &profiles[index].id;
-            self.selection.insert(id.clone());
-            first.get_or_insert_with(|| id.clone());
-        }
-        self.selection_anchor = first.clone();
-        if first.is_some() {
-            self.selected = first;
-        }
-    }
-
-    /// True when this "id" is the only selected row.
-    fn is_single_selection(&self, id: &str) -> bool {
-        self.selection.len() == 1 && self.selection.contains(id)
-    }
-
     /// Guard a selection switch to `id`: when a draft holds uncommitted
     /// changes, stage the leave modal instead of switching (the modal's
     /// Save/Discard resolution performs the switch); otherwise switch
@@ -5761,18 +5589,18 @@ impl ServersScreen {
     /// changes nothing there, but still collapses a multi-selection to it.
     fn guard_select(&mut self, id: String) -> bool {
         if self.delete_pending.is_some() {
-            self.focus_row(&id);
+            self.selection.select(&id);
             return true;
         }
-        if self.selected.as_deref() == Some(id.as_str()) {
-            self.focus_row(&id);
+        if self.selection.focus() == Some(id.as_str()) {
+            self.selection.select(&id);
             return true;
         }
         if self.unsaved_changes() {
             self.stage_leave(LeaveAction::Select(id));
             false
         } else {
-            self.focus_row(&id);
+            self.selection.select(&id);
             true
         }
     }
@@ -6007,7 +5835,7 @@ impl ServersScreen {
             .draft()
             .is_some_and(|draft| draft.id.as_str() == id)
         {
-            self.focus_row(id);
+            self.selection.select(id);
             return;
         }
         if self.unsaved_changes() {
@@ -6029,7 +5857,7 @@ impl ServersScreen {
                 self.existing.close(&mut self.seeded_buffers);
                 self.existing.probe.discard_result();
                 self.existing.hold(draft);
-                self.focus_row(id);
+                self.selection.select(id);
                 self.derive_dialog = None;
                 self.profile_validation_report = None;
                 self.revealed_existing = false;
@@ -6129,7 +5957,7 @@ impl ServersScreen {
     /// windows; Quit resumes the app quit.
     fn apply_leave_action(&mut self, action: LeaveAction, uictx: &mut ServersCtx) {
         match action {
-            LeaveAction::Select(id) => self.focus_row(&id),
+            LeaveAction::Select(id) => self.selection.select(&id),
             LeaveAction::OpenEditor(id) => {
                 let lang = uictx.settings.language;
                 self.load_existing_draft(uictx.servers, lang, &id);
@@ -8019,6 +7847,132 @@ impl ServersScreen {
         }
     }
 
+    /// One draft's active tab inside its scroll area: the five tab renderers,
+    /// the inline verdict slices their fields show, and the chain-target memo
+    /// the Advanced tab refreshes are reached the same way for both editor
+    /// windows, so a tab cannot exist in one and not the other. Returns
+    /// whether the tab changed the draft.
+    fn draft_tab_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        lang: Language,
+        draft: &mut ProfileDraft,
+        profiles: &[ServerProfile],
+        policy: DraftTabPolicy<'_>,
+    ) -> bool {
+        // The borrowed identity the tabs take, built once per frame from the
+        // draft's own fields (see [`DraftTarget`]): it carries the generation
+        // the sweep covers, so a request staged from it is dropped only once
+        // an edit moves the draft on.
+        let target = DraftTarget {
+            kind: policy.kind,
+            profile_id: draft.id.as_str(),
+            generation: draft.generation,
+        };
+        let mut changed = false;
+        egui::ScrollArea::vertical()
+            .id_salt(policy.scroll_id)
+            .max_height(policy.height)
+            .show(ui, |ui| {
+                changed = match policy.tab {
+                    EditorTab::Basic => {
+                        let inline_errors: &[String] = draft
+                            .validation
+                            .as_ref()
+                            .map(|cached| cached.rendered.basic_inline.as_slice())
+                            .unwrap_or(&[]);
+                        self.basic_tab_for_target(
+                            ui,
+                            lang,
+                            &mut draft.profile,
+                            Some(target),
+                            inline_errors,
+                            policy.mask,
+                        )
+                    }
+                    EditorTab::Transport => {
+                        let OutboundModel {
+                            protocol,
+                            stream,
+                            mux,
+                            ..
+                        } = &mut draft.profile.outbound;
+                        self.transport_tab(
+                            ui,
+                            lang,
+                            stream,
+                            0,
+                            TransportTabCtx {
+                                target: Some(target),
+                                masked: policy.mask.secrets,
+                                protocol: *protocol,
+                                mux: Some(mux),
+                            },
+                        )
+                    }
+                    EditorTab::Security => {
+                        let address = draft.profile.server_address();
+                        let ech_sockopt_errors: &[String] = draft
+                            .validation
+                            .as_ref()
+                            .map(|cached| cached.rendered.ech_sockopt.as_slice())
+                            .unwrap_or(&[]);
+                        self.security_tab_for_target(
+                            ui,
+                            lang,
+                            Some(target),
+                            &mut draft.profile.outbound.stream,
+                            address.as_deref(),
+                            ech_sockopt_errors,
+                        )
+                    }
+                    EditorTab::Mux => {
+                        let flow = vless_flow(&draft.profile.outbound.settings);
+                        mux_tab(ui, lang, &mut draft.profile.outbound.mux, flow)
+                    }
+                    EditorTab::Advanced => {
+                        // The inline finalmask and sockopt verdicts ride the
+                        // draft's memoized validation (refreshed by the caller
+                        // whenever the draft generation or language moved):
+                        // identical messages, zero re-validation on idle
+                        // frames.
+                        let finalmask_errors: &[String] = draft
+                            .validation
+                            .as_ref()
+                            .map(|cached| cached.rendered.finalmask.as_slice())
+                            .unwrap_or(&[]);
+                        let stream_sockopt_errors: &[String] = draft
+                            .validation
+                            .as_ref()
+                            .map(|cached| cached.rendered.stream_sockopt.as_slice())
+                            .unwrap_or(&[]);
+                        // The chain-target picker's memo belongs to the draft's
+                        // own slot: the two editors never read each other's
+                        // options.
+                        let dialer_proxy_options = match policy.kind {
+                            DraftKind::Existing => &mut self.existing.chain_options,
+                            DraftKind::Add => &mut self.add.chain_options,
+                        };
+                        ServersScreen::advanced_tab(
+                            ui,
+                            lang,
+                            &mut draft.profile,
+                            profiles,
+                            AdvancedTabCtx {
+                                set_key: (policy.generation, profiles.len()),
+                                finalmask_errors,
+                                stream_sockopt_errors,
+                                dialer_proxy_options,
+                                buffers: &mut self.seeded_buffers,
+                                masked: policy.mask.secrets,
+                            },
+                        )
+                    }
+                };
+            });
+        changed
+    }
+
     /// One frame of the editor window's content. The caller owns the draft out
     /// of its slot for the frame (the tabs mutate the screen around it) and
     /// puts it back or closes it afterwards; `outcome` carries what the
@@ -8170,108 +8124,20 @@ impl ServersScreen {
             reserved += 190.0;
         }
         let tab_height = (ui.available_height() - reserved).max(160.0);
-        // The borrowed identity the three tabs below take, built once per
-        // frame from the draft's own fields (see [`DraftTarget`]): it carries
-        // the generation the sweep above covers, so a request staged from it
-        // is dropped only once an edit moves the draft on.
-        let target = DraftTarget {
-            kind: DraftKind::Existing,
-            profile_id: draft.id.as_str(),
-            generation: draft.generation,
-        };
-        egui::ScrollArea::vertical()
-            .id_salt("servers.editor.scroll")
-            .max_height(tab_height)
-            .show(ui, |ui| {
-                changed |= match self.tab {
-                    EditorTab::Basic => {
-                        let inline_errors: &[String] = draft
-                            .validation
-                            .as_ref()
-                            .map(|cached| cached.rendered.basic_inline.as_slice())
-                            .unwrap_or(&[]);
-                        self.basic_tab_for_target(
-                            ui,
-                            lang,
-                            &mut draft.profile,
-                            Some(target),
-                            inline_errors,
-                            mask,
-                        )
-                    }
-                    EditorTab::Transport => {
-                        let OutboundModel {
-                            protocol,
-                            stream,
-                            mux,
-                            ..
-                        } = &mut draft.profile.outbound;
-                        self.transport_tab(
-                            ui,
-                            lang,
-                            stream,
-                            0,
-                            TransportTabCtx {
-                                target: Some(target),
-                                masked: mask.secrets,
-                                protocol: *protocol,
-                                mux: Some(mux),
-                            },
-                        )
-                    }
-                    EditorTab::Security => {
-                        let address = draft.profile.server_address();
-                        let ech_sockopt_errors: &[String] = draft
-                            .validation
-                            .as_ref()
-                            .map(|cached| cached.rendered.ech_sockopt.as_slice())
-                            .unwrap_or(&[]);
-                        self.security_tab_for_target(
-                            ui,
-                            lang,
-                            Some(target),
-                            &mut draft.profile.outbound.stream,
-                            address.as_deref(),
-                            ech_sockopt_errors,
-                        )
-                    }
-                    EditorTab::Mux => {
-                        let flow = vless_flow(&draft.profile.outbound.settings);
-                        mux_tab(ui, lang, &mut draft.profile.outbound.mux, flow)
-                    }
-                    EditorTab::Advanced => {
-                        // The inline finalmask and sockopt verdicts ride the
-                        // draft's memoized validation (refreshed above
-                        // whenever the draft generation or language moved):
-                        // identical messages, zero re-validation on idle
-                        // frames.
-                        let finalmask_errors: &[String] = draft
-                            .validation
-                            .as_ref()
-                            .map(|cached| cached.rendered.finalmask.as_slice())
-                            .unwrap_or(&[]);
-                        let stream_sockopt_errors: &[String] = draft
-                            .validation
-                            .as_ref()
-                            .map(|cached| cached.rendered.stream_sockopt.as_slice())
-                            .unwrap_or(&[]);
-                        ServersScreen::advanced_tab(
-                            ui,
-                            lang,
-                            &mut draft.profile,
-                            &ctx.servers.profiles,
-                            AdvancedTabCtx {
-                                set_key: (ctx.hooks.model_generation(), ctx.servers.profiles.len()),
-                                finalmask_errors,
-                                stream_sockopt_errors,
-                                dialer_proxy_options: &mut self.existing.chain_options,
-                                buffers: &mut self.seeded_buffers,
-                                masked: mask.secrets,
-                            },
-                        )
-                    }
-                };
-            });
+        changed |= self.draft_tab_body(
+            ui,
+            lang,
+            draft,
+            &ctx.servers.profiles,
+            DraftTabPolicy {
+                tab: self.tab,
+                kind: DraftKind::Existing,
+                mask,
+                scroll_id: "servers.editor.scroll",
+                height: tab_height,
+                generation: ctx.hooks.model_generation(),
+            },
+        );
         if changed {
             // The retired `proxySettings` key needs a chain decision, not any
             // edit: the profile stops gating when its chain target differs
@@ -11048,120 +10914,27 @@ impl ServersScreen {
                         server_info: !self.revealed_add && uictx.settings.hide_server_info,
                     };
                     ui.separator();
-                    egui::ScrollArea::vertical()
-                        .id_salt("servers.add-draft.scroll")
-                        .max_height(430.0)
-                        .show(ui, |ui| {
-                            // The borrowed identity the tabs below take, built from
-                            // the draft's own fields (see [`DraftTarget`]) inside
-                            // the frame that renders them: the change protocol after
-                            // the tabs mutates the draft as a whole, so the borrow
-                            // of its id ends with the tab that reads it.
-                            let target = DraftTarget {
-                                kind: DraftKind::Add,
-                                profile_id: draft.id.as_str(),
-                                generation: draft.generation,
-                            };
-                            let changed = match self.draft_tab {
-                                EditorTab::Basic => {
-                                    let inline_errors: &[String] = draft
-                                        .validation
-                                        .as_ref()
-                                        .map(|cached| cached.rendered.basic_inline.as_slice())
-                                        .unwrap_or(&[]);
-                                    self.basic_tab_for_target(
-                                        ui,
-                                        lang,
-                                        &mut draft.profile,
-                                        Some(target),
-                                        inline_errors,
-                                        mask,
-                                    )
-                                }
-                                EditorTab::Transport => {
-                                    let OutboundModel {
-                                        protocol,
-                                        stream,
-                                        mux,
-                                        ..
-                                    } = &mut draft.profile.outbound;
-                                    self.transport_tab(
-                                        ui,
-                                        lang,
-                                        stream,
-                                        0,
-                                        TransportTabCtx {
-                                            target: Some(target),
-                                            masked: mask.secrets,
-                                            protocol: *protocol,
-                                            mux: Some(mux),
-                                        },
-                                    )
-                                }
-                                EditorTab::Security => {
-                                    let address = draft.profile.server_address();
-                                    let ech_sockopt_errors: &[String] = draft
-                                        .validation
-                                        .as_ref()
-                                        .map(|cached| cached.rendered.ech_sockopt.as_slice())
-                                        .unwrap_or(&[]);
-                                    self.security_tab_for_target(
-                                        ui,
-                                        lang,
-                                        Some(target),
-                                        &mut draft.profile.outbound.stream,
-                                        address.as_deref(),
-                                        ech_sockopt_errors,
-                                    )
-                                }
-                                EditorTab::Mux => {
-                                    let flow = vless_flow(&draft.profile.outbound.settings);
-                                    mux_tab(ui, lang, &mut draft.profile.outbound.mux, flow)
-                                }
-                                EditorTab::Advanced => {
-                                    // The inline finalmask and sockopt verdicts
-                                    // ride the draft's memoized validation
-                                    // (refreshed above whenever the draft
-                                    // generation or language moved): identical
-                                    // messages, zero re-validation on idle
-                                    // frames.
-                                    let finalmask_errors: &[String] = draft
-                                        .validation
-                                        .as_ref()
-                                        .map(|cached| cached.rendered.finalmask.as_slice())
-                                        .unwrap_or(&[]);
-                                    let stream_sockopt_errors: &[String] = draft
-                                        .validation
-                                        .as_ref()
-                                        .map(|cached| cached.rendered.stream_sockopt.as_slice())
-                                        .unwrap_or(&[]);
-                                    ServersScreen::advanced_tab(
-                                        ui,
-                                        lang,
-                                        &mut draft.profile,
-                                        &uictx.servers.profiles,
-                                        AdvancedTabCtx {
-                                            set_key: (
-                                                uictx.hooks.model_generation(),
-                                                uictx.servers.profiles.len(),
-                                            ),
-                                            finalmask_errors,
-                                            stream_sockopt_errors,
-                                            dialer_proxy_options: &mut self.add.chain_options,
-                                            buffers: &mut self.seeded_buffers,
-                                            masked: mask.secrets,
-                                        },
-                                    )
-                                }
-                            };
-                            // The draft changed this frame: its change protocol runs
-                            // so the memoized validation below recomputes. The
-                            // reported validation output stays until the next
-                            // attempt — it is why this dialog is still open.
-                            if changed {
-                                draft.edited();
-                            }
-                        });
+                    let changed = self.draft_tab_body(
+                        ui,
+                        lang,
+                        &mut draft,
+                        &uictx.servers.profiles,
+                        DraftTabPolicy {
+                            tab: self.draft_tab,
+                            kind: DraftKind::Add,
+                            mask,
+                            scroll_id: "servers.add-draft.scroll",
+                            height: 430.0,
+                            generation: uictx.hooks.model_generation(),
+                        },
+                    );
+                    // The draft changed this frame: its change protocol runs
+                    // so the memoized validation below recomputes. The
+                    // reported validation output stays until the next
+                    // attempt — it is why this dialog is still open.
+                    if changed {
+                        draft.edited();
+                    }
 
                     // Content edits ran the change protocol above; refresh the
                     // memoized verdicts once for the new generation.
@@ -12602,21 +12375,7 @@ impl ServersScreen {
                     uictx.servers.active =
                         Some(crate::model::inbound::BLOCK_OUTBOUND_TAG.to_owned());
                 }
-                if self
-                    .selected
-                    .as_deref()
-                    .is_some_and(|id| deleted.iter().any(|deleted| deleted == id))
-                {
-                    self.selected = None;
-                }
-                self.selection.retain(|id| !deleted.contains(id));
-                if self
-                    .selection_anchor
-                    .as_deref()
-                    .is_some_and(|anchor| deleted.iter().any(|deleted| deleted == anchor))
-                {
-                    self.selection_anchor = None;
-                }
+                self.selection.retain_not(&deleted);
                 for deleted_id in &deleted {
                     self.seeded_buffers.evict_owned(deleted_id);
                     // The deleted profile's memoized latency badge is dead
@@ -17469,6 +17228,49 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(harness.query_by_label("Tokyo").is_some());
     }
 
+    /// Both editor windows render the tab the user picked through the one
+    /// five-tab dispatch: the selected profile's window and the add dialog
+    /// each paint the Transport section after its tab is clicked.
+    #[test]
+    fn both_editor_windows_render_the_picked_tab() {
+        let transport = t(Language::En, Key::SrvTabTransport);
+        let network = t(Language::En, Key::SrvNetwork);
+
+        let mut rig = UiTestRig::default();
+        let mut tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
+        tokyo.enabled = true;
+        rig.servers.profiles.push(tokyo);
+        let mut harness = fast_servers_harness(rig);
+        harness.run();
+        harness.get_by_label("Tokyo").click();
+        harness.get_by_label("Tokyo").click();
+        harness.run();
+        assert!(
+            harness.query_by_label(network).is_none(),
+            "the editor window opens on the Basic tab"
+        );
+        harness.get_by_label(transport).click();
+        harness.run();
+        assert!(
+            harness.query_by_label(network).is_some(),
+            "the editor window renders the picked Transport tab"
+        );
+
+        let mut harness = screen_harness(UiTestRig::default(), ServersScreen::default());
+        harness.run();
+        open_add_editor(&mut harness);
+        assert!(
+            harness.query_by_label(network).is_none(),
+            "the add dialog opens on the Basic tab"
+        );
+        harness.get_by_label(transport).click();
+        harness.run();
+        assert!(
+            harness.query_by_label(network).is_some(),
+            "the add dialog renders the picked Transport tab"
+        );
+    }
+
     #[test]
     fn the_row_context_menu_offers_the_six_commands_and_no_inline_icons() {
         let mut rig = UiTestRig::default();
@@ -18100,7 +17902,7 @@ Authentication: ML-KEM-768, Post-Quantum
     fn dragging_a_row_to_the_tail_moves_it_and_marks_the_model_dirty() {
         let mut harness = drag_harness(drag_rig());
         harness.run();
-        let selected_before = harness.state().0.selected.clone();
+        let selected_before = harness.state().0.selection.focus().map(str::to_owned);
         // The drag targets a row that is not the selected one, so the
         // selection assertion below can fail.
         let bravo_id = harness
@@ -18139,8 +17941,8 @@ Authentication: ML-KEM-768, Post-Quantum
             "the release must end the drag"
         );
         assert_eq!(
-            harness.state().0.selected,
-            selected_before,
+            harness.state().0.selection.focus(),
+            selected_before.as_deref(),
             "a drag must not change the selection"
         );
     }
@@ -23342,8 +23144,9 @@ Authentication: ML-KEM-768, Post-Quantum
             }
             let id = state
                 .0
-                .selected
-                .clone()
+                .selection
+                .focus()
+                .map(str::to_owned)
                 .or_else(|| state.1.servers.active.clone())
                 .or_else(|| state.1.servers.profiles.first().map(|p| p.id.clone()));
             let Some(id) = id else {
@@ -23482,7 +23285,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a selection switch with unsaved changes must stage the leave modal"
         );
         assert_eq!(
-            state.0.selected.as_deref(),
+            state.0.selection.focus(),
             Some(tokyo.id.as_str()),
             "the selection must not switch while the modal is staged"
         );
@@ -23505,7 +23308,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Cancel must clear the staged action"
         );
         assert_eq!(
-            state.0.selected.as_deref(),
+            state.0.selection.focus(),
             Some(tokyo.id.as_str()),
             "Cancel must not switch the selection"
         );
@@ -23583,7 +23386,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Discard must clear the staged action"
         );
         assert_eq!(
-            state.0.selected.as_deref(),
+            state.0.selection.focus(),
             Some(osaka.id.as_str()),
             "Discard must switch the selection"
         );
@@ -23611,7 +23414,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let osaka = ServerProfile::new("Osaka", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
         rig.servers.profiles.push(osaka.clone());
-        screen.selected = Some(tokyo.id);
+        screen.selection.set_focus(tokyo.id);
         // Only the add draft is dirty: the add window is a plain window, so
         // the list stays clickable behind it — a row click staged a Select
         // while the modal's Save must target the add draft.
@@ -23638,7 +23441,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "a staged Select must clear when the add commit switches immediately"
         );
         assert_eq!(
-            screen.selected.as_deref(),
+            screen.selection.focus(),
             Some(added.id.as_str()),
             "the add commit must select the new profile"
         );
@@ -23693,7 +23496,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "no validation may start for a buffer-only dirty state"
         );
         assert_eq!(
-            state.0.selected.as_deref(),
+            state.0.selection.focus(),
             Some(tokyo.id.as_str()),
             "the selection must not move"
         );
@@ -23711,7 +23514,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "Discard must clear the staged action"
         );
         assert_eq!(
-            state.0.selected.as_deref(),
+            state.0.selection.focus(),
             Some(osaka.id.as_str()),
             "Discard must complete the switch"
         );
@@ -24035,7 +23838,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let mut rig = UiTestRig::default();
         let tokyo = ServerProfile::new("Tokyo", OutboundModel::new(Protocol::Freedom));
         rig.servers.profiles.push(tokyo.clone());
-        screen.selected = Some(tokyo.id.clone());
+        screen.selection.set_focus(tokyo.id.clone());
         let mut edited = tokyo.clone();
         edited.name = "Tokyo-2".into();
         let mut draft = draft_for(&tokyo);
@@ -24107,7 +23910,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "the resume flag must be single-shot"
         );
         assert_eq!(
-            screen.selected.as_deref(),
+            screen.selection.focus(),
             Some(add.id.as_str()),
             "the add commit must select the new profile"
         );
@@ -25969,7 +25772,7 @@ Authentication: ML-KEM-768, Post-Quantum
             .click();
         harness.run_steps(2);
         assert_eq!(
-            harness.state().0.selected.as_deref(),
+            harness.state().0.selection.focus(),
             Some(ids[63].as_str()),
             "clicking a scrolled-to row must select that profile"
         );
@@ -26010,7 +25813,7 @@ Authentication: ML-KEM-768, Post-Quantum
             "cancelling the delete must not remove the profile"
         );
         assert_eq!(
-            harness.state().0.selected.as_deref(),
+            harness.state().0.selection.focus(),
             Some(ids[63].as_str()),
             "cancelling the delete must keep the selection"
         );
@@ -27400,7 +27203,7 @@ Authentication: ML-KEM-768, Post-Quantum
         click_row_with(&mut harness, "Alpha", egui::Modifiers::NONE);
         assert_eq!(selected_names(&harness), ["Alpha"]);
         assert_eq!(
-            harness.state().0.selected.as_deref(),
+            harness.state().0.selection.focus(),
             Some(id_of(&harness.state().1, "Alpha").as_str())
         );
 
@@ -27431,7 +27234,7 @@ Authentication: ML-KEM-768, Post-Quantum
             harness.state().0.selection.is_empty(),
             "a click on empty space clears the selection"
         );
-        assert_eq!(harness.state().0.selected, None);
+        assert_eq!(harness.state().0.selection.focus(), None);
     }
 
     #[test]
@@ -27453,8 +27256,8 @@ Authentication: ML-KEM-768, Post-Quantum
             harness.state().0.selection.is_empty(),
             "a tab switch must drop the selection with the tab"
         );
-        assert_eq!(harness.state().0.selected, None);
-        assert_eq!(harness.state().0.selection_anchor, None);
+        assert_eq!(harness.state().0.selection.focus(), None);
+        assert_eq!(harness.state().0.selection.anchor(), None);
     }
 
     #[test]

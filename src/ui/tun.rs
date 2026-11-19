@@ -13,6 +13,7 @@ use crate::model::{Mode, emit, fold_eq};
 use crate::rt::{CorePhase, CoreTransport};
 use crate::sys::netif::{self, NetIf};
 use crate::ui::TunCtx;
+use crate::ui::findings::Generations;
 use crate::ui::inbounds::sniffing_editor;
 use crate::ui::request::{Request, Terminal};
 use crate::ui::status::status_colors_of;
@@ -33,10 +34,8 @@ pub struct TunScreen {
     /// In-flight worker enumeration request; a worker that exits without
     /// a result clears it so the refresh cadence resumes.
     iface_request: Request<Vec<NetIf>>,
-    /// Privacy-warning references, rebuilt when the model generation moves
-    /// (the inbounds validation cache precedent) — never on idle repaint
-    /// frames.
-    validation: widgets::Memo<(u64, u64), ValidationTexts>,
+    /// Privacy-warning references, keyed on the frame's [`Generations`].
+    validation: widgets::Memo<Generations, ValidationTexts>,
     /// The add-port control's lowest free port, keyed on the model generation
     /// and the scope: an idle repaint reuses the value and scans no port.
     leak_free_port: widgets::Memo<(u64, LeakScope), Option<LeakPort>>,
@@ -48,11 +47,6 @@ pub struct TunScreen {
 /// takeover state. The validation rules the settings walk publishes (the
 /// gateway requirement, the unrouted-family advisory) are *not* cached here:
 /// the screen asks `ctx.verdict.for_target(FindingTarget::Tun)` for them.
-///
-/// The memo key is `(model generation, published verdict generation)`: the
-/// second is separate because the persist publishes after the edit frame and
-/// stamps the edit generation, so an edit-only key would keep the previous
-/// verdict's finding when the publish arrives.
 struct ValidationTexts {
     tun_warning: Option<String>,
     /// The model's TUN findings, rendered at the cache's generation cadence:
@@ -598,19 +592,18 @@ impl TunScreen {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut TunCtx) {
         self.poll_ifaces(ui);
 
-        // The privacy warning is rebuilt when the model generation or the
-        // published verdict's own generation moves — never on idle repaint
-        // frames (the inbounds ValidationCache precedent) — so the verdict
-        // lags an edit by at most one publish. The mode is read from the live
-        // model at rebuild time, so no second key is needed for it.
+        // The verdict lags an edit by at most one publish; [`Generations`]
+        // carries why the two generations are separate stamps. The mode is
+        // read from the live model at rebuild time, so no second key is
+        // needed for it.
         let lang = ctx.settings.language;
         // The published generation verdict: the TUN rules are asked by
         // structural target below, so the screen never re-runs a predicate the
         // settings walk already judged.
         let verdict = ctx.verdict;
-        let verdict_generation = ctx.verdict_generation;
         let generation = ctx.hooks.model_generation();
-        let texts = self.validation.get(&(generation, verdict_generation), || {
+        let generations = Generations::new(generation, ctx.verdict_generation);
+        let texts = self.validation.get(&generations, || {
             // The shell's verdict for this generation: the privacy finding is
             // the one slice of it this screen renders.
             let findings = ctx.safety;

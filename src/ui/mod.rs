@@ -3,6 +3,7 @@
 pub mod about;
 pub mod dashboard;
 pub mod dns;
+pub(crate) mod findings;
 pub(crate) mod gate;
 pub mod geodata;
 pub mod inbounds;
