@@ -13,7 +13,11 @@
 //! ([`super::seat::cancel_plan`]) — and [`ReplyGuard`]
 //! delivers exactly one terminal result per query job over a per-request
 //! tokio one-shot channel on every path — completion, drop-without-send,
-//! cancel, abort, join error, panic, exit.
+//! cancel, abort, join error, panic, exit. The exclusive occupant's terminal
+//! is taken off its record whole ([`JobRegistry::take_terminal`]) and handed
+//! to one owner (`seat`'s [`ExclusiveTerminal`] settlement methods), so no
+//! completion, pre-spawn refusal, cancel, join-error or exit path re-chooses
+//! a channel or a wording for itself.
 //!
 //! Busy-window bookends (the `CoreEvt::Operation(Some(kind)/None)` shape)
 //! are emitted by the registry through the busy sink: `Some(kind)` on
@@ -276,6 +280,20 @@ pub enum ExclusiveSidecar {
     NoSidecar,
 }
 
+/// The exactly-one terminal of the exclusive occupant, taken off its record in
+/// one step: the kind, the parked reply sidecar, and the apply revision the
+/// verdict names. Every path that can end an accepted exclusive job — the
+/// worker's own outcome, a pre-spawn refusal, a cancel, a join failure, an
+/// exit — takes this value before delivering and hands it to the one delivery
+/// owner (`seat` declares the per-kind route and wording on the methods
+/// below), so a second path finds no terminal state left to deliver.
+#[derive(Debug)]
+pub struct ExclusiveTerminal {
+    pub(crate) kind: JobKind,
+    pub(crate) sidecar: Option<ExclusiveSidecar>,
+    pub(crate) apply_revision: Option<u64>,
+}
+
 /// Why [`JobRegistry::try_begin`] rejected a kind: an exclusive job
 /// (`active`) holds the busy window. The two reject text flavors are
 /// dispatch-side and are not replicated here.
@@ -382,6 +400,11 @@ struct Record {
     /// parked after the write and taken by the completion that stages them
     /// for the helper. Never re-read from disk: the path is user-writable.
     apply_candidate: Option<Vec<u8>>,
+    /// Whether the record's exactly-one terminal state was already taken
+    /// ([`JobRegistry::take_terminal`]): the second take finds nothing, even
+    /// for a kind whose terminal state is empty (a probe with no tags, a
+    /// download, a lifecycle span).
+    terminal_taken: bool,
 }
 
 impl Record {
@@ -397,6 +420,7 @@ impl Record {
             sidecar: None,
             apply_revision: None,
             apply_candidate: None,
+            terminal_taken: false,
         }
     }
 
@@ -697,12 +721,21 @@ impl JobRegistry {
         }
     }
 
-    /// Takes the per-kind terminal pairing off the exclusive record —
-    /// exactly one terminal path may take it (a second one finds `None`).
-    pub fn take_exclusive_sidecar(&mut self) -> Option<ExclusiveSidecar> {
-        self.exclusive
-            .as_mut()
-            .and_then(|record| record.sidecar.take())
+    /// Takes the exclusive occupant's whole terminal state — its kind, the
+    /// parked reply sidecar, and the apply revision — as one value. Exactly
+    /// one terminal path may take it: a second take finds `None`, and taking
+    /// it whole means no delivery path can leave one part behind for another.
+    pub fn take_terminal(&mut self) -> Option<ExclusiveTerminal> {
+        let record = self.exclusive.as_mut()?;
+        if record.terminal_taken {
+            return None;
+        }
+        record.terminal_taken = true;
+        Some(ExclusiveTerminal {
+            kind: record.kind,
+            sidecar: record.sidecar.take(),
+            apply_revision: record.apply_revision.take(),
+        })
     }
 
     /// Requests cancellation of the exclusive occupant (cancel signal +
@@ -747,16 +780,6 @@ impl JobRegistry {
         if let Some(record) = &mut self.exclusive {
             record.apply_revision = Some(revision);
         }
-    }
-
-    /// The config revision of the in-flight apply, if the held record
-    /// carries one. Only one apply can be in flight (the exclusive rule), so
-    /// a verdict that reads this always reads its own; the record's release
-    /// clears it with the rest of the record.
-    pub(crate) fn apply_revision(&self) -> Option<u64> {
-        self.exclusive
-            .as_ref()
-            .and_then(|record| record.apply_revision)
     }
 
     /// Parks the exact candidate bytes the accepted apply wrote on the
@@ -1159,14 +1182,17 @@ mod tests {
         assert_eq!(registry.busy_kind(), Some(JobKind::TestConfig));
         assert_eq!(registry.in_flight(), 1);
         let rejected = Diag::new(Key::SeatRuntimeStopping);
-        match registry.take_exclusive_sidecar() {
-            Some(ExclusiveSidecar::TestReply(reply)) => {
+        match registry.take_terminal() {
+            Some(ExclusiveTerminal {
+                sidecar: Some(ExclusiveSidecar::TestReply(reply)),
+                ..
+            }) => {
                 assert!(
                     reply.send(Err(DiagError::from(rejected.clone()))).is_ok(),
                     "the parked reply receiver is alive"
                 );
             }
-            sidecar => panic!("the sidecar must survive an exclusive-id release: {sidecar:?}"),
+            terminal => panic!("the terminal must survive an exclusive-id release: {terminal:?}"),
         }
         let bounced = rx.try_recv().expect("the parked terminal lands");
         assert_eq!(
@@ -1601,24 +1627,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn sidecar_park_and_exactly_one_take() {
+    async fn terminal_park_and_exactly_one_take() {
         let mut registry = JobRegistry::new();
+        assert!(registry.take_terminal().is_none());
         registry.try_begin(JobKind::TestConfig).unwrap();
-        assert!(registry.take_exclusive_sidecar().is_none());
 
         let (tx, mut rx) = oneshot::channel::<TestConfigReply>();
         registry.set_exclusive_sidecar(ExclusiveSidecar::TestReply(tx));
 
-        match registry.take_exclusive_sidecar() {
-            Some(ExclusiveSidecar::TestReply(reply)) => {
+        match registry.take_terminal() {
+            Some(ExclusiveTerminal {
+                kind,
+                sidecar: Some(ExclusiveSidecar::TestReply(reply)),
+                ..
+            }) => {
+                assert_eq!(kind, JobKind::TestConfig);
                 let verdict = (true, ApplyOutput::Text("valid".to_string()));
                 assert!(
                     reply.send(Ok(verdict)).is_ok(),
                     "the parked reply receiver is alive in this test"
                 );
             }
-            Some(_) => panic!("expected the parked TestReply sidecar"),
-            None => panic!("the parked sidecar must take exactly once"),
+            terminal => panic!("the parked terminal must take exactly once: {terminal:?}"),
         }
         match rx.try_recv() {
             Ok(Ok((ok, output))) => {
@@ -1628,8 +1658,8 @@ mod tests {
             other => panic!("the parked terminal must land, got {other:?}"),
         }
         assert!(
-            registry.take_exclusive_sidecar().is_none(),
-            "a second terminal path must find no sidecar (exactly-one)"
+            registry.take_terminal().is_none(),
+            "a second terminal path must find no terminal state (exactly-one)"
         );
     }
 
@@ -1802,22 +1832,17 @@ mod tests {
     }
 
     /// The apply verdict's identity lives on the job that owns it: the begin
-    /// parks the revision, the release clears it, and a second apply cannot
-    /// overwrite a live verdict (the busy window rejects it before any begin).
+    /// parks the revision, the terminal take carries it exactly once, and a
+    /// second apply cannot overwrite a live verdict (the busy window rejects
+    /// it before any begin).
     #[test]
     fn apply_revision_lives_with_the_apply_record() {
         let bookends: Bookends = Arc::new(Mutex::new(Vec::new()));
         let mut registry = recorder_registry(&bookends);
-        assert_eq!(registry.apply_revision(), None);
+        assert!(registry.take_terminal().is_none());
 
         registry.try_begin(JobKind::ApplyConfig).unwrap();
-        assert_eq!(
-            registry.apply_revision(),
-            None,
-            "the record carries no revision until the command parks one"
-        );
         registry.set_apply_revision(7);
-        assert_eq!(registry.apply_revision(), Some(7));
 
         // A second apply meets the busy window, so it can never reach the
         // setter and overwrite the live verdict.
@@ -1827,16 +1852,21 @@ mod tests {
                 active: JobKind::ApplyConfig
             })
         );
-        assert_eq!(registry.apply_revision(), Some(7));
+        assert_eq!(
+            registry
+                .take_terminal()
+                .expect("the held record carries its terminal")
+                .apply_revision,
+            Some(7)
+        );
+        assert!(
+            registry.take_terminal().is_none(),
+            "the revision is taken with the terminal, exactly once"
+        );
 
         registry.finish_exclusive();
-        assert_eq!(
-            registry.apply_revision(),
-            None,
-            "the record's release clears the revision with it"
-        );
         // A set with no apply record has nothing to land on.
         registry.set_apply_revision(9);
-        assert_eq!(registry.apply_revision(), None);
+        assert!(registry.take_terminal().is_none());
     }
 }

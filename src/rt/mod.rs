@@ -82,7 +82,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 use crate::rt::jobs::{
-    Busy, ExclusiveOutcome, ExclusiveSidecar, JobRegistry, StopPlan, declared_kind,
+    Busy, ExclusiveOutcome, ExclusiveSidecar, ExclusiveTerminal, JobRegistry, StopPlan,
+    declared_kind,
 };
 
 pub use grpc::{
@@ -1354,6 +1355,25 @@ impl Runtime {
         }
     }
 
+    /// Take the held record's exactly-one terminal state — kind, parked reply
+    /// sidecar, apply revision — for a path whose record cannot have settled
+    /// yet (a pre-spawn refusal, a worker completion): taking it off the
+    /// record is what makes a second terminal path impossible, so a missing
+    /// one is a wiring error.
+    fn take_exclusive_terminal(&mut self) -> ExclusiveTerminal {
+        self.jobs
+            .take_terminal()
+            .expect("the settled exclusive job still holds its record")
+    }
+
+    /// Take the record's terminal state when it has not settled yet, for the
+    /// late paths (a cancel or join failure of a task attached to a record
+    /// that already delivered its verdict): `None` means one of two things,
+    /// which the caller tells apart by whether a record is still held.
+    fn take_pending_exclusive_terminal(&mut self) -> Option<ExclusiveTerminal> {
+        self.jobs.take_terminal()
+    }
+
     /// Release the busy window synchronously: `finish_exclusive` queues the
     /// `None` bookend on the side channel, and the immediate drain delivers
     /// it on the GUI event channel behind the terminal that preceded it
@@ -1448,26 +1468,31 @@ impl Runtime {
     /// terminal. Task-less spans (lifecycle windows, a deferred
     /// apply-restart, a completed update awaiting readiness) deliver no
     /// terminal of their own — their result already landed or the exit path
-    /// owns them.
+    /// owns them. A task attached to a record that already delivered its
+    /// verdict (the replacement start riding an apply restart or the update
+    /// health gate) is aborted and released without a second terminal.
     fn cancel_task_exclusive(&mut self, kind: JobKind, reason: &Diag) {
         // A cleanup that is already waiting on its helper's terminal is owned
         // by the record being cancelled here: drop its state so a late
         // terminal neither settles a released window nor leaves a helper
         // launched for that cleanup alive.
         self.cleanup = None;
-        // The worker's terminal state is taken before the cancel: the task
-        // is aborted below, so the cancel path is the exactly-one terminal
-        // when the outcome can no longer arrive.
+        // The record's unsettled terminal state is taken before the cancel:
+        // the task is aborted below, so the cancel path is the exactly-one
+        // terminal when the outcome can no longer arrive. A record whose
+        // terminal already landed has none left to take.
         let task_active = self.jobs.exclusive_task_active();
-        let sidecar = self.jobs.take_exclusive_sidecar();
+        let terminal = self.take_pending_exclusive_terminal();
         self.jobs.cancel_exclusive_record();
         self.app_log(
             Diag::new(Key::RtLogOperationCancelled)
                 .arg_message(seat::occupant_name(kind))
                 .arg_message(reason.clone()),
         );
-        if task_active {
-            seat::deliver_cancel_terminal(kind, self, sidecar, reason);
+        if let Some(terminal) = terminal
+            && task_active
+        {
+            terminal.cancelled(self, reason);
         }
         self.release_exclusive();
     }
@@ -1497,12 +1522,31 @@ impl Runtime {
 
     /// A worker task that died without a result (panic or join failure)
     /// must still settle its operation with the kind's exactly-one terminal.
-    fn complete_exclusive_join_error(&mut self, kind: JobKind, error: tokio::task::JoinError) {
+    /// Three cases, told apart by the record and its terminal state:
+    ///
+    /// - the record has not settled yet: deliver its verdict, then release;
+    /// - the record is held but its verdict already landed — a replacement
+    ///   start riding an apply restart or the update health gate: the dead
+    ///   start is a phase failure, and [`Runtime::settle_error`] publishes it
+    ///   and releases in one step;
+    /// - no record is held at all — the cancel that aborted this task
+    ///   already released it: nothing is left to settle.
+    fn complete_exclusive_join_error(&mut self, error: tokio::task::JoinError) {
         let message = Diag::new(Key::RtFrameBackgroundFailed).arg(error);
         self.app_log(message.clone());
-        let sidecar = self.jobs.take_exclusive_sidecar();
-        seat::deliver_join_error_terminal(kind, self, sidecar, message);
-        self.release_exclusive();
+        match self.take_pending_exclusive_terminal() {
+            Some(terminal) => {
+                terminal.failed(self, DiagError::from(message));
+                self.release_exclusive();
+            }
+            None if self.jobs.busy_kind().is_some() => {
+                self.settle_error(PhaseError::new(DiagError::from(message)));
+            }
+            None => {
+                // The cancel that aborted this task released its record and
+                // delivered the exactly-one terminal already.
+            }
+        }
     }
 
     /// Queue one raw passthrough log line: complete text. Runtime-authored
@@ -1601,10 +1645,6 @@ impl Runtime {
                         .expect("exclusive task select guard");
                     task.await
                 }, if self.jobs.exclusive_task_active() => {
-                    let kind = self
-                        .jobs
-                        .busy_kind()
-                        .expect("completed task still owns its record");
                     self.jobs.clear_exclusive_task();
                     match result {
                         Ok(outcome) => self.complete_exclusive(outcome).await,
@@ -1614,7 +1654,7 @@ impl Runtime {
                             // result after that cancellation.
                             self.release_exclusive();
                         }
-                        Err(error) => self.complete_exclusive_join_error(kind, error),
+                        Err(error) => self.complete_exclusive_join_error(error),
                     }
                 }
                 bookend = self.pending_bookends.recv() => {
@@ -2093,23 +2133,16 @@ impl Runtime {
     }
 
     async fn begin_apply_work(&mut self, value: serde_json::Value, intent: ApplyIntent) {
-        let revision = self
-            .jobs
-            .apply_revision()
-            .expect("the accepted apply record carries the revision its begin parked");
         // The control-plane port is ephemeral and lives only in the
         // emitted config; derive it from the candidate the runtime will run so
         // the gRPC client polls exactly the committed listener.
         let api_port = match apply::api_port_from_value(&value) {
             Ok(port) => port,
             Err(error) => {
-                self.emit(CoreEvt::ApplyResult {
-                    ok: false,
-                    output: ApplyOutput::Message(AppMessage::from(
-                        DiagError::new(Diag::new(Key::RtFrameApplyRejected)).caused_by(error),
-                    )),
-                    revision,
-                });
+                self.take_exclusive_terminal().failed(
+                    self,
+                    DiagError::new(Diag::new(Key::RtFrameApplyRejected)).caused_by(error),
+                );
                 self.release_exclusive();
                 return;
             }
@@ -2121,14 +2154,10 @@ impl Runtime {
         let candidate = match apply::write_candidate_offloaded(value).await {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.emit(CoreEvt::ApplyResult {
-                    ok: false,
-                    output: ApplyOutput::Message(AppMessage::from(
-                        DiagError::new(Diag::new(Key::RtFrameCandidateWriteFailed))
-                            .caused_by(error),
-                    )),
-                    revision,
-                });
+                self.take_exclusive_terminal().failed(
+                    self,
+                    DiagError::new(Diag::new(Key::RtFrameCandidateWriteFailed)).caused_by(error),
+                );
                 self.release_exclusive();
                 return;
             }
@@ -2159,12 +2188,12 @@ impl Runtime {
             Ok(candidate) => candidate.path,
             Err(error) => {
                 // Pre-spawn reject: the task never began, so the rejection is
-                // the terminal result — take the reply the begin parked for it
-                // and deliver there, which also pokes the requester's poll.
-                let rejection =
-                    DiagError::new(Diag::new(Key::RtFrameCandidateWriteFailed)).caused_by(error);
-                let sidecar = self.jobs.take_exclusive_sidecar();
-                seat::deliver_test_reply(self, sidecar, Err(rejection));
+                // the terminal result — taken off the record's parked reply
+                // and delivered there, which also pokes the requester's poll.
+                self.take_exclusive_terminal().failed(
+                    self,
+                    DiagError::new(Diag::new(Key::RtFrameCandidateWriteFailed)).caused_by(error),
+                );
                 self.release_exclusive();
                 return;
             }
@@ -2211,11 +2240,16 @@ impl Runtime {
         if tags.is_empty() {
             let failure = ProbeFailure::plain(Diag::new(Key::ProbeNoProfiles));
             self.log(&failure.full(Language::En));
-            self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
-                tags,
-                result: Err(failure),
-                progress: ProbeProgress::default(),
-            }));
+            // The rejection is the accepted job's terminal; its tags are
+            // empty because no probe tags were ever parked on the record.
+            self.take_exclusive_terminal().verdict(
+                self,
+                seat::TerminalReport::Probe {
+                    tags,
+                    result: Err(failure),
+                    done: 0,
+                },
+            );
             self.release_exclusive();
             return;
         }
@@ -2317,14 +2351,16 @@ impl Runtime {
                 intent,
                 api_port,
             } => {
-                self.complete_apply_validation(ok, output, intent, api_port)
+                let terminal = self.take_exclusive_terminal();
+                self.complete_apply_validation(terminal, ok, output, intent, api_port)
                     .await;
             }
             ExclusiveOutcome::TestValidated { ok, output } => {
                 // Invariant: the terminal can only arrive while a TestConfig
-                // task is in flight, which parked the reply sidecar.
-                let sidecar = self.jobs.take_exclusive_sidecar();
-                seat::deliver_test_reply(self, sidecar, Ok((ok, output)));
+                // task is in flight, which parked the reply sidecar on the
+                // record the terminal is taken from.
+                self.take_exclusive_terminal()
+                    .verdict(self, seat::TerminalReport::Validation { ok, output });
                 self.release_exclusive();
             }
             ExclusiveOutcome::ProfileValidation(reply) => {
@@ -2333,8 +2369,8 @@ impl Runtime {
                 // sidecar. The worker's own terminal (a completed verdict or
                 // its cooperative-cancel terminal) is the exactly-one
                 // terminal, and it is what releases the busy window.
-                let sidecar = self.jobs.take_exclusive_sidecar();
-                seat::deliver_profile_reply(self, sidecar, reply);
+                self.take_exclusive_terminal()
+                    .verdict(self, seat::TerminalReport::Profiles(reply));
                 self.release_exclusive();
             }
             ExclusiveOutcome::LatencyProbe {
@@ -2360,20 +2396,14 @@ impl Runtime {
                 // failure needed a manual reproduction). The UI formatters
                 // and the log both compose from the same `ProbeFailure`, so
                 // their text cannot drift.
-                let progress = ProbeProgress {
-                    done,
-                    total: tags.len(),
-                };
-                self.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
-                    tags,
-                    result,
-                    progress,
-                }));
+                self.take_exclusive_terminal()
+                    .verdict(self, seat::TerminalReport::Probe { tags, result, done });
                 self.release_exclusive();
             }
             ExclusiveOutcome::Download { state, kind } => {
                 let succeeded = matches!(state, DownloadState::Done(_));
-                self.emit(CoreEvt::Download(state));
+                self.take_exclusive_terminal()
+                    .verdict(self, seat::TerminalReport::Download(state));
                 // When Stop/Shutdown cancelled the update but the
                 // install could not be aborted (`spawn_blocking`), the swap
                 // has now landed (or failed) and the disk is consistent.
@@ -2405,23 +2435,14 @@ impl Runtime {
 
     async fn complete_apply_validation(
         &mut self,
+        terminal: ExclusiveTerminal,
         ok: bool,
         output: ApplyOutput,
         intent: ApplyIntent,
         api_port: u16,
     ) {
-        // The verdict names the configuration the command was generated from,
-        // read from the record before any terminal releases it.
-        let revision = self
-            .jobs
-            .apply_revision()
-            .expect("the held apply record carries the revision its begin parked");
         if !ok {
-            self.emit(CoreEvt::ApplyResult {
-                ok: false,
-                output,
-                revision,
-            });
+            terminal.verdict(self, seat::TerminalReport::Validation { ok: false, output });
             self.release_exclusive();
             return;
         }
@@ -2435,13 +2456,15 @@ impl Runtime {
         let validated_bytes = match self.jobs.take_apply_candidate() {
             Some(bytes) => bytes,
             None => {
-                self.emit(CoreEvt::ApplyResult {
-                    ok: false,
-                    output: ApplyOutput::Message(AppMessage::from(DiagError::new(Diag::new(
-                        Key::RtFrameApplyCaptureFailed,
-                    )))),
-                    revision,
-                });
+                terminal.verdict(
+                    self,
+                    seat::TerminalReport::Validation {
+                        ok: false,
+                        output: ApplyOutput::Message(AppMessage::from(DiagError::new(Diag::new(
+                            Key::RtFrameApplyCaptureFailed,
+                        )))),
+                    },
+                );
                 self.release_exclusive();
                 return;
             }
@@ -2454,47 +2477,50 @@ impl Runtime {
         match apply::candidate_holds_digest_offloaded(candidate_digest).await {
             Ok(true) => {}
             Ok(false) => {
-                self.emit(CoreEvt::ApplyResult {
-                    ok: false,
-                    output: ApplyOutput::Message(AppMessage::from(DiagError::new(Diag::new(
-                        Key::RtFrameApplyCaptureFailed,
-                    )))),
-                    revision,
-                });
+                terminal.verdict(
+                    self,
+                    seat::TerminalReport::Validation {
+                        ok: false,
+                        output: ApplyOutput::Message(AppMessage::from(DiagError::new(Diag::new(
+                            Key::RtFrameApplyCaptureFailed,
+                        )))),
+                    },
+                );
                 self.release_exclusive();
                 return;
             }
             Err(error) => {
-                self.emit(CoreEvt::ApplyResult {
-                    ok: false,
-                    output: ApplyOutput::Message(AppMessage::from(
-                        DiagError::new(Diag::new(Key::RtFrameApplyCaptureFailed)).caused_by(error),
-                    )),
-                    revision,
-                });
+                terminal.verdict(
+                    self,
+                    seat::TerminalReport::Validation {
+                        ok: false,
+                        output: ApplyOutput::Message(AppMessage::from(
+                            DiagError::new(Diag::new(Key::RtFrameApplyCaptureFailed))
+                                .caused_by(error),
+                        )),
+                    },
+                );
                 self.release_exclusive();
                 return;
             }
         }
         if let Err(error) = apply::commit_offloaded().await {
-            self.emit(CoreEvt::ApplyResult {
-                ok: false,
-                output: ApplyOutput::Message(AppMessage::from(
-                    DiagError::new(Diag::new(Key::RtFrameApplyCommitFailed)).caused_by(error),
-                )),
-                revision,
-            });
+            terminal.verdict(
+                self,
+                seat::TerminalReport::Validation {
+                    ok: false,
+                    output: ApplyOutput::Message(AppMessage::from(
+                        DiagError::new(Diag::new(Key::RtFrameApplyCommitFailed)).caused_by(error),
+                    )),
+                },
+            );
             self.release_exclusive();
             return;
         }
         self.lifecycle
             .spawn_config
             .capture(validated_bytes, intent.dns_takeover());
-        self.emit(CoreEvt::ApplyResult {
-            ok: true,
-            output,
-            revision,
-        });
+        terminal.verdict(self, seat::TerminalReport::Validation { ok: true, output });
         self.app_log(Diag::new(Key::RtLogConfigApplied));
         self.lifecycle.pending_transition.commit_candidate();
         self.lifecycle.candidate_boot_retries = 0;
@@ -4650,6 +4676,21 @@ mod tests {
         }));
     }
 
+    /// Settle an accepted apply record's verdict the way its completion does
+    /// and keep the record: a successful apply that restarts the core (or the
+    /// update health gate) leaves the record — its terminal already taken —
+    /// holding the busy window for the replacement start.
+    fn settle_apply_and_keep_its_record(runtime: &mut Runtime, revision: u64) {
+        occupy_apply(runtime, revision);
+        runtime.take_exclusive_terminal().verdict(
+            runtime,
+            super::seat::TerminalReport::Validation {
+                ok: true,
+                output: super::ApplyOutput::Text("valid".into()),
+            },
+        );
+    }
+
     #[test]
     fn tun_close_deadline_is_bound_plus_margin() {
         // The outer give-up wrap must leave the RPC's own deadline room to
@@ -6183,6 +6224,150 @@ mod tests {
         .await;
     }
 
+    /// An accepted apply whose candidate cannot be written still settles its
+    /// requester exactly once: the pre-spawn refusal is the terminal verdict,
+    /// naming the revision the begin parked, and the window closes with it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_apply_candidate_that_cannot_be_written_settles_one_verdict() {
+        with_appdata_async(async {
+            // A file where the config directory belongs: every candidate write
+            // fails, whatever the enclosing tree's permissions are.
+            let directory = crate::sys::paths::config_dir();
+            std::fs::create_dir_all(directory.parent().expect("config dir has a parent"))
+                .expect("create the isolated app root");
+            std::fs::write(&directory, b"not a directory").expect("block the config directory");
+            let (mut runtime, events) = runtime_with_events();
+
+            runtime
+                .handle_cmd(CoreCmd::Apply {
+                    value: serde_json::json!({
+                        "api": { "listen": "127.0.0.1:12345" },
+                    }),
+                    intent: super::ApplyIntent::Commit {
+                        tun_mode: false,
+                        dns_takeover: true,
+                    },
+                    revision: 4,
+                })
+                .await;
+
+            assert!(
+                runtime.jobs.busy_kind().is_none(),
+                "the pre-spawn refusal must release the window"
+            );
+            flush_bookends(&mut runtime);
+            let emitted: Vec<_> = events.try_iter().collect();
+            let verdicts: Vec<_> = emitted
+                .iter()
+                .filter_map(|event| match event {
+                    CoreEvt::ApplyResult {
+                        ok,
+                        output,
+                        revision,
+                    } => Some((*ok, *revision, output)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(verdicts.len(), 1, "one terminal settles one revision");
+            assert!(!verdicts[0].0, "a refused apply must not claim success");
+            assert_eq!(
+                verdicts[0].1, 4,
+                "the verdict must name the revision the accepted command carried"
+            );
+            assert!(
+                verdicts[0]
+                    .2
+                    .text(Language::En)
+                    .starts_with(t(Language::En, Key::RtFrameCandidateWriteFailed)),
+                "the verdict must name the candidate write failure, got: {}",
+                verdicts[0].2.text(Language::En)
+            );
+            assert_eq!(
+                emitted
+                    .iter()
+                    .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                    .count(),
+                1,
+                "one terminal releases one busy window"
+            );
+        })
+        .await;
+    }
+
+    /// A cancel that already settled cannot settle again: the second cancel
+    /// finds no record, so neither a second terminal nor a second release
+    /// lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_cancel_settles_nothing() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::TestConfig);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        runtime
+            .jobs
+            .set_exclusive_sidecar(ExclusiveSidecar::TestReply(reply));
+        park_pending_task(&mut runtime);
+
+        runtime.cancel_exclusive(&Diag::new(Key::RtReasonStopRequested));
+        runtime.cancel_exclusive(&Diag::new(Key::RtReasonStopRequested));
+        flush_bookends(&mut runtime);
+
+        let verdict = result.await.expect("the cancel is the parked terminal");
+        assert_eq!(
+            verdict
+                .expect_err("a cancelled test never reports a verdict")
+                .text(Language::En),
+            test_cancelled_text(Key::RtReasonStopRequested)
+        );
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                .count(),
+            1,
+            "one cancel settles the release, whichever path asks twice"
+        );
+        assert!(runtime.jobs.busy_kind().is_none());
+    }
+
+    /// A cancel racing a worker completion cannot deliver a second terminal:
+    /// the completion took the record's terminal state and released the
+    /// window, so the later cancel finds nothing to settle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancel_after_a_worker_completion_settles_nothing() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::TestConfig);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        runtime
+            .jobs
+            .set_exclusive_sidecar(ExclusiveSidecar::TestReply(reply));
+
+        runtime
+            .complete_exclusive(ExclusiveOutcome::TestValidated {
+                ok: true,
+                output: super::ApplyOutput::Text("valid".into()),
+            })
+            .await;
+        runtime.cancel_exclusive(&Diag::new(Key::RtReasonStopRequested));
+        flush_bookends(&mut runtime);
+
+        match result.await {
+            Ok(Ok((ok, output))) => {
+                assert!(ok, "the completion's verdict keeps its acceptance");
+                assert_eq!(output.text(Language::En), "valid");
+            }
+            other => panic!("the completion's verdict must be the one terminal: {other:?}"),
+        }
+        assert_eq!(
+            events
+                .try_iter()
+                .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                .count(),
+            1,
+            "one terminal releases one busy window"
+        );
+        assert!(runtime.jobs.busy_kind().is_none());
+    }
+
     /// The probe-event flavour (latency probe): a held window answers as one
     /// probe failure event carrying the request's own tags, and the occupant
     /// keeps its window.
@@ -6967,7 +7152,7 @@ mod tests {
         });
         let error = task.await.expect_err("worker panic must become JoinError");
 
-        runtime.complete_exclusive_join_error(JobKind::ValidateProfiles, error);
+        runtime.complete_exclusive_join_error(error);
         flush_bookends(&mut runtime);
 
         let verdict = result
@@ -8097,6 +8282,7 @@ mod tests {
             tail: "[stderr] boom".into(),
         };
         let expected = failure.full(Language::En);
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .complete_exclusive(ExclusiveOutcome::LatencyProbe {
                 tags: vec!["srv-a".into()],
@@ -8157,6 +8343,18 @@ mod tests {
             )),
             "the no-profiles rejection must still reach the UI as a terminal result"
         );
+        assert!(
+            runtime.jobs.busy_kind().is_none(),
+            "the no-profiles terminal must release the window"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                .count(),
+            1,
+            "one terminal releases one busy window"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8187,6 +8385,7 @@ mod tests {
             &[tokyo.clone(), osaka.clone()],
             &statuses,
         );
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .complete_exclusive(ExclusiveOutcome::LatencyProbe {
                 tags: vec![tokyo.tag(), osaka.tag()],
@@ -8235,6 +8434,7 @@ mod tests {
             &[tokyo.clone(), osaka.clone()],
             &statuses,
         );
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .complete_exclusive(ExclusiveOutcome::LatencyProbe {
                 tags: vec![tokyo.tag(), osaka.tag()],
@@ -8281,6 +8481,7 @@ mod tests {
             std::slice::from_ref(&tokyo),
             &statuses,
         );
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .complete_exclusive(ExclusiveOutcome::LatencyProbe {
                 tags: vec![tokyo.tag()],
@@ -8321,6 +8522,7 @@ mod tests {
             std::slice::from_ref(&tokyo),
             &statuses,
         );
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .complete_exclusive(ExclusiveOutcome::LatencyProbe {
                 tags: vec![tokyo.tag()],
@@ -8342,6 +8544,7 @@ mod tests {
     async fn latency_probe_full_success_logs_nothing() {
         let (mut runtime, events) = runtime_with_events();
         let tokyo = vless_profile("Tokyo edge", "1.2.3.4", 443);
+        occupy_exclusive(&mut runtime, JobKind::LatencyProbe);
         runtime
             .complete_exclusive(ExclusiveOutcome::LatencyProbe {
                 tags: vec![tokyo.tag()],
@@ -8702,7 +8905,7 @@ mod tests {
         occupy_apply(&mut runtime, 1);
         let task = tokio::spawn(async { panic!("deliberate apply worker failure") });
         let error = task.await.expect_err("worker panic must become JoinError");
-        runtime.complete_exclusive_join_error(JobKind::ApplyConfig, error);
+        runtime.complete_exclusive_join_error(error);
         flush_bookends(&mut runtime);
 
         let apply_results: Vec<_> = events
@@ -8741,7 +8944,7 @@ mod tests {
             .set_exclusive_sidecar(ExclusiveSidecar::TestReply(reply));
         let task = tokio::spawn(async { panic!("deliberate test worker failure") });
         let error = task.await.expect_err("worker panic must become JoinError");
-        runtime.complete_exclusive_join_error(JobKind::TestConfig, error);
+        runtime.complete_exclusive_join_error(error);
         flush_bookends(&mut runtime);
 
         match result.await {
@@ -8782,7 +8985,7 @@ mod tests {
             ])));
         let task = tokio::spawn(async { panic!("deliberate probe worker failure") });
         let error = task.await.expect_err("worker panic must become JoinError");
-        runtime.complete_exclusive_join_error(JobKind::LatencyProbe, error);
+        runtime.complete_exclusive_join_error(error);
         flush_bookends(&mut runtime);
 
         let emitted: Vec<_> = events.try_iter().collect();
@@ -8823,7 +9026,7 @@ mod tests {
         occupy_exclusive(&mut runtime, JobKind::UpdateCore);
         let task = tokio::spawn(async { panic!("deliberate update worker failure") });
         let error = task.await.expect_err("worker panic must become JoinError");
-        runtime.complete_exclusive_join_error(JobKind::UpdateCore, error);
+        runtime.complete_exclusive_join_error(error);
         flush_bookends(&mut runtime);
 
         let emitted: Vec<_> = events.try_iter().collect();
@@ -8860,6 +9063,158 @@ mod tests {
             failed_indices[0].1
         );
         assert!(runtime.jobs.busy_kind().is_none());
+    }
+
+    /// A join failure of the replacement start riding a record whose apply
+    /// verdict already landed settles the dead start as a phase failure: the
+    /// settled verdict stays the only terminal and the window is released
+    /// exactly once (a second verdict would name a revision twice).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_error_of_a_kept_record_settles_the_phase_not_a_second_verdict() {
+        let (mut runtime, events) = runtime_with_events();
+        settle_apply_and_keep_its_record(&mut runtime, 3);
+        assert_eq!(
+            runtime.jobs.busy_kind(),
+            Some(JobKind::ApplyConfig),
+            "the restart rides the settled apply record"
+        );
+
+        let task = tokio::spawn(async { panic!("deliberate replacement start failure") });
+        let error = task.await.expect_err("worker panic must become JoinError");
+        runtime.complete_exclusive_join_error(error);
+        flush_bookends(&mut runtime);
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, CoreEvt::ApplyResult { .. }))
+                .count(),
+            1,
+            "the settled apply keeps its one verdict"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    CoreEvt::State {
+                        phase: CorePhase::Error(_),
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the dead replacement start settles the phase"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                .count(),
+            1,
+            "one settlement releases one busy window"
+        );
+        assert!(runtime.jobs.busy_kind().is_none());
+    }
+
+    /// A Stop during the replacement start of a settled record aborts and
+    /// releases it without a second terminal: the apply's verdict already
+    /// landed, so the cancel path must not manufacture another one (and must
+    /// not crash on the taken terminal).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_during_a_kept_records_restart_delivers_one_terminal() {
+        let (mut runtime, events) = runtime_with_events();
+        settle_apply_and_keep_its_record(&mut runtime, 3);
+        park_pending_task(&mut runtime);
+
+        runtime.cancel_exclusive(&Diag::new(Key::RtReasonStopRequested));
+        flush_bookends(&mut runtime);
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, CoreEvt::ApplyResult { .. }))
+                .count(),
+            1,
+            "the settled apply keeps its one verdict"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                .count(),
+            1,
+            "the abort releases the window exactly once"
+        );
+        assert!(runtime.jobs.busy_kind().is_none());
+    }
+
+    /// A dead Start worker with its own unsettled record settles the phase
+    /// exactly once: the kind's terminal is the phase, and one release
+    /// follows it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_join_error_settles_the_phase_once() {
+        let (mut runtime, events) = runtime_with_events();
+        occupy_exclusive(&mut runtime, JobKind::Start);
+
+        let task = tokio::spawn(async { panic!("deliberate start worker failure") });
+        let error = task.await.expect_err("worker panic must become JoinError");
+        runtime.complete_exclusive_join_error(error);
+        flush_bookends(&mut runtime);
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    CoreEvt::State {
+                        phase: CorePhase::Error(_),
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the dead start is one phase failure"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, CoreEvt::Operation(None)))
+                .count(),
+            1,
+            "one settlement releases one busy window"
+        );
+        assert!(runtime.jobs.busy_kind().is_none());
+    }
+
+    /// A join failure with no record left — the cancel that aborted the task
+    /// already delivered its terminal and released the window — settles
+    /// nothing further: no phase, no release.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_error_with_no_record_settles_nothing() {
+        let (mut runtime, events) = runtime_with_events();
+
+        let task = tokio::spawn(async { panic!("deliberate orphan worker failure") });
+        let error = task.await.expect_err("worker panic must become JoinError");
+        runtime.complete_exclusive_join_error(error);
+        flush_bookends(&mut runtime);
+
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::State { .. })),
+            "a released record has no phase left to settle: {emitted:?}"
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, CoreEvt::Operation(_))),
+            "a released record has no window left to release: {emitted:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

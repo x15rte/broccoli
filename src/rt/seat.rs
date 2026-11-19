@@ -31,10 +31,12 @@ use super::grpc::pb::xray::app::router::command as router_cmd;
 use super::grpc::{
     GrpcClient, add_rule_outcome, balancer_status_diag, routing_context, trial_rule_to_pb,
 };
-use super::jobs::{Busy, ExclusiveSidecar, JobKind, KindRule, ReplyGuard, TestConfigReply};
+use super::jobs::{
+    Busy, ExclusiveSidecar, ExclusiveTerminal, JobKind, KindRule, ReplyGuard, TestConfigReply,
+};
 use super::{
     AppMessage, ApplyOutput, CoreEvt, CorePhase, DownloadState, LatencyProbeResult, PhaseError,
-    ProbeFailure, Runtime, RuntimeStateView, TrialRuleAddOutcome,
+    ProbeFailure, ProbeProgress, Runtime, RuntimeStateView, TrialRuleAddOutcome,
 };
 use crate::diag::{Diag, DiagError};
 use crate::i18n::Key;
@@ -326,178 +328,244 @@ pub(crate) fn cooperative_cancel_log(kind: JobKind, reason: &Diag) -> Diag {
     Diag::new(key).arg_message(reason.clone())
 }
 
-/// Deliver the profile-validation reply terminal (the sidecar parked at
-/// begin). Exactly one terminal path may take the sidecar, so a missing or
-/// mismatched one is a declaration error.
-pub(crate) fn deliver_profile_reply(
-    runtime: &mut Runtime,
-    sidecar: Option<ExclusiveSidecar>,
-    reply: super::ProfileValidationReply,
-) {
-    match sidecar {
-        Some(ExclusiveSidecar::ProfileReply(sender)) => {
-            if sender.send(reply).is_err() {
-                // Receiver vanished; nothing further is delivered.
-            }
-            runtime.events.repaint_now();
-        }
-        sidecar => unreachable!(
-            "a profile-validation terminal must carry its parked reply sidecar, got {sidecar:?}"
-        ),
-    }
+/// Where one exclusive kind's exactly-one terminal travels. Declared here
+/// with the kind's other facts and read only by [`ExclusiveTerminal`], so no
+/// delivery path selects a channel for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalRoute {
+    /// The apply verdict event, naming the revision the record parked.
+    ApplyVerdict,
+    /// The config test's parked reply channel.
+    TestReply,
+    /// The profile validation's parked reply channel.
+    ProfileReply,
+    /// The probe verdict event, tagged from the record.
+    ProbeEvent,
+    /// The download event.
+    Download,
+    /// The phase a lifecycle span settles.
+    Phase,
+    /// No terminal of its own: the span's cancel is its log and release.
+    SettlesNothing,
 }
 
-/// Deliver the config-test reply terminal (the sidecar parked at begin).
-/// Exactly one terminal path may take the sidecar, so a missing or
-/// mismatched one is a declaration error.
-pub(crate) fn deliver_test_reply(
-    runtime: &mut Runtime,
-    sidecar: Option<ExclusiveSidecar>,
-    verdict: TestConfigReply,
-) {
-    match sidecar {
-        Some(ExclusiveSidecar::TestReply(reply)) => {
-            if reply.send(verdict).is_err() {
-                // Receiver vanished; nothing further is delivered.
-            }
-            runtime.events.repaint_now();
-        }
-        sidecar => unreachable!(
-            "a config-test terminal must carry its parked reply sidecar, got {sidecar:?}"
-        ),
-    }
-}
-
-/// Deliver one apply failure: exactly one `ApplyResult` settles the config
-/// revision the in-flight command carried (parked on its own record at
-/// begin, so the verdict names the configuration it settled).
-fn deliver_apply_failure(runtime: &mut Runtime, output: ApplyOutput) {
-    let revision = runtime
-        .jobs
-        .apply_revision()
-        .expect("the held apply record carries the revision its begin parked");
-    runtime.emit(CoreEvt::ApplyResult {
-        ok: false,
-        output,
-        revision,
-    });
-}
-
-/// Deliver a latency-probe failure with the sidecar's tags (probe:
-/// single-flight, so tags pair the terminal back to its request).
-fn deliver_probe_failure(
-    runtime: &mut Runtime,
-    sidecar: Option<ExclusiveSidecar>,
-    failure: ProbeFailure,
-) {
-    match sidecar {
-        Some(ExclusiveSidecar::LatencyTags(probe)) => {
-            let progress = super::ProbeProgress {
-                done: probe.done.load(std::sync::atomic::Ordering::Relaxed),
-                total: probe.tags.len(),
-            };
-            runtime.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
-                tags: probe.tags,
-                result: Err(failure),
-                progress,
-            }));
-        }
-        sidecar => unreachable!(
-            "a latency-probe terminal must carry its parked tags sidecar, got {sidecar:?}"
-        ),
-    }
-}
-
-/// Deliver a core-update failure on the download channel.
-fn deliver_update_failure(runtime: &mut Runtime, message: AppMessage) {
-    runtime.emit(CoreEvt::Download(DownloadState::Failed(message)));
-}
-
-/// Deliver the exactly-one terminal of an exclusive task the runtime just
-/// cancelled. The kind's wording and routing are declared here; the caller
-/// has already taken the sidecar and stopped the worker. The reason stays a
-/// [`Diag`] so the screen renders it in the active language.
-pub(crate) fn deliver_cancel_terminal(
-    kind: JobKind,
-    runtime: &mut Runtime,
-    sidecar: Option<ExclusiveSidecar>,
-    reason: &Diag,
-) {
+/// The terminal route of each exclusive kind.
+fn terminal_route(kind: JobKind) -> TerminalRoute {
     match kind {
-        JobKind::ApplyConfig => {
-            deliver_apply_failure(
+        JobKind::ApplyConfig => TerminalRoute::ApplyVerdict,
+        JobKind::TestConfig => TerminalRoute::TestReply,
+        JobKind::ValidateProfiles => TerminalRoute::ProfileReply,
+        JobKind::LatencyProbe => TerminalRoute::ProbeEvent,
+        JobKind::UpdateCore => TerminalRoute::Download,
+        JobKind::Start | JobKind::Restart => TerminalRoute::Phase,
+        JobKind::Stop | JobKind::CleanUp => TerminalRoute::SettlesNothing,
+        kind => unreachable!("query kinds never hold the exclusive terminal: {kind:?}"),
+    }
+}
+
+/// The worker's own verdict, as one terminal channel reads it: the payload
+/// facts without the path that produced them.
+pub(super) enum TerminalReport {
+    /// ApplyConfig / TestConfig: the configuration validation verdict.
+    Validation { ok: bool, output: ApplyOutput },
+    /// ValidateProfiles: the request's own reply payload.
+    Profiles(super::ProfileValidationReply),
+    /// LatencyProbe: the measured statuses and the arrival count. The tags
+    /// travel here because the no-profile rejection ends before any are
+    /// parked; a cancel or failure terminal reads them from the record.
+    Probe {
+        tags: Vec<String>,
+        result: Result<Vec<super::grpc::OutboundStatusView>, ProbeFailure>,
+        done: usize,
+    },
+    /// UpdateCore: the install state.
+    Download(DownloadState),
+}
+
+/// The one owner of an exclusive job's terminal. Every path that can end the
+/// job takes its [`ExclusiveTerminal`] off the record once and asks one of
+/// the three settlement methods below to deliver, so the per-kind route and
+/// wording are declared here instead of being re-chosen by each path.
+impl ExclusiveTerminal {
+    /// Deliver the worker's own verdict on the channel its kind declares.
+    pub(super) fn verdict(self, runtime: &mut Runtime, report: TerminalReport) {
+        match report {
+            TerminalReport::Validation { ok, output } => match terminal_route(self.kind) {
+                TerminalRoute::ApplyVerdict => self.apply_verdict(runtime, ok, output),
+                TerminalRoute::TestReply => self.test_reply(runtime, Ok((ok, output))),
+                route => unreachable!(
+                    "a validation verdict only travels an apply or config-test terminal: {route:?}"
+                ),
+            },
+            TerminalReport::Profiles(reply) => match terminal_route(self.kind) {
+                TerminalRoute::ProfileReply => self.profile_reply(runtime, reply),
+                route => {
+                    unreachable!(
+                        "a profile-validation verdict only travels its own reply: {route:?}"
+                    )
+                }
+            },
+            TerminalReport::Probe { tags, result, done } => match terminal_route(self.kind) {
+                TerminalRoute::ProbeEvent => {
+                    let total = tags.len();
+                    runtime.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
+                        tags,
+                        result,
+                        progress: ProbeProgress { done, total },
+                    }));
+                }
+                route => {
+                    unreachable!("a probe verdict only travels the probe's own event: {route:?}")
+                }
+            },
+            TerminalReport::Download(state) => match terminal_route(self.kind) {
+                TerminalRoute::Download => runtime.emit(CoreEvt::Download(state)),
+                route => {
+                    unreachable!("a download state only travels the update's own event: {route:?}")
+                }
+            },
+        }
+    }
+
+    /// Deliver the terminal of a job cancelled before its verdict; `reason`
+    /// keys the kind's cancelled text.
+    pub(super) fn cancelled(self, runtime: &mut Runtime, reason: &Diag) {
+        match terminal_route(self.kind) {
+            TerminalRoute::ApplyVerdict => {
+                self.apply_verdict(
+                    runtime,
+                    false,
+                    ApplyOutput::Message(AppMessage::from(
+                        Diag::new(Key::RtFrameApplyCancelled).arg_message(reason.clone()),
+                    )),
+                );
+            }
+            TerminalRoute::TestReply => self.test_reply(
                 runtime,
-                ApplyOutput::Message(AppMessage::from(
-                    Diag::new(Key::RtFrameApplyCancelled).arg_message(reason.clone()),
+                Err(DiagError::from(
+                    Diag::new(Key::RtFrameConfigTestCancelled).arg_message(reason.clone()),
                 )),
-            );
+            ),
+            // Defensive: an active validation is cancelled cooperatively (its
+            // worker observes the cancel signal) and is outside the
+            // exit-cancel set, so no path reaches this arm today. The
+            // terminal is kept so a future wiring change degrades to a
+            // delivered verdict rather than a panic in the select loop.
+            TerminalRoute::ProfileReply => self.profile_reply(
+                runtime,
+                Err(DiagError::from(
+                    Diag::new(Key::RtFrameProfileValidationCancelled).arg_message(reason.clone()),
+                )),
+            ),
+            TerminalRoute::ProbeEvent => {
+                // The user's own Cancel keeps a distinct terminal key: the
+                // screen renders its progress line instead of a failure
+                // reason.
+                let failure = if reason.key() == Key::RtReasonUserCancelledProbe {
+                    ProbeFailure::plain(Diag::new(Key::ProbeCancelledByUser))
+                } else {
+                    ProbeFailure::plain(Diag::new(Key::ProbeCancelled).arg_message(reason.clone()))
+                };
+                self.probe_failure(runtime, failure);
+            }
+            // Lifecycle spans cancel to log + release only: their terminal
+            // would have ridden the worker's outcome, which the cancel owns.
+            TerminalRoute::Phase | TerminalRoute::SettlesNothing => {}
+            // A keep-slot core-update install is never aborted by a cancel
+            // path (the flag-only path returns before this point).
+            TerminalRoute::Download => unreachable!(
+                "an in-flight core update keeps its slot and never takes the cancel terminal"
+            ),
         }
-        JobKind::TestConfig => deliver_test_reply(
-            runtime,
-            sidecar,
-            Err(DiagError::from(
-                Diag::new(Key::RtFrameConfigTestCancelled).arg_message(reason.clone()),
-            )),
-        ),
-        JobKind::LatencyProbe => {
-            // The user's own Cancel keeps a distinct terminal key: the
-            // screen renders its progress line instead of a failure reason.
-            let failure = if reason.key() == Key::RtReasonUserCancelledProbe {
-                ProbeFailure::plain(Diag::new(Key::ProbeCancelledByUser))
-            } else {
-                ProbeFailure::plain(Diag::new(Key::ProbeCancelled).arg_message(reason.clone()))
-            };
-            deliver_probe_failure(runtime, sidecar, failure);
-        }
-        // Defensive: an active validation is cancelled cooperatively (its
-        // worker observes the cancel signal) and is outside the exit-cancel
-        // set, so no path reaches this arm today. The terminal is kept so a
-        // future wiring change degrades to a delivered verdict rather than a
-        // panic in the select loop.
-        JobKind::ValidateProfiles => deliver_profile_reply(
-            runtime,
-            sidecar,
-            Err(DiagError::from(
-                Diag::new(Key::RtFrameProfileValidationCancelled).arg_message(reason.clone()),
-            )),
-        ),
-        // Lifecycle spans cancel to log + release only: their terminal would
-        // have ridden the worker's outcome, which the cancel owns.
-        JobKind::Start | JobKind::Restart | JobKind::Stop | JobKind::CleanUp => {}
-        // A keep-slot core-update install is never aborted by a cancel path
-        // (the flag-only path returns before this point).
-        JobKind::UpdateCore => unreachable!(
-            "an in-flight core update keeps its slot and never takes the cancel terminal"
-        ),
-        kind => unreachable!("query kinds never reach the exclusive cancel terminal: {kind:?}"),
     }
-}
 
-/// Deliver the exactly-one terminal of an exclusive worker that died
-/// without a result (panic or join failure).
-pub(crate) fn deliver_join_error_terminal(
-    kind: JobKind,
-    runtime: &mut Runtime,
-    sidecar: Option<ExclusiveSidecar>,
-    message: Diag,
-) {
-    match kind {
-        JobKind::TestConfig => deliver_test_reply(runtime, sidecar, Err(DiagError::from(message))),
-        JobKind::ValidateProfiles => {
-            deliver_profile_reply(runtime, sidecar, Err(DiagError::from(message)))
+    /// Deliver the terminal of a job that ended without a verdict (a
+    /// pre-spawn refusal, a join failure); `message` is the whole text.
+    pub(super) fn failed(self, runtime: &mut Runtime, message: DiagError) {
+        match terminal_route(self.kind) {
+            TerminalRoute::ApplyVerdict => self.apply_verdict(
+                runtime,
+                false,
+                ApplyOutput::Message(AppMessage::from(message)),
+            ),
+            TerminalRoute::TestReply => self.test_reply(runtime, Err(message)),
+            TerminalRoute::ProfileReply => self.profile_reply(runtime, Err(message)),
+            TerminalRoute::ProbeEvent => {
+                self.probe_failure(runtime, ProbeFailure::plain(message.diag().clone()));
+            }
+            TerminalRoute::Download => runtime.emit(CoreEvt::Download(DownloadState::Failed(
+                AppMessage::from(message.diag().clone()),
+            ))),
+            TerminalRoute::Phase => {
+                runtime.set_phase(CorePhase::Error(PhaseError::new(message.diag().clone())));
+            }
+            TerminalRoute::SettlesNothing => {}
         }
-        JobKind::UpdateCore => deliver_update_failure(runtime, AppMessage::from(message)),
-        JobKind::ApplyConfig => {
-            deliver_apply_failure(runtime, ApplyOutput::Message(AppMessage::from(message)));
+    }
+
+    /// Emit one apply verdict, naming the revision its begin parked on the
+    /// record (only one apply can be in flight, so a verdict that reads this
+    /// always reads its own).
+    fn apply_verdict(&self, runtime: &mut Runtime, ok: bool, output: ApplyOutput) {
+        runtime.emit(CoreEvt::ApplyResult {
+            ok,
+            output,
+            revision: self
+                .apply_revision
+                .expect("an apply terminal names the revision its begin parked"),
+        });
+    }
+
+    /// Answer the config test's parked reply.
+    fn test_reply(self, runtime: &mut Runtime, verdict: TestConfigReply) {
+        match self.sidecar {
+            Some(ExclusiveSidecar::TestReply(reply)) => {
+                if reply.send(verdict).is_err() {
+                    // Receiver vanished; nothing further is delivered.
+                }
+                runtime.events.repaint_now();
+            }
+            sidecar => unreachable!(
+                "a config-test terminal must carry its parked reply sidecar, got {sidecar:?}"
+            ),
         }
-        JobKind::LatencyProbe => {
-            deliver_probe_failure(runtime, sidecar, ProbeFailure::plain(message));
+    }
+
+    /// Answer the profile validation's parked reply.
+    fn profile_reply(self, runtime: &mut Runtime, reply: super::ProfileValidationReply) {
+        match self.sidecar {
+            Some(ExclusiveSidecar::ProfileReply(sender)) => {
+                if sender.send(reply).is_err() {
+                    // Receiver vanished; nothing further is delivered.
+                }
+                runtime.events.repaint_now();
+            }
+            sidecar => unreachable!(
+                "a profile-validation terminal must carry its parked reply sidecar, got {sidecar:?}"
+            ),
         }
-        JobKind::Start | JobKind::Restart => {
-            runtime.set_phase(CorePhase::Error(PhaseError::new(message)))
+    }
+
+    /// Emit a probe failure with the record's tags and arrival count (the
+    /// probe is single-flight, so the tags pair the terminal back to its
+    /// request).
+    fn probe_failure(self, runtime: &mut Runtime, failure: ProbeFailure) {
+        match self.sidecar {
+            Some(ExclusiveSidecar::LatencyTags(probe)) => {
+                let progress = ProbeProgress {
+                    done: probe.done.load(std::sync::atomic::Ordering::Relaxed),
+                    total: probe.tags.len(),
+                };
+                runtime.emit(CoreEvt::LatencyProbe(LatencyProbeResult {
+                    tags: probe.tags,
+                    result: Err(failure),
+                    progress,
+                }));
+            }
+            sidecar => unreachable!(
+                "a latency-probe terminal must carry its parked tags sidecar, got {sidecar:?}"
+            ),
         }
-        JobKind::Stop | JobKind::CleanUp => {}
-        kind => unreachable!("query kinds never reach the exclusive task branch: {kind:?}"),
     }
 }
 
