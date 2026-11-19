@@ -1769,6 +1769,7 @@ pub use settings::{
     routing_script_issues, tun_ipv4_gateway, tun_ipv6_gateway, validate_listen_address,
     validate_profiles, validate_settings,
 };
+pub(crate) use stream::is_canonical_uuid;
 pub use stream::{
     SEQ_PLACEMENT_OPTIONS, SESSION_ID_PLACEMENT_OPTIONS, SOCKOPT_ADDRESS_PORT_STRATEGY_OPTIONS,
     SOCKOPT_DOMAIN_STRATEGY_OPTIONS, SS_METHOD_OPTIONS, StreamBlocks, TARGET_STRATEGY_OPTIONS,
@@ -1787,7 +1788,6 @@ pub use stream::{
     xmux_limits_conflict, xpadding_bytes_supported, xpadding_method_supported,
     xpadding_placement_supported,
 };
-pub(crate) use stream::{is_canonical_uuid, range_has_session_room};
 
 #[cfg(test)]
 mod tests {

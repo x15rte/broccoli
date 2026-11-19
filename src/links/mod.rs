@@ -3993,32 +3993,24 @@ fn validate_reality(stream: &StreamModel) -> Result<(), LinkError> {
         // model validation pass before this links-local grammar check runs.
         return Ok(());
     };
+    // Kept: the core accepts an empty REALITY `serverName` (its conf build
+    // only assigns the field), so no model finding covers it.
     if reality.server_name.is_empty() {
         return Err(malformed(Diag::new(Key::LinkRealityServerNameEmpty)));
     }
+    // Kept: a host-shape rule, which the model pass states for no setting.
     validate_host(&reality.server_name, "REALITY sni")?;
+    // Kept: the grammar's accept-set also excludes the wire-only
+    // `randomizedalpn` the model pass accepts.
     if !supported_reality_fingerprint(&reality.fingerprint) {
         return Err(malformed(
             Diag::new(Key::LinkRealityFingerprint).arg(excerpt_debug(&reality.fingerprint)),
         ));
     }
-    // Shape checks delegate to the shared model predicates
-    // (src/model/validation.rs) — the same predicates the model validation
-    // pass runs on the TLS/REALITY stream blocks, so import and model can
-    // never drift. The messages below are the grammar's renderings of those
-    // predicates.
-    if !crate::model::validation::reality_public_key_valid(&reality.password) {
-        return Err(malformed(Diag::new(Key::LinkRealityPbk)));
-    }
-    if !crate::model::validation::reality_short_id_valid(&reality.short_id) {
-        return Err(malformed(Diag::new(Key::LinkRealitySid)));
-    }
-    if !crate::model::validation::reality_mldsa65_verify_valid(&reality.mldsa65_verify) {
-        return Err(malformed(Diag::new(Key::LinkRealityPqv)));
-    }
-    if !crate::model::validation::reality_spider_x_valid(&reality.spider_x) {
-        return Err(malformed(Diag::new(Key::LinkRealitySpx)));
-    }
+    // The key, shortId, mldsa65Verify and spiderX shapes are the model pass's
+    // findings (`RealityPublicKeyInvalid`, `RealityShortIdInvalid`,
+    // `RealityMldsa65Invalid`, `RealitySpiderXInvalid`), refused before this
+    // walk with a path that names the field.
     Ok(())
 }
 
@@ -4033,14 +4025,19 @@ fn supported_tls_fingerprint(value: &str) -> bool {
 }
 
 fn validate_tls(tls: &TlsModel) -> Result<(), LinkError> {
+    // Kept: the grammar's accept-set is the editor table, which excludes the
+    // wire-only `randomizedalpn` the model pass accepts.
     if !supported_tls_fingerprint(&tls.fingerprint) {
         return Err(malformed(
             Diag::new(Key::LinkTlsFingerprint).arg(excerpt_debug(&tls.fingerprint)),
         ));
     }
+    // Kept: a host-shape rule, which the model pass states for no setting.
     if !tls.server_name.is_empty() {
         validate_host(&tls.server_name, "TLS serverName")?;
     }
+    // Kept: the core folds `fromMitm` case-insensitively (`tls.IsFromMitm`);
+    // the model rule compares the spelling exactly.
     if tls.alpn.len() > 1
         && tls
             .alpn
@@ -4049,14 +4046,9 @@ fn validate_tls(tls: &TlsModel) -> Result<(), LinkError> {
     {
         return Err(malformed(Diag::new(Key::LinkTlsAlpnFromMitm)));
     }
-    if !crate::model::validation::pinned_peer_cert_sha256_valid(&tls.pinned_peer_cert_sha256) {
-        return Err(malformed(Diag::new(Key::LinkTlsPcs)));
-    }
+    // `pinnedPeerCertSha256` is the model pass's
+    // `PinnedPeerCertSha256Invalid`, refused before this walk.
     Ok(())
-}
-
-fn string_map_is_valid(map: &Map<String, Value>) -> bool {
-    map.values().all(Value::is_string)
 }
 
 fn raw_header_value_is_valid(value: &Value) -> bool {
@@ -4066,92 +4058,14 @@ fn raw_header_value_is_valid(value: &Value) -> bool {
             .is_some_and(|values| values.iter().all(Value::is_string))
 }
 
-fn validate_xhttp(settings: &XhttpSettings) -> Result<(), LinkError> {
-    // Vocabulary / cross-field refusals delegate to the shared predicates in
-    // `crate::model::validation`: the import grammar and the
-    // model pass decide identically on every value because they run the same
-    // code, mirroring Xray's SplitHTTPConfig.Build
-    // (infra/conf/transport_method.go:317-459).
-    let mode = if settings.mode.is_empty() {
-        "auto"
-    } else {
-        settings.mode.as_str()
-    };
-    if !crate::model::validation::xhttp_mode_supported(&settings.mode) {
-        return Err(malformed(
-            Diag::new(Key::LinkXhttpMode).arg(excerpt_debug(&settings.mode)),
-        ));
-    }
-    if !string_map_is_valid(&settings.headers) {
-        return Err(malformed(Diag::new(Key::LinkXhttpHeaderValues)));
-    }
-    if settings
-        .headers
-        .keys()
-        .any(|key| key.eq_ignore_ascii_case("host"))
-    {
-        return Err(malformed(Diag::new(Key::LinkXhttpHostHeader)));
-    }
-    if !crate::model::validation::xpadding_bytes_supported(settings.x_padding_bytes) {
-        return Err(malformed(Diag::new(Key::LinkXhttpPaddingBytes)));
-    }
-    if !crate::model::validation::xpadding_placement_supported(&settings.x_padding_placement) {
-        return Err(malformed(Diag::new(Key::LinkXhttpPaddingPlacement)));
-    }
-    if !crate::model::validation::xpadding_method_supported(&settings.x_padding_method) {
-        return Err(malformed(Diag::new(Key::LinkXhttpPaddingMethod)));
-    }
-    if !crate::model::validation::uplink_data_placement_supported(&settings.uplink_data_placement) {
-        return Err(malformed(Diag::new(Key::LinkXhttpUplinkPlacement)));
-    }
-    if !crate::model::validation::uplink_placement_mode_supported(
-        &settings.uplink_data_placement,
-        mode,
-    ) {
-        return Err(malformed(Diag::new(Key::LinkXhttpUplinkMode)));
-    }
-    if !crate::model::validation::uplink_http_method_mode_supported(
-        &settings.uplink_http_method,
-        mode,
-    ) {
-        return Err(malformed(Diag::new(Key::LinkXhttpUplinkMethod)));
-    }
-    if !crate::model::validation::session_id_placement_supported(&settings.session_id_placement) {
-        return Err(malformed(Diag::new(Key::LinkXhttpSessionPlacement)));
-    }
-    if !crate::model::validation::seq_placement_supported(&settings.seq_placement) {
-        return Err(malformed(Diag::new(Key::LinkXhttpSeqPlacement)));
-    }
-    if !settings.session_id_table.is_empty() {
-        let range = settings
-            .session_id_length
-            .ok_or_else(|| malformed(Diag::new(Key::LinkXhttpSessionLength)))?;
-        if !crate::model::validation::range_has_session_room(&settings.session_id_table, range) {
-            return Err(malformed(Diag::new(Key::LinkXhttpSessionSpace)));
-        }
-    }
-    if settings
-        .server_max_header_bytes
-        .is_some_and(|value| !crate::model::validation::server_max_header_bytes_ok(value))
-    {
-        return Err(malformed(Diag::new(Key::LinkXhttpServerMaxHeader)));
-    }
-    if crate::model::validation::xmux_limits_conflict(settings.xmux.as_ref()) {
-        return Err(malformed(Diag::new(Key::LinkXhttpXmux)));
-    }
-    if mode == "stream-one" && settings.download_settings.is_some() {
-        return Err(malformed(Diag::new(Key::LinkXhttpStreamOne)));
-    }
-    if let Some(download) = settings.download_settings.as_deref() {
-        validate_stream_core(download)?;
-    }
-    Ok(())
-}
-
 /// The share grammar's own stream rules: the transport-security and
-/// transport-settings refusals a link spells, recursing over the XHTTP
-/// download chain. Only [`validate_profile_inner`] reaches this; the note at
-/// the end records which block the model sweep already covered.
+/// transport-settings refusals a link spells that the model pass does not
+/// state, recursing over the XHTTP download chain.
+///
+/// A rule the model pass already states is not repeated here. The same walk
+/// runs `validate_outbound` first ([`validate_profile_inner`]), and its
+/// finding names the offending field, so a second copy could only restate a
+/// verdict the caller already holds.
 fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
     match stream.security {
         Security::None => {}
@@ -4165,6 +4079,11 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
 
     match stream.network {
         Network::Raw => {
+            // Kept: the model pass states no raw camouflage rule — neither the
+            // `type` vocabulary (Xray's `tcpHeaderLoader` refuses an unknown
+            // type) nor the header value types (its authenticator decodes each
+            // value as a string or a string list) — so these checks have no
+            // model counterpart.
             if let Some(header) = stream
                 .raw_settings
                 .as_ref()
@@ -4196,19 +4115,9 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
             }
         }
         Network::Kcp => {
+            // The mtu and tti bounds are the model pass's `KcpRangeInvalid`.
+            // Kept: `cwndMultiplier` and `maxSendingWindow` have no model rule.
             if let Some(kcp) = stream.kcp_settings.as_ref() {
-                if kcp
-                    .mtu
-                    .is_some_and(|mtu| !crate::model::validation::kcp_mtu_hard_ok(mtu))
-                {
-                    return Err(malformed(Diag::new(Key::LinkKcpMtu)));
-                }
-                if kcp
-                    .tti
-                    .is_some_and(|tti| !crate::model::validation::kcp_tti_hard_ok(tti))
-                {
-                    return Err(malformed(Diag::new(Key::LinkKcpTti)));
-                }
                 if kcp.cwnd_multiplier == Some(0) {
                     return Err(malformed(Diag::new(Key::LinkKcpCwnd)));
                 }
@@ -4219,16 +4128,14 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
                 }
             }
         }
-        Network::Ws => {
-            if stream
-                .ws_settings
-                .as_ref()
-                .is_some_and(|settings| !string_map_is_valid(&settings.headers))
-            {
-                return Err(malformed(Diag::new(Key::LinkWsHeaderValues)));
-            }
+        Network::Ws | Network::Httpupgrade => {
+            // Nothing link-only remains: their `headers` value rule is the
+            // model pass's `HeaderValuesNotStrings`, and a link's header map
+            // holds only strings by construction.
         }
         Network::Grpc => {
+            // Kept: the core accepts an empty `serviceName`, so no model
+            // finding covers a `grpc` link that names none.
             if stream
                 .grpc_settings
                 .as_ref()
@@ -4237,16 +4144,20 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
                 return Err(malformed(Diag::new(Key::LinkGrpcServiceName)));
             }
         }
-        Network::Httpupgrade => {
-            if let Some(settings) = stream.httpupgrade_settings.as_ref()
-                && !string_map_is_valid(&settings.headers)
-            {
-                return Err(malformed(Diag::new(Key::LinkHttpupgradeHeaderValues)));
-            }
-        }
         Network::Xhttp => {
             if let Some(settings) = stream.xhttp_settings.as_ref() {
-                validate_xhttp(settings)?;
+                // Kept: Xray's `SplitHTTPConfig.Build` refuses a `headers` key
+                // that folds to `host`; the model pass states no such rule.
+                if settings
+                    .headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("host"))
+                {
+                    return Err(malformed(Diag::new(Key::LinkXhttpHostHeader)));
+                }
+                if let Some(download) = settings.download_settings.as_deref() {
+                    validate_stream_core(download)?;
+                }
             }
         }
         Network::Hysteria => {
@@ -4267,13 +4178,12 @@ fn validate_stream_core(stream: &StreamModel) -> Result<(), LinkError> {
         }
     }
     // `finalmask` is deliberately not re-validated here. This function only
-    // runs inside `validate_profile_inner`, for the top-level stream and —
-    // through `validate_xhttp` — each nested `downloadSettings` stream, and
-    // that walk already ran `validate_outbound`, whose stream visit descends
-    // the same XHTTP chain with the same model `validate_finalmask` and
-    // refuses first (`InvalidModel` with no prefix). Running the model
-    // verdict a second time could only repeat an outcome the caller has
-    // already been handed.
+    // runs inside `validate_profile_inner`, for the top-level stream and each
+    // nested `downloadSettings` stream, and that walk already ran
+    // `validate_outbound`, whose stream visit descends the same XHTTP chain
+    // with the same model `validate_finalmask` and refuses first
+    // (`InvalidModel` with no prefix). Running the model verdict a second time
+    // could only repeat an outcome the caller has already been handed.
     Ok(())
 }
 
@@ -7131,6 +7041,42 @@ mod tests {
         }
     }
 
+    /// A model refusal whose finding must also name `field`: the report shows
+    /// the finding's own `path: message` text, so the path is the part that
+    /// tells the user which value to fix.
+    fn assert_model_refusal(error: LinkError, code: ValidationCode, field: &str) {
+        match error {
+            LinkError::InvalidModel { issue, .. } => {
+                assert_eq!(issue.code, code);
+                let message = validation_issue_message(&issue, Language::En);
+                assert!(
+                    message.starts_with(&format!("{field}: ")),
+                    "expected the finding to name {field:?}, got {message:?}"
+                );
+            }
+            other => panic!(
+                "expected InvalidModel({code:?}), got {}",
+                error_shape(&other)
+            ),
+        }
+    }
+
+    /// [`assert_model_refusal`] for a link the import gate must refuse.
+    fn expect_invalid_model_at(s: &str, code: ValidationCode, field: &str) {
+        match parse_link(s) {
+            Ok(_) => panic!("expected InvalidModel({code:?}) for {}, got Ok", redact(s)),
+            Err(error) => assert_model_refusal(error, code, field),
+        }
+    }
+
+    /// [`assert_model_refusal`] for a profile the export gate must refuse.
+    fn expect_profile_refusal(profile: &ServerProfile, code: ValidationCode, field: &str) {
+        match validate_profile(profile) {
+            Ok(()) => panic!("expected InvalidModel({code:?}), got Ok"),
+            Err(error) => assert_model_refusal(error, code, field),
+        }
+    }
+
     /// A link with its credential elided: for the URL-shaped engines
     /// everything between the scheme and the first `@` is the account's id or
     /// password, and for the base64-shaped ones the whole body is, so a
@@ -7375,6 +7321,163 @@ mod tests {
                 "vmess://{UUID}@h.example.com:443?type=xhttp&mode=stream-one&extra={recursive}"
             ),
             crate::model::validation::ValidationCode::StreamOneNoDownload,
+        );
+    }
+
+    /// Every stream rule the model pass states refuses the link through that
+    /// finding, with the offending field named: the grammar keeps no second
+    /// copy of the rule, so this is the whole refusal.
+    #[test]
+    fn model_stream_rules_refuse_links_with_the_offending_field() {
+        let base = format!("vless://{UUID}@h.example.com:443");
+        let xhttp = |extra: &str| {
+            format!(
+                "vmess://{UUID}@h.example.com:443?type=xhttp&extra={}",
+                pct_encode(extra)
+            )
+        };
+        let reality = |tail: &str| format!("{base}?security=reality&fp=chrome&{tail}");
+        let public_key = reality_public_key();
+        let cases = [
+            (
+                format!("{base}?type=kcp&mtu=20&security=tls"),
+                ValidationCode::KcpRangeInvalid,
+                "stream.kcpSettings.mtu",
+            ),
+            (
+                format!("{base}?type=kcp&tti=9&security=tls"),
+                ValidationCode::KcpRangeInvalid,
+                "stream.kcpSettings.tti",
+            ),
+            (
+                format!("{base}?security=tls&pcs=abcd"),
+                ValidationCode::PinnedPeerCertSha256Invalid,
+                "stream.tlsSettings.pinnedPeerCertSha256",
+            ),
+            (
+                reality(&format!("pbk={public_key}&sid=0")),
+                ValidationCode::RealityShortIdInvalid,
+                "stream.realitySettings.shortId",
+            ),
+            (
+                reality(&format!("pbk={public_key}&pqv=AAA")),
+                ValidationCode::RealityMldsa65Invalid,
+                "stream.realitySettings.mldsa65Verify",
+            ),
+            (
+                reality(&format!("pbk={public_key}&spx=relative")),
+                ValidationCode::RealitySpiderXInvalid,
+                "stream.realitySettings.spiderX",
+            ),
+            (
+                reality(""),
+                ValidationCode::RealityPublicKeyInvalid,
+                "stream.realitySettings.publicKey",
+            ),
+            (
+                xhttp(r#"{"headers":{"X-Test":1}}"#),
+                ValidationCode::HeaderValuesNotStrings(Network::Xhttp),
+                "stream.xhttpSettings.headers",
+            ),
+            (
+                xhttp(r#"{"xPaddingPlacement":"bogus"}"#),
+                ValidationCode::XhttpPaddingPlacementInvalid,
+                "stream.xhttpSettings.xPaddingPlacement",
+            ),
+            (
+                xhttp(r#"{"xPaddingMethod":"bogus"}"#),
+                ValidationCode::XhttpPaddingMethodInvalid,
+                "stream.xhttpSettings.xPaddingMethod",
+            ),
+            (
+                xhttp(r#"{"uplinkDataPlacement":"bogus"}"#),
+                ValidationCode::XhttpUplinkDataPlacementInvalid,
+                "stream.xhttpSettings.uplinkDataPlacement",
+            ),
+            (
+                xhttp(r#"{"uplinkDataPlacement":"cookie"}"#),
+                ValidationCode::XhttpUplinkDataPlacementRequiresPacketUp,
+                "stream.xhttpSettings.uplinkDataPlacement",
+            ),
+            (
+                xhttp(r#"{"uplinkHTTPMethod":"GET"}"#),
+                ValidationCode::XhttpUplinkHttpMethodRequiresPacketUp,
+                "stream.xhttpSettings.uplinkHTTPMethod",
+            ),
+            (
+                xhttp(r#"{"sessionIDPlacement":"bogus"}"#),
+                ValidationCode::XhttpSessionIdPlacementInvalid,
+                "stream.xhttpSettings.sessionIDPlacement",
+            ),
+            (
+                xhttp(r#"{"seqPlacement":"bogus"}"#),
+                ValidationCode::XhttpSeqPlacementInvalid,
+                "stream.xhttpSettings.seqPlacement",
+            ),
+            (
+                xhttp(r#"{"sessionIDTable":"ab"}"#),
+                ValidationCode::XhttpSessionIdLengthRequired,
+                "stream.xhttpSettings.sessionIDLength",
+            ),
+            (
+                xhttp(r#"{"sessionIDTable":"ab","sessionIDLength":"1-1"}"#),
+                ValidationCode::XhttpSessionIdTableInvalid,
+                "stream.xhttpSettings.sessionIDTable",
+            ),
+            (
+                xhttp(r#"{"serverMaxHeaderBytes":-1}"#),
+                ValidationCode::XhttpServerMaxHeaderBytesInvalid,
+                "stream.xhttpSettings.serverMaxHeaderBytes",
+            ),
+            (
+                xhttp(r#"{"xmux":{"maxConnections":"1-2","maxConcurrency":"1-2"}}"#),
+                ValidationCode::XmuxLimitsExclusive,
+                "stream.xhttpSettings.xmux",
+            ),
+        ];
+        for (link, code, field) in cases {
+            expect_invalid_model_at(&link, code, field);
+        }
+    }
+
+    /// A non-string `headers` value is state-file content, not link content:
+    /// the model pass refuses it with the field path and the grammar's own
+    /// sentence, so the export gate keeps no copy of that rule either.
+    #[test]
+    fn non_string_transport_header_values_are_refused_by_the_model_pass() {
+        let mut ws = parse_link(&format!(
+            "vmess://{UUID}@h.example.com:443?type=ws&path=%2Fws"
+        ))
+        .unwrap();
+        ws.outbound
+            .stream
+            .ws_settings
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("X-Test".into(), Value::from(1));
+        expect_profile_refusal(
+            &ws,
+            ValidationCode::HeaderValuesNotStrings(Network::Ws),
+            "stream.wsSettings.headers",
+        );
+
+        let mut upgrade = parse_link(&format!(
+            "vmess://{UUID}@h.example.com:443?type=httpupgrade&path=%2Fup"
+        ))
+        .unwrap();
+        upgrade
+            .outbound
+            .stream
+            .httpupgrade_settings
+            .as_mut()
+            .unwrap()
+            .headers
+            .insert("X-Test".into(), Value::from(1));
+        expect_profile_refusal(
+            &upgrade,
+            ValidationCode::HeaderValuesNotStrings(Network::Httpupgrade),
+            "stream.httpupgradeSettings.headers",
         );
     }
 

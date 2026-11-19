@@ -2184,34 +2184,13 @@ keys! {
     LinkSsPasswordEmpty 0,
     LinkRealityServerNameEmpty 0,
     LinkRealityFingerprint 1,
-    LinkRealityPbk 0,
-    LinkRealitySid 0,
-    LinkRealityPqv 0,
-    LinkRealitySpx 0,
     LinkTlsFingerprint 1,
     LinkTlsAlpnFromMitm 0,
-    LinkTlsPcs 0,
-    LinkXhttpMode 1,
     LinkXhttpHeaderValues 0,
     LinkXhttpHostHeader 0,
-    LinkXhttpPaddingBytes 0,
-    LinkXhttpPaddingPlacement 0,
-    LinkXhttpPaddingMethod 0,
-    LinkXhttpUplinkPlacement 0,
-    LinkXhttpUplinkMode 0,
-    LinkXhttpUplinkMethod 0,
-    LinkXhttpSessionPlacement 0,
-    LinkXhttpSeqPlacement 0,
-    LinkXhttpSessionLength 0,
-    LinkXhttpSessionSpace 0,
-    LinkXhttpServerMaxHeader 0,
-    LinkXhttpXmux 0,
-    LinkXhttpStreamOne 0,
     LinkRawHeaderType 1,
     LinkRawCamouflage 0,
     LinkRawHeaderValues 0,
-    LinkKcpMtu 0,
-    LinkKcpTti 0,
     LinkKcpCwnd 0,
     LinkKcpWindow 0,
     LinkWsHeaderValues 0,
@@ -6252,50 +6231,15 @@ mod en {
             Key::LinkSsPasswordEmpty => "The ss link has an empty password.",
             Key::LinkRealityServerNameEmpty => "The REALITY server name must not be empty.",
             Key::LinkRealityFingerprint => "The REALITY fingerprint {} is unknown or unsafe.",
-            Key::LinkRealityPbk => "REALITY pbk must hold a 32-byte base64url key.",
-            Key::LinkRealitySid => {
-                "REALITY sid must hold an even-length hexadecimal value of up to 16 digits."
-            }
-            Key::LinkRealityPqv => "REALITY pqv must hold a 1952-byte base64url ML-DSA-65 key.",
-            Key::LinkRealitySpx => "REALITY spx must hold a URL path that begins with '/'.",
             Key::LinkTlsFingerprint => "The TLS fingerprint {} is unknown.",
             Key::LinkTlsAlpnFromMitm => "TLS alpn accepts only one element when it uses fromMitm.",
-            Key::LinkTlsPcs => {
-                "TLS pcs entries must be 32-byte hexadecimal SHA-256 fingerprints, comma-separated."
-            }
-            Key::LinkXhttpMode => "The XHTTP mode {} is not supported.",
             Key::LinkXhttpHeaderValues => "Every XHTTP header value must be a string.",
             Key::LinkXhttpHostHeader => "XHTTP headers cannot contain Host. Use the host field.",
-            Key::LinkXhttpPaddingBytes => "XHTTP xPaddingBytes values must be positive.",
-            Key::LinkXhttpPaddingPlacement => "The XHTTP xPaddingPlacement value is not supported.",
-            Key::LinkXhttpPaddingMethod => "The XHTTP xPaddingMethod value is not supported.",
-            Key::LinkXhttpUplinkPlacement => {
-                "The XHTTP uplinkDataPlacement value is not supported."
-            }
-            Key::LinkXhttpUplinkMode => {
-                "The XHTTP cookie and header uplinkDataPlacement values need packet-up mode."
-            }
-            Key::LinkXhttpUplinkMethod => "The XHTTP uplinkHTTPMethod GET needs packet-up mode.",
-            Key::LinkXhttpSessionPlacement => {
-                "The XHTTP sessionIDPlacement value is not supported."
-            }
-            Key::LinkXhttpSeqPlacement => "The XHTTP seqPlacement value is not supported.",
-            Key::LinkXhttpSessionLength => "The XHTTP sessionIDTable needs a sessionIDLength.",
-            Key::LinkXhttpSessionSpace => {
-                "The XHTTP sessionIDTable and sessionIDLength leave too little ASCII key space."
-            }
-            Key::LinkXhttpServerMaxHeader => "The XHTTP serverMaxHeaderBytes cannot be negative.",
-            Key::LinkXhttpXmux => {
-                "The XHTTP maxConnections and maxConcurrency cannot be set together."
-            }
-            Key::LinkXhttpStreamOne => "The XHTTP stream-one mode cannot contain downloadSettings.",
             Key::LinkRawHeaderType => "The raw transport header type {} is not supported.",
             Key::LinkRawCamouflage => "The raw request and response camouflage needs type=http.",
             Key::LinkRawHeaderValues => {
                 "The raw HTTP camouflage headers must be strings or string arrays."
             }
-            Key::LinkKcpMtu => "The mKCP mtu must be at least 21.",
-            Key::LinkKcpTti => "The mKCP tti must be between 10 and 1000.",
             Key::LinkKcpCwnd => "The mKCP cwndMultiplier must be at least 1.",
             Key::LinkKcpWindow => "The mKCP maxSendingWindow must be at least mtu.",
             Key::LinkWsHeaderValues => "Every ws header value must be a string.",
