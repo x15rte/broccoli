@@ -59,6 +59,7 @@ pub(crate) mod finalmask_editors;
 mod keygen;
 mod raw_editor;
 mod selection;
+mod tab_rows;
 mod tls_editor;
 mod tool_session;
 mod validators;
@@ -72,6 +73,7 @@ use finalmask_editors::{
 use keygen::gen_short_id;
 use raw_editor::{FieldKey, RawField, SeededBuffers};
 use selection::{Selection, VisibleRows};
+use tab_rows::TabRows;
 use tool_session::{Applied, ToolOutcome, ToolSession};
 use validators::{
     v_masque_remote_dns_entry, v_masque_warp_address_entry, v_masque_warp_private_key,
@@ -2378,25 +2380,6 @@ fn next_view_sort(current: Option<ViewSort>, column: SortColumn) -> ViewSort {
     }
 }
 
-/// The row list of one tab, rebuilt only when the model, the tab, the search
-/// or the view sort moves.
-struct TabRowsCache {
-    generation: u64,
-    tab: ServerTab,
-    search: String,
-    sort: Option<ViewSort>,
-    rows: std::rc::Rc<[usize]>,
-    /// The display rows a drag may lift or land on: the hops are not drag
-    /// places, so they are left out here rather than filtered per frame.
-    seeds: std::rc::Rc<[usize]>,
-    /// `seeds_before[i]`: how many seed rows precede display index `i`.
-    seeds_before: std::rc::Rc<[usize]>,
-    /// Whether display index `i` can move inside its own group block. Only
-    /// the Emitted tab's rows can, and a row whose group block holds no other
-    /// movable row cannot.
-    drag_movable: std::rc::Rc<[bool]>,
-}
-
 /// The tab bar's entries for one model generation. The list moves only when
 /// the groups — their records, order or pins — do; a label is borrowed from
 /// the model (or a static translation) and formatted per frame.
@@ -2640,7 +2623,9 @@ pub struct ServersScreen {
     sort_initialized: bool,
     /// The list's search text; it filters the current tab only.
     search: String,
-    tab_rows_cache: Option<TabRowsCache>,
+    /// The current tab's rows and their display facts, rebuilt only when the
+    /// model, the tab, the search or the view sort moves (see [`TabRows`]).
+    tab_rows: Option<std::rc::Rc<TabRows>>,
     /// The tab bar's entry list, rebuilt only when the model generation
     /// moves (see [`TabBarCache`]).
     tab_bar_cache: Option<TabBarCache>,
@@ -2666,9 +2651,9 @@ pub struct ServersScreen {
     /// grabbed. Held across frames so each frame lays the column out from the
     /// press, not from the previous frame's stored widths.
     column_drag: Option<ColumnDrag>,
-    /// The emitted set memoized for one model generation: the row switches
-    /// and their lock hints read it, and it is rebuilt only when the model
-    /// moves, never per repaint.
+    /// The emitted set memoized for one model generation: the tab's rows and
+    /// their chain facts are rebuilt from it, and it is rebuilt only when the
+    /// model moves, never per repaint.
     emitted_cache: Option<(u64, std::rc::Rc<crate::model::servers::EmittedSet>)>,
     /// Memoized latency badges keyed by profile id: the list
     /// paints one badge per visible row per frame, but a badge's text is a
@@ -3954,14 +3939,14 @@ impl ServersScreen {
 
     /// Switch tabs. The selection belongs to the tab that was showing, so it
     /// is dropped here; the view sort is the screen's and stays, and the
-    /// stored order never moves.
+    /// stored order never moves. The tab's rows need no explicit reset: the
+    /// tab is one of their cache keys, so the next frame rebuilds them.
     fn select_tab(&mut self, tab: ServerTab) {
         if self.view == tab {
             return;
         }
         self.view = tab;
         self.selection.clear();
-        self.tab_rows_cache = None;
     }
 
     /// The group a new row lands in: the current tab's group, or `Manual` when
@@ -4691,103 +4676,33 @@ impl ServersScreen {
                 .expect("the emitted set was cached above")
                 .1,
         );
-        let stale_rows = self.tab_rows_cache.as_ref().is_none_or(|cache| {
-            cache.generation != generation
-                || cache.tab != self.view
-                || cache.search != self.search
-                || cache.sort != self.view_sort
+        let stale_rows = self.tab_rows.as_ref().is_none_or(|rows| {
+            !rows.is_current(generation, &self.view, &self.search, self.view_sort)
         });
         if stale_rows {
-            let rows: Box<[usize]> =
-                tab_rows(ctx.servers, &self.view, &self.search, self.view_sort).into_boxed_slice();
-            // The rows a drag may lift or land on: this tab's display rows
-            // without the chain hops, and for every display index the count
-            // of seed rows before it. Both are derived with the row list so a
-            // drag reads them in O(1) instead of filtering and scanning every
-            // row on each frame of the gesture.
-            let mut seeds = Vec::with_capacity(rows.len());
-            let mut seeds_before = Vec::with_capacity(rows.len() + 1);
-            for &index in &rows {
-                seeds_before.push(seeds.len());
-                if !emitted.chain_only.contains(&index) {
-                    seeds.push(index);
-                }
-            }
-            seeds_before.push(seeds.len());
-            // A row can move only inside its own block, and only when that
-            // block holds another movable sibling. The active route is its
-            // own block (the generated order pins it first), so it can never
-            // move; a chain hop is not a place in its group either.
-            let active_index = ctx
-                .servers
-                .active
-                .as_deref()
-                .and_then(|id| profiles.iter().position(|profile| profile.id == id));
-            let mut drag_movable = vec![false; rows.len()];
-            if self.view == ServerTab::Emitted {
-                for (display, &index) in rows.iter().enumerate() {
-                    if emitted.chain_only.contains(&index) || Some(index) == active_index {
-                        continue;
-                    }
-                    let group = profiles[index].group_id();
-                    drag_movable[display] = seeds.iter().any(|&other| {
-                        other != index
-                            && Some(other) != active_index
-                            && profiles[other].group_id() == group
-                    });
-                }
-            }
-            self.tab_rows_cache = Some(TabRowsCache {
+            self.tab_rows = Some(std::rc::Rc::new(TabRows::rebuild(
                 generation,
-                tab: self.view.clone(),
-                search: self.search.clone(),
-                sort: self.view_sort,
-                rows: std::rc::Rc::from(rows),
-                seeds: std::rc::Rc::from(seeds.into_boxed_slice()),
-                seeds_before: std::rc::Rc::from(seeds_before.into_boxed_slice()),
-                drag_movable: std::rc::Rc::from(drag_movable.into_boxed_slice()),
-            });
+                self.view.clone(),
+                &self.search,
+                self.view_sort,
+                ctx.servers,
+                &emitted,
+            )));
         }
-        let display_rows = std::rc::Rc::clone(
-            &self
-                .tab_rows_cache
+        let tab_rows = std::rc::Rc::clone(
+            self.tab_rows
                 .as_ref()
-                .expect("the tab rows were cached above")
-                .rows,
+                .expect("the tab rows were built above"),
         );
-        let seed_rows = std::rc::Rc::clone(
-            &self
-                .tab_rows_cache
-                .as_ref()
-                .expect("the tab rows were cached above")
-                .seeds,
-        );
-        let seeds_before = std::rc::Rc::clone(
-            &self
-                .tab_rows_cache
-                .as_ref()
-                .expect("the tab rows were cached above")
-                .seeds_before,
-        );
-        let drag_movable = std::rc::Rc::clone(
-            &self
-                .tab_rows_cache
-                .as_ref()
-                .expect("the tab rows were cached above")
-                .drag_movable,
-        );
+        let display_rows = tab_rows.rows();
         // A row the tab no longer shows — filtered out, or gone with its
         // group — leaves the selection before any command reads it. Only the
         // row list's own rebuild can change which rows are visible, so the
         // sweep rides on it instead of running selection × rows every frame.
         if stale_rows {
             self.selection
-                .retain_visible(VisibleRows::new(&display_rows, profiles));
+                .retain_visible(VisibleRows::new(display_rows, profiles));
         }
-        // One clone per frame instead of a lookup per row: the menu's switch
-        // label asks which selected rows are locked, and the route is one of
-        // the two locks.
-        let active_id = ctx.servers.active.clone();
         let endpoint_hidden = ctx.settings.hide_server_info && !self.revealed_list;
         // Whether a row took the pointer's primary click this frame: a click
         // the rows did not take falls to the empty space below them and
@@ -4862,39 +4777,15 @@ impl ServersScreen {
                                 .then(|| ui.input(|i| i.pointer.interact_pos()))
                                 .flatten()
                                 .filter(|pos| viewport.contains(*pos));
-                            // The generated order pins the active server first, so its
-                            // row is a block of its own and accepts no drop.
-                            let active_index = ctx.servers.active.as_deref().and_then(|id| {
-                                profiles.iter().position(|profile| profile.id == id)
-                            });
-                            // A hop row is a consequence of the chain, not a place in
-                            // its group, so it neither lifts nor receives a drop: the
-                            // block algorithm reads the seed rows alone, and both the
-                            // seed list and the per-display seed count were derived
-                            // with the row cache, so a drag frame reads them instead
-                            // of filtering and scanning every row.
-                            let drag_rows: Option<&[usize]> = lifted.map(|_| seed_rows.as_ref());
-                            let seed_position = |display: usize| {
-                                seeds_before
-                                    .get(display)
-                                    .copied()
-                                    .unwrap_or(seeds_before.len())
-                            };
-                            let map_drop = |from: usize, gap: usize| {
-                                let rows = drag_rows?;
-                                block_drop(
-                                    rows,
-                                    profiles,
-                                    active_index,
-                                    seed_position(from),
-                                    seed_position(gap),
-                                )
-                            };
-                            // Only a gap inside the lifted row's own block proposes a
-                            // drop: another group's block would silently rewrite the
-                            // wrong group's row order.
+                            // A hop row never lifts and the pinned route is a
+                            // block of its own, so the drop mapping lives in
+                            // [`TabRows`], which derived the seed rows and
+                            // their per-display count with the row list. Only
+                            // a gap inside the lifted row's own block proposes
+                            // a drop: another group's block would silently
+                            // rewrite the wrong group's row order.
                             let droppable = |gap: usize| {
-                                lifted.is_some_and(|from| map_drop(from, gap).is_some())
+                                lifted.is_some_and(|from| tab_rows.drop_target(from, gap).is_some())
                             };
                             let mut drop_mark: Option<(usize, f32)> = None;
                             // Whether the row under the pointer already named the
@@ -4903,23 +4794,19 @@ impl ServersScreen {
                             let mut gap_decided = false;
                             let mut last_row_bottom: Option<f32> = None;
                             for display in rows {
-                                let index = display_rows[display];
-                                let p = &profiles[index];
+                                let facts = tab_rows.facts(display);
+                                let p = &profiles[facts.profile];
                                 let is_sel = self.selection.contains(p.id.as_str());
                                 // The neighbours decide where the selection band
                                 // opens and closes: the outline omits an edge shared
                                 // with another selected row.
                                 let selected_at = |position: usize| {
-                                    display_rows.get(position).is_some_and(|&other| {
+                                    tab_rows.rows().get(position).is_some_and(|&other| {
                                         self.selection.contains(profiles[other].id.as_str())
                                     })
                                 };
                                 let joined_above = display > 0 && selected_at(display - 1);
                                 let joined_below = selected_at(display + 1);
-                                let is_active =
-                                    ctx.servers.active.as_deref() == Some(p.id.as_str());
-                                let row_movable =
-                                    drag_movable.get(display).copied().unwrap_or(false);
                                 // Latency badge text is memoized per profile:
                                 // formatting runs only when the row's latency,
                                 // the language, or the theme palette moved — a
@@ -4963,45 +4850,31 @@ impl ServersScreen {
                                         endpoint_hidden,
                                         verdict: p.verdict.as_ref(),
                                         extras: RowExtras {
-                                            order: shape.order.then_some(display + 1),
-                                            group: shape.group.then_some(p.group_title.as_str()),
+                                            order: facts.order,
+                                            group: facts.group.then_some(p.group_title.as_str()),
                                         },
                                     },
                                     RowState {
                                         selected: is_sel,
                                         joined_above,
                                         joined_below,
-                                        active: is_active,
-                                        hop: emitted.chain_only.contains(&index),
-                                        movable: drag_movable
-                                            .get(display)
-                                            .copied()
-                                            .unwrap_or(false),
-                                        dialers: if emitted.chain_only.contains(&index) {
-                                            emitted
-                                                .dialers
-                                                .get(&index)
-                                                .map(Vec::as_slice)
-                                                .unwrap_or(&[])
-                                        } else {
-                                            // An enabled server that others dial through
-                                            // is a seed, not a hop: the note belongs to
-                                            // the row that exists only for the chain.
-                                            &[]
-                                        },
+                                        active: facts.active,
+                                        hop: facts.hop,
+                                        movable: facts.movable,
+                                        dialers: facts.dialers,
                                         frozen: probe_pending,
                                         switch: RowSwitch {
                                             // The active server and a chain-only hop
                                             // are in the generated document whatever
-                                            // their own switch says, so both render
+                                            // their own switch says: both render
                                             // checked and locked.
-                                            checked: is_active
-                                                || p.enabled
-                                                || emitted.chain_only.contains(&index),
-                                            locked_hint: if is_active {
-                                                Some(t(lang, Key::SrvActiveAlwaysEmitted))
-                                            } else if emitted.chain_only.contains(&index) {
-                                                Some(t(lang, Key::SrvChainOnlyHint))
+                                            checked: p.enabled || facts.locked,
+                                            locked_hint: if facts.locked {
+                                                Some(if facts.active {
+                                                    t(lang, Key::SrvActiveAlwaysEmitted)
+                                                } else {
+                                                    t(lang, Key::SrvChainOnlyHint)
+                                                })
                                             } else {
                                                 None
                                             },
@@ -5027,7 +4900,7 @@ impl ServersScreen {
                                 if clicks.row.drag_started_by(egui::PointerButton::Primary)
                                     && !probe_pending
                                     && !modified
-                                    && row_movable
+                                    && facts.movable
                                 {
                                     egui::DragAndDrop::set_payload(ui.ctx(), DragRow(display));
                                 }
@@ -5124,14 +4997,13 @@ impl ServersScreen {
                                     // nor whether the item can act.
                                     let mut has_unlocked = false;
                                     let mut any_unlocked_off = false;
-                                    for (index, profile) in profiles.iter().enumerate() {
+                                    for (position, _) in tab_rows.rows().iter().enumerate() {
+                                        let other = tab_rows.facts(position);
+                                        let profile = &profiles[other.profile];
                                         if !self.selection.contains(&profile.id) {
                                             continue;
                                         }
-                                        let locked = active_id.as_deref()
-                                            == Some(profile.id.as_str())
-                                            || emitted.chain_only.contains(&index);
-                                        if locked {
+                                        if other.locked {
                                             continue;
                                         }
                                         has_unlocked = true;
@@ -5196,12 +5068,9 @@ impl ServersScreen {
                                 })
                                 && let Some(lifted) =
                                     egui::DragAndDrop::take_payload::<DragRow>(ui.ctx())
-                                && let Some(drop) = map_drop(lifted.0, gap)
+                                && let Some((from, before)) = tab_rows.drop_target(lifted.0, gap)
                             {
-                                action = Some(ListAction::MoveInGroup {
-                                    from: drop.from,
-                                    before: drop.before,
-                                });
+                                action = Some(ListAction::MoveInGroup { from, before });
                             }
                             // The insertion line paints over the rows, clamped into
                             // the viewport so a band-edge drop stays visible.
@@ -5322,11 +5191,11 @@ impl ServersScreen {
             Some(ListAction::ToggleSelection(id)) => self.selection.toggle(&id),
             Some(ListAction::ExtendSelection(id)) => {
                 self.selection
-                    .extend(&id, VisibleRows::new(&display_rows, profiles));
+                    .extend(&id, VisibleRows::new(display_rows, profiles));
             }
             Some(ListAction::SelectAllVisible) => {
                 self.selection
-                    .select_all(VisibleRows::new(&display_rows, profiles));
+                    .select_all(VisibleRows::new(display_rows, profiles));
             }
             Some(ListAction::ClearSelection) => self.selection.clear(),
             Some(ListAction::ProbeLatency(id)) => {
@@ -5335,7 +5204,7 @@ impl ServersScreen {
                 // multi-selection probes the whole selection.
                 let ids = if self.selection.len() > 1 {
                     self.selection
-                        .ids_in_order(VisibleRows::new(&display_rows, profiles))
+                        .ids_in_order(VisibleRows::new(display_rows, profiles))
                 } else {
                     vec![id]
                 };
@@ -5347,7 +5216,7 @@ impl ServersScreen {
                 // names the target count, even when the target is one row.
                 let selected = self
                     .selection
-                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
+                    .ids_in_order(VisibleRows::new(display_rows, profiles));
                 let ids = if selected.is_empty() {
                     display_rows
                         .iter()
@@ -5361,25 +5230,25 @@ impl ServersScreen {
             Some(ListAction::SetSelectionEnabled(enabled)) => {
                 let ids = self
                     .selection
-                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
+                    .ids_in_order(VisibleRows::new(display_rows, profiles));
                 self.set_selected_enabled(ctx, &ids, enabled);
             }
             Some(ListAction::ExportSelection) => {
                 let ids = self
                     .selection
-                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
+                    .ids_in_order(VisibleRows::new(display_rows, profiles));
                 self.export_rows(ui, ctx, lang, &ids);
             }
             Some(ListAction::CopySelection) => {
                 let ids = self
                     .selection
-                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
+                    .ids_in_order(VisibleRows::new(display_rows, profiles));
                 self.open_copy_dialog(&ids, ctx.servers);
             }
             Some(ListAction::DeleteSelection) => {
                 let ids = self
                     .selection
-                    .ids_in_order(VisibleRows::new(&display_rows, profiles));
+                    .ids_in_order(VisibleRows::new(display_rows, profiles));
                 self.open_delete_dialog(ctx.servers, ctx.settings, lang, ids);
             }
             Some(ListAction::Duplicate(id)) => {
@@ -5531,17 +5400,24 @@ impl ServersScreen {
             return (0, 0);
         }
         let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
-        let emitted = ctx.servers.emitted_set();
-        let active = ctx.servers.active.clone();
+        // The rows own the lock rule: the active route and a chain-only hop
+        // are in the generated document whatever their own switch says. The
+        // commands only ever target rows the current tab shows.
+        let mut locked = std::collections::HashSet::new();
+        if let Some(rows) = self.tab_rows.as_ref() {
+            for (display, &profile) in rows.rows().iter().enumerate() {
+                if rows.facts(display).locked {
+                    locked.insert(profile);
+                }
+            }
+        }
         let mut changed = 0;
         let mut skipped = 0;
         for (index, profile) in ctx.servers.profiles.iter_mut().enumerate() {
             if !wanted.contains(profile.id.as_str()) {
                 continue;
             }
-            let locked = active.as_deref() == Some(profile.id.as_str())
-                || emitted.chain_only.contains(&index);
-            if locked {
+            if locked.contains(&index) {
                 skipped += 1;
                 continue;
             }
@@ -6887,65 +6763,6 @@ const DRAG_HANDLE: &str = "⠿";
 const DRAG_SCROLL_EDGE: f32 = 32.0;
 const DRAG_SCROLL_MAX_SPEED: f32 = 600.0;
 
-/// The stored move one `Emitted` drop asks for: the dragged profile and the
-/// sibling inside the same group it lands ahead of. `before: None` lands it at
-/// its block's tail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BlockDrop {
-    from: usize,
-    before: Option<usize>,
-}
-
-/// Map a drop on the `Emitted` list to a move inside the dragged row's own
-/// group block. `rows` is the list as drawn with the hop rows left out — a
-/// hop is a consequence of the chain, not a place in its group — as profile
-/// indices, `from` and `gap` index that list the way [`reorder_target`] reads
-/// them, and `active` is the profile the generated order pins first — that
-/// row is a block of its own and accepts no drop.
-///
-/// A gap whose neighbours are both another group's rows yields `None`, so a
-/// drop outside the row's block neither paints an insertion line nor changes
-/// the stored order. At a block boundary the gap belongs to the block on the
-/// other side; when the lifted row's block owns that side, the row goes to the
-/// block's tail, because the next row belongs to the following block.
-/// [`move_profile_in_group`](crate::model::ServersFile::move_profile_in_group)
-/// is what then refuses a destination the view alone could not spot.
-fn block_drop(
-    rows: &[usize],
-    profiles: &[ServerProfile],
-    active: Option<usize>,
-    from: usize,
-    gap: usize,
-) -> Option<BlockDrop> {
-    let &from_profile = rows.get(from)?;
-    if Some(from_profile) == active || gap == from || gap == from + 1 {
-        return None;
-    }
-    let group = profiles.get(from_profile)?.group_id();
-    // The lifted row is not a place to land; the gaps beside it are no-ops.
-    let in_block = |display: usize| {
-        rows.get(display).is_some_and(|&index| {
-            index != from_profile
-                && Some(index) != active
-                && profiles
-                    .get(index)
-                    .is_some_and(|profile| profile.group_id() == group)
-        })
-    };
-    let previous = gap.checked_sub(1);
-    let next = (gap < rows.len()).then_some(gap);
-    if !previous.is_some_and(in_block) && !next.is_some_and(in_block) {
-        return None;
-    }
-    let before = next
-        .filter(|&display| in_block(display))
-        .map(|display| rows[display]);
-    Some(BlockDrop {
-        from: from_profile,
-        before,
-    })
-}
-
 /// Where a dragged row lands: `gap` indexes the list as drawn, so a gap past
 /// the row's own slot shifts down one once the row is lifted out; the two
 /// gaps adjacent to its slot are no-ops.
@@ -6987,77 +6804,6 @@ fn row_detail(profile: &crate::model::ServerProfile) -> RowDetail {
     RowDetail {
         protocol,
         endpoint: profile.server_address().unwrap_or_default(),
-    }
-}
-
-/// One tab's rows as profile indices, in view order: the emitted set in
-/// generated order, one group's rows in stored order, or every row in grouped
-/// order for `All`. `search` filters by name or address, case-insensitively,
-/// and only inside this tab. `sort` is a view over the rows — except on
-/// `Emitted`, whose order is the outbound order and is never sorted here.
-fn tab_rows(
-    servers: &crate::model::ServersFile,
-    tab: &ServerTab,
-    search: &str,
-    sort: Option<ViewSort>,
-) -> Vec<usize> {
-    let needle = search.trim().to_lowercase();
-    let group_members = |group_id: &str| -> Vec<usize> {
-        servers
-            .profiles
-            .iter()
-            .enumerate()
-            .filter(|(_, profile)| profile.group_id() == group_id)
-            .map(|(index, _)| index)
-            .collect()
-    };
-    let mut rows: Vec<usize> = match tab {
-        ServerTab::Emitted => servers.emitted_set().order,
-        ServerTab::All => servers.grouped_order(),
-        ServerTab::Manual => group_members(crate::model::servers::MANUAL_GROUP_ID),
-        ServerTab::Group(id) => group_members(id),
-    };
-    rows.retain(|&index| {
-        if needle.is_empty() {
-            return true;
-        }
-        let profile = &servers.profiles[index];
-        profile.name.to_lowercase().contains(&needle)
-            || profile
-                .server_address()
-                .is_some_and(|address| address.to_lowercase().contains(&needle))
-    });
-    if *tab != ServerTab::Emitted
-        && let Some(sort) = sort
-    {
-        sort_view_rows(&mut rows, &servers.profiles, sort);
-    }
-    rows
-}
-
-/// Sort a tab's row indices by one column, ascending or descending. The
-/// stored order is untouched; only the view's row list moves.
-fn sort_view_rows(rows: &mut [usize], profiles: &[crate::model::ServerProfile], sort: ViewSort) {
-    match sort.column {
-        SortColumn::Name => rows.sort_by_cached_key(|&index| profiles[index].name.to_lowercase()),
-        SortColumn::Protocol => {
-            rows.sort_by_cached_key(|&index| profiles[index].outbound.protocol.as_str().to_owned());
-        }
-        SortColumn::Latency => {
-            rows.sort_by_cached_key(|&index| {
-                match profiles[index]
-                    .verdict
-                    .as_ref()
-                    .and_then(ProbeVerdict::delay_ms)
-                {
-                    Some(value) => (0u8, value),
-                    None => (1u8, i64::MAX),
-                }
-            });
-        }
-    }
-    if !sort.ascending {
-        rows.reverse();
     }
 }
 
