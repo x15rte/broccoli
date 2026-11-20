@@ -146,11 +146,11 @@ pub(crate) struct PreparedSet {
 }
 
 impl PreparedSet {
-    /// Build the request's working file: move the caller's file in, stand in
-    /// for every row the model's profile-set pass blocks on that is not one of
-    /// `candidates`, and assert the result. The assertion costs one extra
-    /// model pass for the whole request — never one per candidate — and is
-    /// the contract this type exists for.
+    /// Build the request's working file: move the caller's file in and stand
+    /// in for every row the model's profile-set pass blocks on that is not one
+    /// of `candidates`. One model pass decides the stand-in set for the whole
+    /// request; [`Self::stage`] checks the contract against the file each
+    /// candidate is generated from.
     fn build(mut servers: ServersFile, candidates: &[ServerProfile]) -> Self {
         let blocked = blocking_profile_numbers(&servers.profiles, servers.active.as_deref());
         let candidate_numbers: BTreeSet<usize> = servers
@@ -167,15 +167,22 @@ impl PreparedSet {
         let neutralized: BTreeSet<usize> =
             blocked.difference(&candidate_numbers).copied().collect();
         // Rows that stay real keep their generated tags and ids first, so a
-        // stand-in never takes a tag or id a live row still answers to.
+        // stand-in never takes a tag or id a live row still answers to. A
+        // candidate's row is replaced by the incoming profile when it is
+        // staged, so the tag it will hold — not the stored one — is what a
+        // stand-in must avoid and what a chain or routing rule may name.
         let mut claimed_tags = BTreeSet::new();
         let mut claimed_ids = BTreeSet::new();
         for (index, profile) in servers.profiles.iter().enumerate() {
             if neutralized.contains(&(index + 1)) {
                 continue;
             }
-            claimed_tags.insert(profile.tag());
-            claimed_ids.insert(profile.id.clone());
+            let incoming = candidates
+                .iter()
+                .find(|candidate| candidate.id == profile.id)
+                .unwrap_or(profile);
+            claimed_tags.insert(incoming.tag());
+            claimed_ids.insert(incoming.id.clone());
         }
         for number in &neutralized {
             let original = &servers.profiles[number - 1];
@@ -190,13 +197,6 @@ impl PreparedSet {
             claimed_ids.insert(stand_in.id.clone());
             servers.profiles[number - 1] = stand_in;
         }
-        debug_assert!(
-            blocking_profile_numbers(&servers.profiles, servers.active.as_deref())
-                .iter()
-                .all(|number| candidate_numbers.contains(number)),
-            "PreparedSet::build must leave no blocking finding on a profile it did not stand in \
-             for: a stand-in lost its identity or an unnamed row's tag is still referenced"
-        );
         Self {
             servers: Arc::new(servers),
         }
@@ -205,8 +205,29 @@ impl PreparedSet {
     /// Stage `profile` into the working file in place — replace the entry with
     /// the same id, else append ([`stage_profile`]) — and hand back the undo
     /// record a rejection applies.
+    ///
+    /// The staged file is the one the generator reads, so this is where the
+    /// type's contract is checked: no row but the candidate's own may carry a
+    /// blocking finding. A debug-only model pass pays for it; the build cannot
+    /// check it, because before staging the candidate still holds its stored
+    /// tag and a duplicate is expected to dissolve when it is replaced.
     fn stage(&mut self, profile: &ServerProfile) -> StagingUndo {
-        stage_profile(Arc::make_mut(&mut self.servers), profile)
+        let undo = stage_profile(Arc::make_mut(&mut self.servers), profile);
+        debug_assert!(
+            {
+                let file = &*self.servers;
+                let own = file
+                    .profiles
+                    .iter()
+                    .position(|row| row.id == profile.id)
+                    .map(|index| index + 1);
+                blocking_profile_numbers(&file.profiles, file.active.as_deref())
+                    .iter()
+                    .all(|number| Some(*number) == own)
+            },
+            "PreparedSet::stage left a sibling blocking after the candidate was staged"
+        );
+        undo
     }
 
     /// Revert a rejected candidate's staging, restoring the file the
@@ -1183,6 +1204,43 @@ mod tests {
             import_profile("duplicate", "0123456789abcdef"),
             import_profile("duplicate", "fedcba9876543210"),
         ]);
+    }
+
+    #[test]
+    fn a_renamed_duplicate_keeps_the_tag_a_chain_still_names() {
+        // Two rows generate one tag and the candidate is one of them, renamed
+        // to break the duplicate. The sibling must keep the tag: it is the row
+        // that carries it once the candidate is staged under its new name, and
+        // a chain through that tag would otherwise lose its target.
+        let first = import_profile("duplicate", "0123456789abcdef");
+        let second = import_profile("duplicate", "fedcba9876543210");
+        let mut dialer = import_profile("dial-through", "0011223344556677");
+        dialer.outbound.chain_via(first.tag());
+        let servers = ServersFile {
+            profiles: vec![first.clone(), second, dialer],
+            active: Some(first.id.clone()),
+            ..ServersFile::default()
+        };
+        let mut renamed = first.clone();
+        renamed.name = "duplicate fixed".into();
+
+        let mut prepared = PreparedSet::build(servers, std::slice::from_ref(&renamed));
+        prepared.stage(&renamed);
+
+        crate::r#gen::generate(&prepared.servers, &Settings::default()).unwrap_or_else(|error| {
+            panic!(
+                "a renamed duplicate must not orphan a chain to its tag: {}",
+                error.text(Language::En)
+            )
+        });
+        assert!(
+            prepared
+                .servers
+                .profiles
+                .iter()
+                .any(|profile| profile.tag() == first.tag()),
+            "the tag the chain names must survive the rename"
+        );
     }
 
     #[test]
