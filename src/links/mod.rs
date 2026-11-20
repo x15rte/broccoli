@@ -90,10 +90,12 @@
 
 pub mod body;
 pub mod convert;
+pub mod import;
 
-pub use body::{
-    BodyEntry, BodyParse, BodyRefusal, CompatibilityParameter, IgnoredSection, content_key,
-    decode_whole_body, identity_key, origin_for, parse_body, parse_body_cancellable,
+pub use body::{CompatibilityParameter, content_key, decode_whole_body, identity_key, origin_for};
+pub use import::{
+    BatchRow, ImportBatch, ImportKind, ImportReason, ImportRecord, Preview, PreviewKind,
+    PreviewRow, parse_body, parse_body_cancellable,
 };
 
 use base64::Engine as _;
@@ -4635,9 +4637,9 @@ pub fn parse_link(s: &str) -> Result<ParsedLink, LinkError> {
 /// `#comment` lines are skipped. The whole blob is bounded by
 /// [`MAX_BULK_LEN`]; an oversized blob yields one `Malformed` error entry.
 ///
-/// A synchronous wrapper over [`parse_bulk_cancellable`], so the bulk cap and
-/// the skip rule have one implementation: the flag below is private to this
-/// function and nothing ever stores into it, so the walk always completes.
+/// An adapter over [`import::parse_body_cancellable`], so the bulk cap, the
+/// line walk and the skip rule have one implementation. Compatibility
+/// parameters travel with the profile they belong to.
 pub fn parse_bulk(text: &str) -> Vec<Result<ParsedLink, LinkError>> {
     static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
     parse_bulk_cancellable(text, &NEVER_CANCELLED)
@@ -4653,23 +4655,36 @@ pub fn parse_bulk_cancellable(
     text: &str,
     cancel: &AtomicBool,
 ) -> Option<Vec<Result<ParsedLink, LinkError>>> {
-    if text.len() > MAX_BULK_LEN {
-        return Some(vec![Err(malformed(
-            Diag::new(Key::LinkSubscriptionTooLarge)
-                .arg(text.len())
-                .arg(MAX_BULK_LEN),
-        ))]);
+    let batch = import::parse_body_cancellable(text, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
     }
     let mut parsed = Vec::new();
-    for line in text.lines() {
-        if cancel.load(Ordering::Relaxed) {
-            return None;
+    let mut pending = Vec::new();
+    for record in batch.records() {
+        match record.kind() {
+            ImportKind::Accepted => {
+                let profile = record
+                    .profile()
+                    .expect("an accepted record carries its profile");
+                parsed.push(Ok(ParsedLink {
+                    profile: profile.clone(),
+                    ignored: pending.drain(..).cloned().collect(),
+                }));
+            }
+            ImportKind::Refused => {
+                pending.clear();
+                if let Some(reason) = record.reason() {
+                    parsed.push(Err(reason.to_link_error()));
+                }
+            }
+            ImportKind::IgnoredParameter => {
+                if let Some(parameter) = record.parameter() {
+                    pending.push(parameter);
+                }
+            }
+            ImportKind::IgnoredSection => pending.clear(),
         }
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        parsed.push(parse_link(line));
     }
     Some(parsed)
 }

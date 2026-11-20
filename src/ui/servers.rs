@@ -1974,20 +1974,320 @@ enum LeaveDecision {
     Cancel,
 }
 
-/// What one import-preview row reports: a clean link, a link whose
-/// compatibility parameters were dropped, or a failed link. The kind only
-/// decides the row's color and tooltip.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImportPreviewKind {
-    Ok,
-    Warn,
-    Err,
+/// One delivered link-parse result: a cancelled parse is never delivered (the
+/// worker checks its stop flag before returning, and the request's receiver is
+/// dropped on cancel), so a delivered result always carries its batch for the
+/// paste it read.
+struct ImportParseResult {
+    source: String,
+    batch: links::ImportBatch,
 }
 
-/// One formatted import-preview row: the text the list paints and its kind.
-struct ImportPreviewRow {
+/// What the import session asks its owner to do once the frame is painted.
+enum ImportAsk {
+    /// Validate exactly these profiles through the existing
+    /// `CoreCmd::ValidateProfiles` request.
+    Validate(Vec<ServerProfile>),
+}
+
+/// One import dialog's whole lifecycle: the paste, its parse, the formatted
+/// preview, the parse worker and the profile-validation gate. The screen owns
+/// only whether the dialog exists ([`ServersScreen::import`]); the session
+/// owns everything inside it.
+struct ImportSession {
+    /// The group the batch lands in, captured when the dialog opened, so a
+    /// tab switch while the paste validates cannot retarget it.
+    target_group: String,
     text: String,
-    kind: ImportPreviewKind,
+    /// The batch for `parsed_source`.
+    parsed: Option<std::rc::Rc<links::ImportBatch>>,
+    parsed_source: Option<String>,
+    /// The formatted preview, built once per batch and language.
+    preview: Option<links::Preview>,
+    parse_job: Request<ImportParseResult>,
+    /// A refusal before parsing (size cap) or a worker failure; shown inline.
+    parse_error: Option<String>,
+    /// True between emitting [`ImportAsk::Validate`] and the verdict landing.
+    validating: bool,
+    /// The language the open dialog renders under; `frame` refreshes it, and
+    /// a language move rebuilds the preview once.
+    language: Language,
+    /// Whether the core is busy with another operation this frame: the
+    /// commit waits rather than replacing the operation.
+    core_busy: bool,
+    /// The paste changed since the last frame; the owner clears the previous
+    /// validation report.
+    edited: bool,
+}
+
+impl ImportSession {
+    /// Open a session whose batch lands in `target_group`, rendering in
+    /// `lang`.
+    fn open(target_group: String, lang: Language) -> Self {
+        Self {
+            target_group,
+            text: String::new(),
+            parsed: None,
+            parsed_source: None,
+            preview: None,
+            parse_job: Request::default(),
+            parse_error: None,
+            validating: false,
+            language: lang,
+            core_busy: false,
+            edited: false,
+        }
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn target_group(&self) -> &str {
+        &self.target_group
+    }
+
+    fn batch(&self) -> Option<&std::rc::Rc<links::ImportBatch>> {
+        self.parsed.as_ref()
+    }
+
+    /// Whether the current parse result came from the current paste.
+    fn preview_is_current(&self) -> bool {
+        self.parsed_source.as_deref() == Some(self.text.as_str())
+    }
+
+    /// Drop the parse result and its formatted preview. A source edit calls
+    /// this: a stale result must never paint under a new paste.
+    fn invalidate(&mut self) {
+        self.parsed = None;
+        self.parsed_source = None;
+        self.preview = None;
+    }
+
+    /// Parse the paste on a worker thread. Inputs over [`links::MAX_BULK_LEN`]
+    /// are refused up front with a message and never reach the worker.
+    fn start_parse(&mut self, repaint: egui::Context) {
+        self.parse_error = None;
+        self.invalidate();
+        if self.text.len() > links::MAX_BULK_LEN {
+            self.parse_error = Some(t_fmt(
+                self.language,
+                Key::SrvImportTooLarge,
+                &[&self.text.len(), &links::MAX_BULK_LEN],
+            ));
+            return;
+        }
+        let text = self.text.clone();
+        match Request::worker("broccoli-link-parse", &repaint, move |stop| {
+            // A cancelled parse is never delivered: the request drops the
+            // receiver, and this early return keeps the invariant that a
+            // delivered result always carries its batch.
+            let batch = links::parse_body_cancellable(&text, stop);
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            Some(ImportParseResult {
+                source: text,
+                batch,
+            })
+        }) {
+            Ok(job) => self.parse_job = job,
+            Err(error) => {
+                self.parse_error = Some(t_fmt(self.language, Key::SrvParseWorkerFailed, &[&error]));
+            }
+        }
+    }
+
+    /// Drain one finished parse result. A result whose paste changed while
+    /// the worker ran is discarded.
+    fn poll_parse(&mut self) {
+        let Some(terminal) = self.parse_job.poll() else {
+            return;
+        };
+        let result = match terminal {
+            Terminal::Answered(result) => result,
+            Terminal::Exited => {
+                self.parse_error =
+                    Some(t(self.language, Key::WorkerExitedWithoutResult).to_string());
+                return;
+            }
+        };
+        self.apply_result(result);
+    }
+
+    /// Adopt one parse result when it still belongs to the current paste.
+    fn apply_result(&mut self, result: ImportParseResult) {
+        if result.source != self.text {
+            return;
+        }
+        self.parsed = Some(std::rc::Rc::new(result.batch));
+        self.parsed_source = Some(result.source);
+        self.preview = None;
+    }
+
+    /// The formatted preview for the session's language, built once and
+    /// reused until the batch or the language moves. A paste with tens of
+    /// thousands of entries formats its rows here, never inside the paint
+    /// loop.
+    fn preview(&mut self) -> Option<&links::Preview> {
+        if self
+            .preview
+            .as_ref()
+            .is_none_or(|preview| preview.language != self.language)
+        {
+            self.preview = self
+                .parsed
+                .as_ref()
+                .map(|batch| batch.preview(self.language));
+        }
+        self.preview.as_ref()
+    }
+
+    /// Stop the in-flight parse. The receiver is dropped, so a late result
+    /// finds no listener.
+    fn cancel_parse(&mut self) {
+        self.parse_job.cancel();
+    }
+
+    /// Close the session: the caller drops it, and any parse still running
+    /// stops before its result could be applied.
+    fn close(mut self) {
+        self.cancel_parse();
+    }
+
+    /// The commit asks for exactly the profiles the current batch accepted.
+    fn validation_request(&self) -> Option<Vec<ServerProfile>> {
+        if !self.preview_is_current() {
+            return None;
+        }
+        let batch = self.parsed.as_ref()?;
+        Some(
+            batch
+                .entries()
+                .into_iter()
+                .map(|entry| entry.profile.clone())
+                .collect(),
+        )
+    }
+
+    /// Clear the in-flight flag when the verdict lands (or fails to start).
+    fn finish_validation(&mut self) {
+        self.validating = false;
+    }
+
+    /// Whether the paste moved since the last frame. The owner clears the
+    /// previous validation report once.
+    fn take_edited(&mut self) -> bool {
+        std::mem::take(&mut self.edited)
+    }
+
+    /// Paint the dialog body and poll the parse worker. Returns the ask the
+    /// caller routes; `popup::show` and the window's own existence stay at
+    /// the caller.
+    fn frame(&mut self, ui: &mut egui::Ui, lang: Language) -> Option<ImportAsk> {
+        self.language = lang;
+        self.poll_parse();
+        let mut ask = None;
+        let validating = self.validating;
+        ui.add_enabled_ui(!validating, |ui| {
+            ui.label(t(lang, Key::SrvImportHint));
+            let source_changed = ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.text)
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(t(lang, Key::SrvImportPasteHint)),
+                )
+                .on_hover_text(t(lang, Key::SrvPasteCtrlV))
+                .changed();
+            if source_changed {
+                self.invalidate();
+                self.parse_error = None;
+                self.edited = true;
+                self.cancel_parse();
+            }
+            if ui
+                .add_enabled(
+                    !self.parse_job.is_pending() && !self.text.is_empty(),
+                    egui::Button::new(t(lang, Key::SrvParse)),
+                )
+                .clicked()
+            {
+                self.start_parse(ui.ctx().clone());
+            }
+            if self.parse_job.is_pending() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(t(lang, Key::SrvParsingLinks));
+                    if ui.button(t(lang, Key::Cancel)).clicked() {
+                        self.cancel_parse();
+                    }
+                });
+            }
+            if let Some(message) = &self.parse_error {
+                ui.colored_label(status_colors_of(ui).err, message);
+            }
+            if self.preview_is_current() {
+                let Some(preview) = self.preview() else {
+                    return;
+                };
+                if preview.rows.is_empty() {
+                    return;
+                }
+                let ok = preview.ok;
+                ui.label(t_fmt(lang, Key::SrvOkTotal, &[&ok, &preview.rows.len()]));
+                // One truncated line per entry, laid out only for the rows
+                // the scroll viewport shows: a subscription paste can hold
+                // tens of thousands of links, and egui lays out every child
+                // of a plain `show`. The full text stays reachable as the
+                // row's tooltip.
+                let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                egui::ScrollArea::vertical().max_height(140.0).show_rows(
+                    ui,
+                    row_height,
+                    preview.rows.len(),
+                    |ui, rows| {
+                        let colors = status_colors_of(ui);
+                        for row in &preview.rows[rows] {
+                            let text = match row.kind {
+                                links::PreviewKind::Ok => RichText::new(row.text.as_str()),
+                                links::PreviewKind::Warn => {
+                                    RichText::new(row.text.as_str()).color(colors.warn)
+                                }
+                                links::PreviewKind::Err => {
+                                    RichText::new(row.text.as_str()).color(colors.err)
+                                }
+                            };
+                            let response = ui.add(egui::Label::new(text).truncate());
+                            if row.kind != links::PreviewKind::Ok {
+                                response.on_hover_text(row.text.as_str());
+                            }
+                        }
+                    },
+                );
+                if self.core_busy {
+                    ui.colored_label(
+                        status_colors_of(ui).warn,
+                        t(lang, Key::SrvWaitCoreOperationImports),
+                    );
+                }
+                if ok > 0
+                    && ui
+                        .add_enabled(
+                            !self.core_busy,
+                            egui::Button::new(t_fmt(lang, Key::SrvValidateAndAddServers, &[&ok])),
+                        )
+                        .on_hover_text(t(lang, Key::SrvValidateAndAddServersHint))
+                        .clicked()
+                    && let Some(profiles) = self.validation_request()
+                {
+                    self.validating = true;
+                    ask = Some(ImportAsk::Validate(profiles));
+                }
+            }
+        });
+        ask
+    }
 }
 
 /// Memoized pretty print of one preserved over-limit `downloadSettings`
@@ -2002,20 +2302,6 @@ struct OverLimitJson {
     /// text is refilled on every such call and never reused.
     key: Option<(ToolTarget, u32, Language)>,
     text: String,
-}
-
-/// The import dialog's formatted preview, built once per parse result and per
-/// language. The paste cap allows a subscription blob with tens of thousands
-/// of entries, so formatting a row inside the paint loop would make the frame
-/// cost scale with the paste; the rows are also painted through a virtualized
-/// list, so only the ones on screen are laid out. Rebuilt (not validated) when
-/// `import_parsed` changes — both writers of that vector clear this slot.
-struct ImportPreview {
-    lang: Language,
-    /// How many entries parsed into a profile: the count the caption and the
-    /// "validate and add" gate read.
-    ok: usize,
-    rows: Vec<ImportPreviewRow>,
 }
 
 /// What the server table shows: one of the three default views or one group.
@@ -2302,7 +2588,7 @@ impl ProfileJsonView {
 /// the last refresh, or the off-thread parse of the persisted snapshot.
 struct SubscriptionView {
     group: String,
-    parse: Option<std::rc::Rc<links::BodyParse>>,
+    parse: Option<std::rc::Rc<links::ImportBatch>>,
     /// The snapshot revision `parse` came from. The revision, not the display
     /// second, identifies a capture: two refreshes inside one second stay
     /// distinct.
@@ -2329,7 +2615,7 @@ struct SubscriptionView {
 struct SubscriptionParseResult {
     group: String,
     revision: u64,
-    parsed: links::BodyParse,
+    parsed: links::ImportBatch,
 }
 
 #[derive(Default)]
@@ -2414,11 +2700,10 @@ pub struct ServersScreen {
     /// hides it again. It is not the editor's reveal: the list shows no
     /// credentials.
     revealed_list: bool,
-    import_open: bool,
-    import_text: String,
-    /// The group a paste or converted batch lands in: the group the tab that
-    /// opened the import dialog owns.
-    import_group: Option<String>,
+    /// The one import lifecycle: the paste, its parse, the preview and the
+    /// parse job, all owned by the open dialog. `None` means the dialog is
+    /// closed.
+    import: Option<ImportSession>,
     group_dialog: Option<GroupDraft>,
     /// The one in-flight refresh; the group it targets travels with the
     /// result.
@@ -2428,13 +2713,6 @@ pub struct ServersScreen {
     subscription_fetch_group: Option<String>,
     /// A group awaiting delete confirmation.
     group_delete_pending: Option<String>,
-    import_parsed: Vec<Result<links::ParsedLink, String>>,
-    import_parsed_source: Option<String>,
-    import_refusals: Vec<(String, String)>,
-    import_ignored: usize,
-    /// The structured ignored rows of the last import parse: their
-    /// `parameter=value` key and bounded raw source travel into the report.
-    import_ignored_rows: Vec<crate::model::servers::ReportRow>,
     /// The report window on screen: its title, one refresh report, and the
     /// ignored rows grouped when it opened.
     report_view: Option<ReportView>,
@@ -2445,25 +2723,15 @@ pub struct ServersScreen {
     /// The last successful refresh's parse, kept for the session so the raw
     /// viewer opens without re-parsing. Keyed by the group and the snapshot
     /// revision the parse came from.
-    last_subscription_parse: Option<(String, u64, std::rc::Rc<links::BodyParse>)>,
+    last_subscription_parse: Option<(String, u64, std::rc::Rc<links::ImportBatch>)>,
     /// The in-flight off-thread parse of a persisted subscription snapshot.
     subscription_parse: Request<SubscriptionParseResult>,
     /// The group whose snapshot the in-flight parse belongs to.
     subscription_parse_group: Option<String>,
-    /// Formatted preview of `import_parsed` (see [`ImportPreview`]), built on
-    /// the first frame that shows it and reused until the parse result or the
-    /// language moves.
-    import_preview: Option<ImportPreview>,
     /// Pretty print of the preserved over-limit `downloadSettings` subtree of
     /// one draft (see [`Self::over_limit_json_for`]): the transport tab walks
     /// it every frame while the header is open.
     over_limit_json: Option<OverLimitJson>,
-    /// In-flight background parse of `import_text` (spawned on Parse click,
-    /// polled every frame in `show`); idle while none runs.
-    import_parse_job: Request<ImportParseResult>,
-    /// Rejection message for input refused before parsing (size cap), or a
-    /// worker failure; shown inline in the import dialog.
-    import_parse_error: Option<String>,
     qr_dialog: Option<QrDialog>,
     /// The Copy to group picker; `Some` while it is on screen.
     copy_dialog: Option<CopyDialog>,
@@ -2509,21 +2777,6 @@ pub struct ServersScreen {
     latency_probe: Request<LatencyProbeResult>,
     latency_probe_feedback: Option<(FeedbackLevel, String)>,
     profile_validation_report: Option<String>,
-}
-
-/// One delivered link-parse result: a cancelled parse is never delivered
-/// (the worker checks its stop flag before returning, and the request's
-/// receiver is dropped on cancel), so a delivered result always carries
-/// `parsed` for the paste it read.
-struct ImportParseResult {
-    source: String,
-    parsed: Vec<Result<links::ParsedLink, String>>,
-    /// Refused items with their raw text, for the report.
-    refused: Vec<(String, String)>,
-    ignored: usize,
-    /// The ignored sections/parameters, each already shaped as a report row
-    /// with its grouping key and bounded raw source.
-    ignored_rows: Vec<crate::model::servers::ReportRow>,
 }
 
 /// The New group dialog's fields: a kind choice, then the fields that kind
@@ -2675,165 +2928,6 @@ impl ServersScreen {
         self.outbound_settings.reset_transient();
     }
 
-    fn invalidate_import_preview(&mut self) {
-        self.import_parsed.clear();
-        self.import_parsed_source = None;
-        self.import_preview = None;
-    }
-
-    /// Format the import preview once for the current parse result and
-    /// language: the dialog paints it every frame, and the parsed list is as
-    /// large as the paste allows. A no-op while the cached preview's language
-    /// still stands — every path that replaces `import_parsed` clears the
-    /// slot, so the language is the only input this memo can go stale on.
-    fn refresh_import_preview(&mut self, lang: Language) {
-        if self
-            .import_preview
-            .as_ref()
-            .is_some_and(|preview| preview.lang == lang)
-        {
-            return;
-        }
-        let mut ok = 0;
-        let rows = self
-            .import_parsed
-            .iter()
-            .map(|result| match result {
-                Ok(parsed) => {
-                    ok += 1;
-                    let protocol = parsed.outbound.protocol.as_str();
-                    let joined: Vec<String> = parsed
-                        .ignored
-                        .iter()
-                        .map(links::CompatibilityParameter::key)
-                        .collect();
-                    if joined.is_empty() {
-                        ImportPreviewRow {
-                            text: t_fmt(lang, Key::SrvImportOkMark, &[&parsed.name, &protocol]),
-                            kind: ImportPreviewKind::Ok,
-                        }
-                    } else {
-                        let joined = joined.join(", ");
-                        ImportPreviewRow {
-                            text: t_fmt(
-                                lang,
-                                Key::SrvImportIgnoredMark,
-                                &[&parsed.name, &protocol, &joined],
-                            ),
-                            kind: ImportPreviewKind::Warn,
-                        }
-                    }
-                }
-                Err(error) => ImportPreviewRow {
-                    text: t_fmt(lang, Key::SrvImportErrMark, &[error]),
-                    kind: ImportPreviewKind::Err,
-                },
-            })
-            .collect();
-        self.import_preview = Some(ImportPreview { lang, ok, rows });
-    }
-
-    fn import_preview_is_current(&self) -> bool {
-        self.import_parsed_source.as_deref() == Some(self.import_text.as_str())
-    }
-
-    /// Parse the import buffer on a worker thread. Inputs over
-    /// [`links::MAX_BULK_LEN`] are refused up front with a message and never
-    /// reach the worker. The UI stays responsive; `poll_import_parse`
-    /// applies the result once it lands.
-    fn start_import_parse(&mut self, lang: Language, repaint: egui::Context) {
-        self.import_parse_error = None;
-        self.invalidate_import_preview();
-        if self.import_text.len() > links::MAX_BULK_LEN {
-            self.import_parse_error = Some(t_fmt(
-                lang,
-                Key::SrvImportTooLarge,
-                &[&self.import_text.len(), &links::MAX_BULK_LEN],
-            ));
-            return;
-        }
-        let text = self.import_text.clone();
-        match Request::worker("broccoli-link-parse", &repaint, move |stop| {
-            // A cancelled parse is never delivered: `cancel_import_parse`
-            // has already flipped the stop flag and dropped the receiver, so
-            // returning early keeps the invariant that a delivered result
-            // always carries `parsed`.
-            let mut body = links::parse_body_cancellable(&text, stop);
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return None;
-            }
-            let refused: Vec<(String, String)> = body
-                .refused
-                .iter()
-                .map(|refusal| (refusal.raw.clone(), refusal.error.clone()))
-                .collect();
-            let ignored = body.ignored.len();
-            let mut ignored_rows = Vec::new();
-            for section in &body.ignored {
-                crate::model::servers::push_report_row(&mut ignored_rows, section.report_row());
-            }
-            let mut parsed: Vec<Result<links::ParsedLink, String>> =
-                std::mem::take(&mut body.entries)
-                    .into_iter()
-                    .map(|entry| {
-                        Ok(links::ParsedLink {
-                            profile: entry.profile,
-                            ignored: entry.ignored,
-                        })
-                    })
-                    .collect();
-            parsed.extend(body.refused.into_iter().map(|refusal| Err(refusal.error)));
-            Some(ImportParseResult {
-                source: text,
-                parsed,
-                refused,
-                ignored,
-                ignored_rows,
-            })
-        }) {
-            Ok(job) => self.import_parse_job = job,
-            Err(error) => {
-                self.import_parse_error = Some(t_fmt(lang, Key::SrvParseWorkerFailed, &[&error]));
-            }
-        }
-    }
-
-    /// Drain one finished parse result per frame. Stale results (the paste
-    /// changed while the worker ran) are discarded; cancelled parses leave
-    /// the preview empty, and a worker that exited without a result surfaces
-    /// the generic failure text.
-    fn poll_import_parse(&mut self, lang: Language) {
-        let Some(terminal) = self.import_parse_job.poll() else {
-            return;
-        };
-        let result = match terminal {
-            Terminal::Answered(result) => result,
-            Terminal::Exited => {
-                self.import_parse_error = Some(t(lang, Key::WorkerExitedWithoutResult).to_string());
-                return;
-            }
-        };
-        if result.source != self.import_text {
-            // The user edited the paste while the worker ran; keep the
-            // preview invalidated instead of applying stale results.
-            return;
-        }
-        self.import_parsed = result.parsed;
-        self.import_refusals = result.refused;
-        self.import_ignored = result.ignored;
-        self.import_ignored_rows = result.ignored_rows;
-        self.import_parsed_source = Some(result.source);
-        // The formatted preview belongs to the previous result.
-        self.import_preview = None;
-    }
-
-    /// Request a cooperative stop of the in-flight parse and drop the job so
-    /// the busy indicator clears immediately. The request flips the worker's
-    /// stop flag and stops listening, so its result is never applied.
-    fn cancel_import_parse(&mut self) {
-        self.import_parse_job.cancel();
-    }
-
     /// Start one subscription refresh. The group's stored User-Agent wins
     /// when set; otherwise the global one is sent (an empty global value
     /// omits the header). The group's effective outbound path (its override,
@@ -2957,15 +3051,16 @@ impl ServersScreen {
                     refused: 1,
                     ..Default::default()
                 };
-                crate::model::servers::push_report_row(
-                    &mut report.rows,
-                    crate::model::servers::ReportRow {
-                        kind: crate::model::servers::ReportKind::Refused,
-                        name: error.to_string(),
-                        key: String::new(),
-                        raw: error.to_string(),
-                    },
-                );
+                report.push_row(crate::model::servers::ReportRow {
+                    kind: crate::model::servers::ReportKind::Refused,
+                    name: String::new(),
+                    key: String::new(),
+                    raw: error.to_string(),
+                    reason: Some(
+                        crate::model::servers::ReportReason::keyed(Key::SrvSubscriptionFetchFailed)
+                            .arg(error.to_string()),
+                    ),
+                });
                 let title = uictx.servers.groups[index].title.clone();
                 if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
                     subscription.report = Some(report.clone());
@@ -2976,27 +3071,24 @@ impl ServersScreen {
             }
             Ok(outcome) => {
                 let parsed = links::parse_body(&outcome.body);
-                if parsed.entries.is_empty() {
+                if parsed.is_empty() {
                     let mut report = crate::model::servers::RefreshReport {
                         at,
-                        refused: parsed.refused.len().max(1),
-                        ignored: parsed.ignored.len(),
                         ..Default::default()
                     };
-                    let mut rows = Vec::new();
-                    parsed.push_diagnostic_rows(&mut rows);
-                    if parsed.refused.is_empty() {
-                        crate::model::servers::push_report_row(
-                            &mut rows,
-                            crate::model::servers::ReportRow {
-                                kind: crate::model::servers::ReportKind::Refused,
-                                name: t(lang, Key::SrvSubscriptionEmpty).to_owned(),
-                                key: String::new(),
-                                raw: String::new(),
-                            },
-                        );
+                    parsed.extend_report(&mut report, lang);
+                    if parsed.refused_count() == 0 {
+                        report.refused += 1;
+                        report.push_row(crate::model::servers::ReportRow {
+                            kind: crate::model::servers::ReportKind::Refused,
+                            name: String::new(),
+                            key: String::new(),
+                            raw: String::new(),
+                            reason: Some(crate::model::servers::ReportReason::keyed(
+                                Key::SrvSubscriptionEmpty,
+                            )),
+                        });
                     }
-                    report.rows = rows;
                     let title = uictx.servers.groups[index].title.clone();
                     let mut revision = None;
                     if let Some(subscription) = uictx.servers.groups[index].subscription.as_mut() {
@@ -3024,12 +3116,12 @@ impl ServersScreen {
                     return;
                 }
                 let entries: Vec<crate::model::servers::SubscriptionEntry> = parsed
-                    .entries
-                    .iter()
+                    .entries()
+                    .into_iter()
                     .map(|entry| crate::model::servers::SubscriptionEntry {
                         profile: entry.profile.clone(),
-                        content_key: links::body::content_key(&entry.profile),
-                        identity_key: links::body::identity_key(&entry.profile),
+                        content_key: links::body::content_key(entry.profile),
+                        identity_key: links::body::identity_key(entry.profile),
                     })
                     .collect();
                 let mut report = uictx.servers.refresh_subscription_group(
@@ -3037,12 +3129,10 @@ impl ServersScreen {
                     &result.group_id,
                     entries,
                 );
-                report.refused = parsed.refused.len();
-                report.ignored = parsed.ignored.len();
-                parsed.push_diagnostic_rows(&mut report.rows);
+                parsed.extend_report(&mut report, lang);
                 let pick = |header: &str, key: &str| -> String {
                     if header.trim().is_empty() {
-                        parsed.comments.get(key).cloned().unwrap_or_default()
+                        parsed.comments().get(key).cloned().unwrap_or_default()
                     } else {
                         header.to_owned()
                     }
@@ -3269,8 +3359,13 @@ impl ServersScreen {
         // A raw override bypasses GUI outbounds entirely; disable it only in
         // this request-local scratch model so the staged profile is exercised.
         scratch_settings.raw_override = None;
-        let import_source =
-            (origin == ProfileValidationOrigin::Import).then(|| self.import_text.clone());
+        let import_source = (origin == ProfileValidationOrigin::Import)
+            .then(|| {
+                self.import
+                    .as_ref()
+                    .map(|session| session.text().to_owned())
+            })
+            .flatten();
         // One oneshot channel per request: the runtime sends the terminal
         // verdict back on the request's own reply and this screen adopts it
         // as the request's channel, polled per frame (the runtime pokes the
@@ -3320,6 +3415,11 @@ impl ServersScreen {
         };
         let origin = self.profile_validation_origin.take();
         self.profile_validation_count = 0;
+        if origin == Some(ProfileValidationOrigin::Import)
+            && let Some(session) = self.import.as_mut()
+        {
+            session.finish_validation();
+        }
         let result = match terminal {
             Terminal::Answered(Ok(result)) => result,
             Terminal::Answered(Err(error)) => {
@@ -3347,11 +3447,14 @@ impl ServersScreen {
             return;
         }
         if result.origin == ProfileValidationOrigin::Import
-            && result.import_source.as_deref() != Some(self.import_text.as_str())
+            && result.import_source.as_deref() != self.import.as_ref().map(|session| session.text())
         {
             let error = t(lang, Key::SrvDiscardedStaleImport).to_string();
             self.profile_validation_report = Some(error.clone());
             self.set_status(StatusLine::err(error));
+            if let Some(session) = self.import.as_mut() {
+                session.finish_validation();
+            }
             return;
         }
 
@@ -3451,16 +3554,16 @@ impl ServersScreen {
             }
             ProfileValidationOrigin::Import => {
                 let accepted_count = result.accepted.len();
+                let Some(session) = self.import.as_ref() else {
+                    // The dialog closed while the verdict travelled: the paste
+                    // and its batch are gone, so nothing can be committed.
+                    return;
+                };
+                let target_group = session.target_group().to_owned();
+                let batch = session.batch().cloned();
                 let mut added_names = Vec::new();
                 if accepted_count > 0 {
                     let first_id = result.accepted[0].id.clone();
-                    // The tab that opened the import owns the batch: the
-                    // dialog captured its group, so a tab switch while the
-                    // paste validated cannot retarget it.
-                    let target_group = self
-                        .import_group
-                        .clone()
-                        .unwrap_or_else(|| self.target_group(uictx.servers));
                     for profile in result.accepted {
                         if uictx
                             .servers
@@ -3485,52 +3588,29 @@ impl ServersScreen {
                     self.guard_select(first_id);
                     uictx.hooks.mark_dirty();
                 }
-                let refusals = std::mem::take(&mut self.import_refusals);
-                let ignored = std::mem::take(&mut self.import_ignored);
-                let ignored_rows = std::mem::take(&mut self.import_ignored_rows);
-                if !added_names.is_empty() || !refusals.is_empty() || !ignored_rows.is_empty() {
-                    let mut report = crate::model::servers::RefreshReport {
-                        at: unix_now(),
-                        added: added_names.len(),
-                        refused: refusals.len(),
-                        ignored,
-                        ..Default::default()
-                    };
-                    for name in added_names {
-                        crate::model::servers::push_report_row(
-                            &mut report.rows,
-                            crate::model::servers::ReportRow {
-                                kind: crate::model::servers::ReportKind::Added,
-                                name,
-                                key: String::new(),
-                                raw: String::new(),
-                            },
-                        );
+                // The report's counts and rows come from the batch. Each
+                // profile the core's `xray run -test` refused becomes one
+                // refused record with its keyed reason, so the counts cannot
+                // disagree with the rows.
+                let mut batch = batch;
+                if let Some(batch) = batch.as_mut() {
+                    for (name, output) in &result.rejected {
+                        std::rc::Rc::make_mut(batch).reject_core(name.clone(), output.clone());
                     }
-                    for (raw, error) in refusals {
-                        crate::model::servers::push_report_row(
-                            &mut report.rows,
-                            crate::model::servers::ReportRow {
-                                kind: crate::model::servers::ReportKind::Refused,
-                                name: error,
-                                key: String::new(),
-                                raw,
-                            },
-                        );
-                    }
-                    for row in ignored_rows {
-                        crate::model::servers::push_report_row(&mut report.rows, row);
-                    }
+                }
+                let ignored = batch.as_ref().map_or(0, |batch| batch.ignored_count());
+                if (!added_names.is_empty() || !result.rejected.is_empty() || ignored > 0)
+                    && let Some(batch) = batch.as_ref()
+                {
+                    let import_report = batch.import_report(unix_now(), &added_names, lang);
                     self.report_view = Some(ReportView::new(
                         t(lang, Key::SrvReportTitle).to_string(),
-                        report,
+                        import_report,
                     ));
                 }
-                self.invalidate_import_preview();
                 self.profile_validation_report = report;
                 if self.profile_validation_report.is_none() {
-                    self.import_text.clear();
-                    self.import_open = false;
+                    self.import = None;
                     self.set_status(StatusLine::ok(t_fmt(
                         lang,
                         Key::SrvImportedCount,
@@ -3924,7 +4004,6 @@ impl ServersScreen {
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &mut ServersCtx) {
         let lang = ctx.settings.language;
         self.poll_profile_validation(lang, ctx);
-        self.poll_import_parse(lang);
         self.poll_subscription_fetch(lang, ctx);
         self.poll_subscription_view_parse(lang);
         self.poll_xray_tool(lang);
@@ -4579,8 +4658,7 @@ impl ServersScreen {
                     });
                 });
                 if ui.button(t(lang, Key::SrvImportLinks)).clicked() {
-                    self.import_open = true;
-                    self.import_group = Some(self.target_group(ctx.servers));
+                    self.import = Some(ImportSession::open(self.target_group(ctx.servers), lang));
                     self.profile_validation_report = None;
                 }
                 if ui.button(t(lang, Key::SrvNewGroup)).clicked() {
@@ -5386,7 +5464,8 @@ impl ServersScreen {
             || self.copy_dialog.is_some()
             || self.leave_pending.is_some()
             || self.qr_dialog.is_some()
-            || self.derive_dialog.is_some();
+            || self.derive_dialog.is_some()
+            || self.import.is_some();
         if !probe_pending && !typing && !overlay_open {
             if ui
                 .input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::A))
@@ -7211,83 +7290,26 @@ fn profile_json_text(
         .unwrap_or_else(|error| t_fmt(lang, Key::SrvSerializationError, &[&error]))
 }
 
-/// One row of the parsed pane, flattened from the parser's result: accepted
+/// One row of the parsed pane, projected from the import batch: accepted
 /// entries and refused entries with their source, and ignored parameters with
 /// the line they came from.
 enum ParsedRow<'a> {
     Entry { name: &'a str, raw: &'a str },
-    Refused { error: &'a str, raw: &'a str },
+    Refused { error: String, raw: &'a str },
     Ignored { name: &'a str, raw: &'a str },
 }
 
-/// The parsed pane's rows in result order. The row count is the sum of the
-/// three lists, so the virtualized view lays out `rows.len()` without
-/// building a vector per frame.
-fn parsed_row_count(parsed: &links::BodyParse) -> usize {
-    parsed.entries.len() + parsed.refused.len() + parsed.ignored.len()
-}
-
-fn parsed_row_at(parsed: &links::BodyParse, index: usize) -> Option<ParsedRow<'_>> {
-    if let Some(entry) = parsed.entries.get(index) {
-        return Some(ParsedRow::Entry {
-            name: entry.profile.name.as_str(),
-            raw: entry.raw.as_str(),
-        });
+/// The parsed pane's row at `index`, rendered in `language`.
+fn parsed_row_at(
+    parsed: &links::ImportBatch,
+    index: usize,
+    lang: Language,
+) -> Option<ParsedRow<'_>> {
+    match parsed.view_row(index, lang)? {
+        links::BatchRow::Accepted { name, raw } => Some(ParsedRow::Entry { name, raw }),
+        links::BatchRow::Refused { reason, raw } => Some(ParsedRow::Refused { error: reason, raw }),
+        links::BatchRow::Ignored { name, raw } => Some(ParsedRow::Ignored { name, raw }),
     }
-    let index = index - parsed.entries.len();
-    if let Some(refusal) = parsed.refused.get(index) {
-        return Some(ParsedRow::Refused {
-            error: refusal.error.as_str(),
-            raw: refusal.raw.as_str(),
-        });
-    }
-    let index = index - parsed.refused.len();
-    parsed.ignored.get(index).map(|ignored| ParsedRow::Ignored {
-        name: ignored.name.as_str(),
-        raw: ignored
-            .parameter
-            .as_ref()
-            .map(|parameter| parameter.raw.as_str())
-            .unwrap_or(""),
-    })
-}
-
-/// The parsed pane's gathered text, for its own Copy: one line per row, in
-/// the same order the pane shows.
-fn parsed_pane_text(parsed: &links::BodyParse) -> String {
-    let mut text = String::new();
-    for index in 0..parsed_row_count(parsed) {
-        let Some(row) = parsed_row_at(parsed, index) else {
-            continue;
-        };
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        match row {
-            ParsedRow::Entry { name, raw } => {
-                text.push_str(name);
-                if !raw.is_empty() {
-                    text.push_str(": ");
-                    text.push_str(raw);
-                }
-            }
-            ParsedRow::Refused { error, raw } => {
-                text.push_str(error);
-                if !raw.is_empty() {
-                    text.push_str(": ");
-                    text.push_str(raw);
-                }
-            }
-            ParsedRow::Ignored { name, raw } => {
-                text.push_str(name);
-                if !raw.is_empty() {
-                    text.push_str(": ");
-                    text.push_str(raw);
-                }
-            }
-        }
-    }
-    text
 }
 
 /// The decoded-body pane: the provider's decoded body verbatim in the
@@ -7347,7 +7369,7 @@ fn subscription_body_pane(
 fn subscription_parsed_pane(
     ui: &mut egui::Ui,
     lang: Language,
-    parsed: Option<&links::BodyParse>,
+    parsed: Option<&links::ImportBatch>,
     requested: bool,
     error: Option<&str>,
     copied: &mut bool,
@@ -7366,7 +7388,7 @@ fn subscription_parsed_pane(
                 .clicked()
                 && let Some(parsed) = parsed
             {
-                ui.ctx().copy_text(parsed_pane_text(parsed));
+                ui.ctx().copy_text(parsed.view_text(lang));
                 *copied = true;
             }
         });
@@ -7382,7 +7404,7 @@ fn subscription_parsed_pane(
         }
         return;
     };
-    let count = parsed_row_count(parsed);
+    let count = parsed.view_row_count();
     let row_height = ui.spacing().interact_size.y;
     egui::ScrollArea::vertical()
         .id_salt("servers.subscription-view.parsed")
@@ -7391,7 +7413,7 @@ fn subscription_parsed_pane(
         .show_rows(ui, row_height, count, |ui, range| {
             let colors = status_colors_of(ui);
             for index in range {
-                let Some(row) = parsed_row_at(parsed, index) else {
+                let Some(row) = parsed_row_at(parsed, index, lang) else {
                     continue;
                 };
                 match row {
@@ -11529,9 +11551,9 @@ impl ServersScreen {
                                 lang,
                                 Key::SrvSubscriptionCounts,
                                 &[
-                                    &parsed.entries.len(),
-                                    &parsed.refused.len(),
-                                    &parsed.ignored.len(),
+                                    &parsed.accepted_count(),
+                                    &parsed.refused_count(),
+                                    &parsed.ignored_count(),
                                 ],
                             ));
                         } else if view.requested_revision.is_some() {
@@ -11790,13 +11812,21 @@ impl ServersScreen {
                                     egui::CollapsingHeader::new(label).id_salt(index).show(
                                         ui,
                                         |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(&row.raw).monospace(),
-                                                )
-                                                .selectable(true)
-                                                .wrap(),
-                                            );
+                                            if !row.name.is_empty() {
+                                                ui.label(&row.name);
+                                            }
+                                            if let Some(reason) = row.reason_text(lang) {
+                                                ui.label(reason);
+                                            }
+                                            if !row.raw.is_empty() {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(&row.raw).monospace(),
+                                                    )
+                                                    .selectable(true)
+                                                    .wrap(),
+                                                );
+                                            }
                                         },
                                     );
                                 } else if row.name.is_empty() {
@@ -12080,10 +12110,10 @@ impl ServersScreen {
         self.show_editor_window(ctx, uictx);
         self.show_add_draft(ctx, uictx);
         // Import links.
-        if self.import_open {
+        if let Some(mut session) = self.import.take() {
             let validating = self.profile_validation_in_progress(ProfileValidationOrigin::Import);
-            let core_busy = uictx.busy.is_held();
-            let mut validate_profiles: Option<Vec<ServerProfile>> = None;
+            session.core_busy = uictx.busy.is_held();
+            let mut ask = None;
             let close_requested = popup::show(
                 ctx,
                 "servers.import-links",
@@ -12091,115 +12121,7 @@ impl ServersScreen {
                 [520.0, 420.0],
                 true,
                 |ui| {
-                    ui.add_enabled_ui(!validating, |ui| {
-                        ui.label(t(lang, Key::SrvImportHint));
-                        let source_changed = ui
-                            .add(
-                                egui::TextEdit::multiline(&mut self.import_text)
-                                    .desired_rows(6)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text(t(lang, Key::SrvImportPasteHint)),
-                            )
-                            .on_hover_text(t(lang, Key::SrvPasteCtrlV))
-                            .changed();
-                        if source_changed {
-                            self.invalidate_import_preview();
-                            self.profile_validation_report = None;
-                            self.import_parse_error = None;
-                            self.cancel_import_parse();
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.import_parse_job.is_pending() && !self.import_text.is_empty(),
-                                egui::Button::new(t(lang, Key::SrvParse)),
-                            )
-                            .clicked()
-                        {
-                            self.start_import_parse(lang, ui.ctx().clone());
-                        }
-                        if self.import_parse_job.is_pending() {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(t(lang, Key::SrvParsingLinks));
-                                if ui.button(t(lang, Key::Cancel)).clicked() {
-                                    self.cancel_import_parse();
-                                }
-                            });
-                        }
-                        if let Some(message) = &self.import_parse_error {
-                            ui.colored_label(status_colors_of(ui).err, message);
-                        }
-                        if self.import_preview_is_current() && !self.import_parsed.is_empty() {
-                            self.refresh_import_preview(lang);
-                            let preview = self
-                                .import_preview
-                                .as_ref()
-                                .expect("the preview was built for this frame");
-                            let ok = preview.ok;
-                            ui.label(t_fmt(lang, Key::SrvOkTotal, &[&ok, &preview.rows.len()]));
-                            // One truncated line per entry, laid out only for the
-                            // rows the scroll viewport shows: a subscription
-                            // paste can hold tens of thousands of links, and egui
-                            // lays out every child of a plain `show`. The full
-                            // error text stays reachable as the row's tooltip.
-                            let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                            egui::ScrollArea::vertical().max_height(140.0).show_rows(
-                                ui,
-                                row_height,
-                                preview.rows.len(),
-                                |ui, rows| {
-                                    let colors = status_colors_of(ui);
-                                    for row in &preview.rows[rows] {
-                                        let text = match row.kind {
-                                            ImportPreviewKind::Ok => {
-                                                RichText::new(row.text.as_str())
-                                            }
-                                            ImportPreviewKind::Warn => {
-                                                RichText::new(row.text.as_str()).color(colors.warn)
-                                            }
-                                            ImportPreviewKind::Err => {
-                                                RichText::new(row.text.as_str()).color(colors.err)
-                                            }
-                                        };
-                                        let response = ui.add(egui::Label::new(text).truncate());
-                                        if row.kind != ImportPreviewKind::Ok {
-                                            response.on_hover_text(row.text.as_str());
-                                        }
-                                    }
-                                },
-                            );
-                            if core_busy {
-                                ui.colored_label(
-                                    status_colors_of(ui).warn,
-                                    t(lang, Key::SrvWaitCoreOperationImports),
-                                );
-                            }
-                            if ui
-                                .add_enabled(
-                                    ok > 0 && !core_busy,
-                                    egui::Button::new(t_fmt(
-                                        lang,
-                                        Key::SrvValidateAndAddServers,
-                                        &[&ok],
-                                    )),
-                                )
-                                .on_hover_text(t(lang, Key::SrvValidateAndAddServersHint))
-                                .clicked()
-                            {
-                                validate_profiles = Some(
-                                    self.import_parsed
-                                        .iter()
-                                        .filter_map(|result| {
-                                            result
-                                                .as_ref()
-                                                .ok()
-                                                .map(|parsed| parsed.profile.clone())
-                                        })
-                                        .collect(),
-                                );
-                            }
-                        }
-                    });
+                    ask = session.frame(ui, lang);
                     if validating {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -12225,7 +12147,10 @@ impl ServersScreen {
                     }
                 },
             );
-            if let Some(profiles) = validate_profiles
+            if session.take_edited() {
+                self.profile_validation_report = None;
+            }
+            if let Some(ImportAsk::Validate(profiles)) = ask
                 && let Err(error) = self.start_profile_validation(
                     lang,
                     ProfileValidationOrigin::Import,
@@ -12234,18 +12159,20 @@ impl ServersScreen {
                     uictx,
                 )
             {
+                session.finish_validation();
                 self.profile_validation_report = Some(error.clone());
                 self.set_status(StatusLine::err(error));
             }
             // A validation in flight keeps the dialog up, and the platform's
             // close on its window is refused with it: the report the dialog
             // will render is the reason it is still open.
-            self.import_open = (!close_requested
+            if !close_requested
                 || validating
-                || self.profile_validation_in_progress(ProfileValidationOrigin::Import))
-                && self.import_open;
-            if !self.import_open {
-                self.cancel_import_parse();
+                || self.profile_validation_in_progress(ProfileValidationOrigin::Import)
+            {
+                self.import = Some(session);
+            } else {
+                session.close();
             }
         }
 
@@ -12739,15 +12666,16 @@ mod tests {
     use super::{
         AdvancedTabCtx, Column, DRAG_HANDLE, DRAG_SCROLL_MAX_SPEED, DeriveDialog, DraftBaseline,
         DraftKind, DraftTarget, EditorTab, EditorValidationCache, EditorValidationFindings,
-        EditorValidationRender, FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft, Language,
-        LatencyBadge, LeaveAction, MUX_SEED_CONCURRENCY, ProfileDraft, RawField, ReportView,
-        Request, RowCells, RowDetail, RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR,
-        SeededBuffers, ServerProfile, ServerTab, ServersScreen, ServersSide, StatusLine,
-        SubscriptionFetchResult, TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe,
-        TransportTabCtx, XUDP_SEED_CONCURRENCY, basic_tab_inline_verdict, column_bounds,
-        drag_divider, drag_scroll_delta, ech_sockopt_editor, editor_validation_findings,
-        feedback_preview, final_rules_editor, finalmask_udp_settings_editor, fingerprint_allowed,
-        frozen_widths, mux_tab, noises_editor, reorder_target, sanitized_widths, server_list_row,
+        EditorValidationRender, FINGERPRINTS, FeedbackLevel, FieldKey, GroupDraft,
+        ImportParseResult, ImportSession, Language, LatencyBadge, LeaveAction,
+        MUX_SEED_CONCURRENCY, ProfileDraft, RawField, ReportView, Request, RowCells, RowDetail,
+        RowExtras, RowState, RowSwitch, STATUS_TOAST_AUTO_CLEAR, SeededBuffers, ServerProfile,
+        ServerTab, ServersScreen, ServersSide, StatusLine, SubscriptionFetchResult,
+        TABLE_CELL_INSET, TABLE_DEFAULT_WIDTHS, TableShape, TlsProbe, TransportTabCtx,
+        XUDP_SEED_CONCURRENCY, basic_tab_inline_verdict, column_bounds, drag_divider,
+        drag_scroll_delta, ech_sockopt_editor, editor_validation_findings, feedback_preview,
+        final_rules_editor, finalmask_udp_settings_editor, fingerprint_allowed, frozen_widths,
+        mux_tab, noises_editor, reorder_target, sanitized_widths, server_list_row,
         status_colors_of, status_toast_expired, tab_order, table_columns, xmux_section,
     };
     use crate::diag::{Diag, DiagError};
@@ -13327,8 +13255,8 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn the_report_window_lists_rows_and_keeps_refused_text() {
-        use crate::model::servers::{RefreshReport, ReportKind, ReportRow};
+    fn the_report_window_lists_rows_and_renders_refused_reasons() {
+        use crate::model::servers::{RefreshReport, ReportKind, ReportReason, ReportRow};
 
         let report = RefreshReport {
             added: 1,
@@ -13340,24 +13268,28 @@ Authentication: ML-KEM-768, Post-Quantum
                     name: "Tokyo".into(),
                     key: String::new(),
                     raw: String::new(),
+                    reason: None,
                 },
                 ReportRow {
                     kind: ReportKind::Refused,
-                    name: "bad entry".into(),
+                    name: String::new(),
                     key: String::new(),
-                    raw: "vless://broken".into(),
+                    raw: "https://provider.example/sub".into(),
+                    reason: Some(ReportReason::keyed(Key::LinkNestedSubscription)),
                 },
                 ReportRow {
                     kind: ReportKind::Ignored,
                     name: "Tokyo: quicSecurity=none".into(),
                     key: "quicSecurity=none".into(),
                     raw: "vless://a#quicSecurity=none".into(),
+                    reason: None,
                 },
                 ReportRow {
                     kind: ReportKind::Ignored,
                     name: "Osaka: quicSecurity=none".into(),
                     key: "quicSecurity=none".into(),
                     raw: "vless://b#quicSecurity=none".into(),
+                    reason: None,
                 },
             ],
             ..Default::default()
@@ -13392,6 +13324,17 @@ Authentication: ML-KEM-768, Post-Quantum
                 .next()
                 .is_some(),
             "the refused section is present"
+        );
+        harness
+            .get_by_label(t(Language::En, Key::SrvReportRefused))
+            .click();
+        harness.run();
+        assert!(
+            harness
+                .get_all_by_label(t(Language::En, Key::LinkNestedSubscription))
+                .next()
+                .is_some(),
+            "an expanded refused row renders its keyed reason, not stored English"
         );
         assert!(
             harness
@@ -13440,6 +13383,7 @@ Authentication: ML-KEM-768, Post-Quantum
                 name: format!("server {index:02} with a long enough name"),
                 key: String::new(),
                 raw: String::new(),
+                reason: None,
             })
             .collect();
         let report = RefreshReport {
@@ -14187,25 +14131,11 @@ Authentication: ML-KEM-768, Post-Quantum
 
         let body = "Alpha body";
         let (mut rig, feed_id, at) = subscription_view_rig(Some(body), false);
-        let mut parsed = links::BodyParse::default();
-        parsed.entries.push(links::BodyEntry {
-            profile: ServerProfile::new("Alpha", OutboundModel::new(Protocol::Freedom)),
-            raw: "vless://alpha".into(),
-            ignored: Vec::new(),
-        });
-        parsed.refused.push(links::BodyRefusal {
-            raw: "vless://broken".into(),
-            error: "bad entry".into(),
-        });
-        parsed.ignored.push(links::IgnoredSection::parameter(
-            "Alpha",
-            links::CompatibilityParameter {
-                name: "quicSecurity".into(),
-                value: "none".into(),
-                raw: "vless://alpha?quicSecurity=none".into(),
-            },
-        ));
-        let parsed_text = super::parsed_pane_text(&parsed);
+        let batch = links::parse_body(
+            "trojan://pw@alpha.example.com:443?allowInsecure=1#Alpha\n\
+             https://provider.example/sub\n",
+        );
+        let parsed_text = batch.view_text(Language::En);
         rig.servers.groups = vec![Group::manual(), {
             let mut group = Group::new("Feed");
             group.id = feed_id.clone();
@@ -14222,7 +14152,7 @@ Authentication: ML-KEM-768, Post-Quantum
         }];
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.state_mut().0.last_subscription_parse =
-            Some((feed_id, VIEW_REVISION, Rc::new(parsed)));
+            Some((feed_id, VIEW_REVISION, Rc::new(batch)));
         harness.run();
         open_raw_from_card(&mut harness);
         assert!(
@@ -14243,13 +14173,13 @@ Authentication: ML-KEM-768, Post-Quantum
         );
         assert!(
             harness
-                .query_all_by_label_contains("bad entry")
+                .query_all_by_label_contains(t(Language::En, Key::LinkNestedSubscription))
                 .next()
                 .is_some()
         );
         assert!(
             harness
-                .query_all_by_label_contains("quicSecurity=none")
+                .query_all_by_label_contains("allowInsecure=1")
                 .next()
                 .is_some(),
             "an ignored row shows its parameter=value pair"
@@ -14389,7 +14319,7 @@ Authentication: ML-KEM-768, Post-Quantum
         let (rig, feed, _at) = subscription_view_rig(Some("vless://body"), false);
         let mut harness = screen_harness(rig, ServersScreen::default());
         harness.state_mut().0.last_subscription_parse =
-            Some((feed, VIEW_REVISION, Rc::new(links::BodyParse::default())));
+            Some((feed, VIEW_REVISION, Rc::new(links::ImportBatch::default())));
         harness.run();
         open_raw_from_card(&mut harness);
         let divider = harness
@@ -16219,7 +16149,12 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert_eq!(
             Some(feed_id),
-            harness.state().0.import_group.clone(),
+            harness
+                .state()
+                .0
+                .import
+                .as_ref()
+                .map(|session| session.target_group().to_owned()),
             "a paste lands in the tab that opened it"
         );
 
@@ -16232,7 +16167,12 @@ Authentication: ML-KEM-768, Post-Quantum
         harness.run();
         assert_eq!(
             Some(crate::model::servers::MANUAL_GROUP_ID.to_owned()),
-            harness.state().0.import_group.clone(),
+            harness
+                .state()
+                .0
+                .import
+                .as_ref()
+                .map(|session| session.target_group().to_owned()),
             "a view falls back to Manual"
         );
     }
@@ -19376,22 +19316,24 @@ Authentication: ML-KEM-768, Post-Quantum
 
     #[test]
     fn changing_import_source_invalidates_the_parsed_snapshot() {
-        let mut screen = ServersScreen {
-            import_text: "vless://first".into(),
-            import_parsed: vec![Ok(links::ParsedLink {
-                profile: ServerProfile::default(),
-                ignored: Vec::new(),
-            })],
-            import_parsed_source: Some("vless://first".into()),
-            ..Default::default()
-        };
-        assert!(screen.import_preview_is_current());
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
+        );
+        session.text = "vless://first".into();
+        session.parsed = Some(std::rc::Rc::new(links::ImportBatch::default()));
+        session.parsed_source = Some("vless://first".into());
+        assert!(session.preview_is_current());
 
-        screen.import_text = "vless://second".into();
-        assert!(!screen.import_preview_is_current());
-        screen.invalidate_import_preview();
-        assert!(screen.import_parsed.is_empty());
-        assert!(screen.import_parsed_source.is_none());
+        session.text = "vless://second".into();
+        assert!(
+            !session.preview_is_current(),
+            "an edited paste never matches its old parse"
+        );
+        session.invalidate();
+        assert!(session.parsed.is_none());
+        assert!(session.parsed_source.is_none());
+        assert!(session.preview.is_none());
     }
 
     #[test]
@@ -22615,29 +22557,28 @@ Authentication: ML-KEM-768, Post-Quantum
     }
 
     #[test]
-    fn import_parse_refuses_oversized_paste_before_any_worker() {
-        let mut screen = ServersScreen {
-            import_text: "x".repeat(links::MAX_BULK_LEN + 1),
-            ..Default::default()
-        };
-        screen.start_import_parse(Language::En, egui::Context::default());
+    fn import_session_refuses_an_oversized_paste_before_any_worker() {
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
+        );
+        session.text = "x".repeat(links::MAX_BULK_LEN + 1);
+        session.start_parse(egui::Context::default());
         assert!(
-            !screen.import_parse_job.is_pending(),
+            !session.parse_job.is_pending(),
             "an oversized paste must not spawn a worker"
         );
-        let message = screen
-            .import_parse_error
+        let message = session
+            .parse_error
+            .as_ref()
             .expect("oversized paste must produce a rejection message");
         assert!(
             message.contains("too large"),
             "message must name the cap: {message:?}"
         );
+        assert!(!message.contains("xxxx"), "message must not echo the paste");
         assert!(
-            !message.contains(&screen.import_text),
-            "message must not echo the paste"
-        );
-        assert!(
-            screen.import_parsed.is_empty(),
+            session.parsed.is_none(),
             "nothing may be parsed from an oversized paste"
         );
     }
@@ -22650,11 +22591,11 @@ Authentication: ML-KEM-768, Post-Quantum
         let _harness = harness_builder().build_ui(|ui| screen.show(ui, &mut rig.ctx().servers()));
     }
 
-    /// The import preview is formatted once per parse result, not per frame:
-    /// the dialog paints it every frame while it is open, and the paste cap
-    /// allows a subscription blob with tens of thousands of entries. A later
-    /// frame reuses the formatted rows — the same text allocations — and an
-    /// edit that invalidates the parsed snapshot drops them with it.
+    /// The import preview is formatted once per batch and language, not per
+    /// frame: the dialog paints it every frame while it is open, and the
+    /// paste cap allows a subscription blob with tens of thousands of
+    /// entries. A later frame reuses the formatted rows — the same text
+    /// allocations — and an edit that invalidates the batch drops them.
     #[test]
     fn import_dialog_paints_a_large_preview_and_reuses_its_rows() {
         const ROWS: usize = 300;
@@ -22666,22 +22607,24 @@ Authentication: ML-KEM-768, Post-Quantum
             })
             .collect();
         let mut rig = UiTestRig::default();
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
+        );
+        session.text = paste.clone();
+        session.parsed = Some(std::rc::Rc::new(links::parse_body(&paste)));
+        session.parsed_source = Some(paste);
         let mut screen = ServersScreen {
-            import_open: true,
-            import_text: paste.clone(),
+            import: Some(session),
             ..Default::default()
         };
-        screen.import_parsed = links::parse_bulk(&paste)
-            .into_iter()
-            .map(|result| result.map_err(|error| error.to_string()))
-            .collect();
-        screen.import_parsed_source = Some(paste);
 
         render_servers_frame(&mut screen, &mut rig);
         let allocations: Vec<*const u8> = {
             let preview = screen
-                .import_preview
+                .import
                 .as_ref()
+                .and_then(|session| session.preview.as_ref())
                 .expect("the open dialog builds the preview");
             assert_eq!(preview.rows.len(), ROWS);
             assert_eq!(preview.ok, ROWS);
@@ -22690,8 +22633,9 @@ Authentication: ML-KEM-768, Post-Quantum
 
         render_servers_frame(&mut screen, &mut rig);
         let reused: Vec<*const u8> = screen
-            .import_preview
+            .import
             .as_ref()
+            .and_then(|session| session.preview.as_ref())
             .unwrap()
             .rows
             .iter()
@@ -22702,75 +22646,120 @@ Authentication: ML-KEM-768, Post-Quantum
             "a later frame of the same dialog must reuse the formatted rows"
         );
 
-        // Editing the paste invalidates the snapshot the preview was built
-        // from, so the formatted rows go with it.
-        screen.invalidate_import_preview();
-        assert!(
-            screen.import_preview.is_none(),
-            "a text edit must drop the formatted preview"
+        // Editing the paste invalidates the batch the preview was built from,
+        // so the formatted rows go with it.
+        if let Some(session) = screen.import.as_mut() {
+            session.invalidate();
+            assert!(
+                session.preview.is_none(),
+                "a text edit must drop the formatted preview"
+            );
+        }
+    }
+
+    #[test]
+    fn import_session_rebuilds_the_preview_once_per_language() {
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
         );
+        session.text =
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.local:443?encryption=none#A\n\
+             vless://b831381d-6324-4d53-ad4f-8cda48b30811@b.local:443?encryption=none#B\n"
+                .to_string();
+        let batch = links::parse_body(&session.text);
+        session.apply_result(ImportParseResult {
+            source: session.text.clone(),
+            batch,
+        });
+        let first = session
+            .preview()
+            .expect("the batch builds a preview")
+            .rows
+            .as_ptr();
+        let second = session
+            .preview()
+            .expect("the preview is still there")
+            .rows
+            .as_ptr();
+        assert_eq!(first, second, "the preview is not rebuilt per frame");
+        session.invalidate();
+        assert!(session.preview.is_none(), "a new batch drops the memo");
+    }
+
+    #[test]
+    fn import_session_discards_a_stale_result_after_an_edit() {
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
+        );
+        let old = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.local:443?encryption=none#A\n";
+        let batch = links::parse_body(old);
+        session.text =
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@c.local:443?encryption=none#C\n"
+                .to_string();
+        session.apply_result(ImportParseResult {
+            source: old.to_string(),
+            batch,
+        });
+        assert!(
+            session.parsed.is_none(),
+            "stale results must never reach the preview"
+        );
+        assert!(session.parsed_source.is_none());
+    }
+
+    #[test]
+    fn import_session_commit_asks_for_exactly_the_parsed_profiles() {
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
+        );
+        session.text =
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.local:443?encryption=none#A\n\
+             https://provider.example/sub\n"
+                .to_string();
+        let batch = links::parse_body(&session.text);
+        session.apply_result(ImportParseResult {
+            source: session.text.clone(),
+            batch,
+        });
+        let asked = session
+            .validation_request()
+            .expect("a current batch asks for its profiles");
+        assert_eq!(asked.len(), 1, "refused entries are never validated");
+        assert_eq!(asked[0].name, "A");
     }
 
     #[test]
     fn import_parse_worker_delivers_results_via_poll() {
-        let mut screen = ServersScreen {
-            import_text:
-                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.local:443?encryption=none#A\n\
-             vless://b831381d-6324-4d53-ad4f-8cda48b30811@b.local:443?encryption=none#B\n"
-                    .to_string(),
-            ..Default::default()
-        };
+        let mut session = ImportSession::open(
+            crate::model::servers::MANUAL_GROUP_ID.to_owned(),
+            Language::En,
+        );
+        let paste = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.local:443?encryption=none#A\n\
+             vless://b831381d-6324-4d53-ad4f-8cda48b30811@b.local:443?encryption=none#B\n";
+        session.text = paste.to_string();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        screen.start_import_parse(Language::En, egui::Context::default());
+        session.start_parse(egui::Context::default());
         assert!(
-            screen.import_parse_job.is_pending(),
+            session.parse_job.is_pending(),
             "a parse must run off the UI thread"
         );
-        while screen.import_parse_job.is_pending() {
+        while session.parse_job.is_pending() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "worker did not deliver in time"
             );
-            screen.poll_import_parse(Language::En);
+            session.poll_parse();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(screen.import_parsed.len(), 2);
-        assert!(screen.import_parsed.iter().all(|result| result.is_ok()));
         assert_eq!(
-            screen.import_parsed_source.as_deref(),
-            Some(screen.import_text.as_str())
+            session.parsed.as_ref().map(|batch| batch.accepted_count()),
+            Some(2)
         );
-        assert!(screen.import_parse_error.is_none());
-    }
-
-    #[test]
-    fn import_parse_discards_stale_result_after_edit() {
-        let mut screen = ServersScreen {
-            import_text:
-                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@a.local:443?encryption=none#A\n"
-                    .to_string(),
-            ..Default::default()
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        screen.start_import_parse(Language::En, egui::Context::default());
-        // Edit the paste while the worker runs: the delivered result must be
-        // discarded as stale, leaving the preview invalidated.
-        screen.import_text =
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@c.local:443?encryption=none#C\n"
-                .to_string();
-        while screen.import_parse_job.is_pending() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "worker did not deliver in time"
-            );
-            screen.poll_import_parse(Language::En);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            screen.import_parsed.is_empty(),
-            "stale results must never reach the preview"
-        );
-        assert!(screen.import_parsed_source.is_none());
+        assert_eq!(session.parsed_source.as_deref(), Some(paste));
+        assert!(session.parse_error.is_none());
     }
 
     /// One full Advanced-tab frame through a kittest harness. The harness is

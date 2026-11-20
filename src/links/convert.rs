@@ -1,13 +1,20 @@
 //! Document converters: Clash YAML, sing-box/Xray JSON, SIP008, WireGuard and
-//! Hysteria 2 YAML in, server profiles out.
+//! Hysteria 2 YAML in, import records out.
 //!
 //! Every converter follows the share-link importer's contract: a field the
 //! persisted model cannot express is dropped and named as a compatibility
 //! parameter; an entry is refused only when its protocol cannot be dialed by
 //! the pinned core or a required field is missing. Non-server document
 //! sections are ignored and named for the report.
+//!
+//! A converter writes into the one [`ImportBatch`]: it allocates an ordinal
+//! per source entry, pushes the accepted profile with the parameters it
+//! dropped, and refuses with a keyed reason. No converter renders a sentence.
 
-use super::body::{BodyEntry, BodyRefusal, CompatibilityParameter, IgnoredSection};
+use super::body::CompatibilityParameter;
+use super::import::{ImportBatch, ImportReason};
+use crate::diag::Diag;
+use crate::i18n::Key;
 use crate::model::ServerProfile;
 use crate::model::outbound::{
     HttpSettings, HysteriaSettings, MasqueSettings, OutboundModel, Protocol, ProtocolSettings,
@@ -19,13 +26,42 @@ use crate::model::stream::{
     StreamModel, TlsModel, WsSettings, XhttpSettings,
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
 
-/// One converter's outcome.
-#[derive(Debug, Clone, Default)]
-pub struct ConvertOutcome {
-    pub entries: Vec<BodyEntry>,
-    pub refused: Vec<BodyRefusal>,
-    pub ignored: Vec<IgnoredSection>,
+/// One converted entry: the profile plus the compatibility parameters the
+/// document parser dropped.
+struct Converted {
+    profile: ServerProfile,
+    ignored: Vec<CompatibilityParameter>,
+}
+
+/// A document entry the converter cannot accept: either refused with its
+/// keyed reason, or skipped as a non-server section.
+enum Refusal {
+    Refused(ImportReason),
+    Ignored(String),
+}
+
+impl Refusal {
+    fn refused(reason: ImportReason) -> Self {
+        Self::Refused(reason)
+    }
+    fn ignored(name: impl Into<String>) -> Self {
+        Self::Ignored(name.into())
+    }
+}
+
+/// Wrap one converted entry after the model's own verdict: an entry the
+/// model refuses is refused here with its keyed reason, so a document import
+/// never emits a profile the profile-validation step would reject as a
+/// grammar finding.
+fn converted(
+    profile: ServerProfile,
+    ignored: Vec<CompatibilityParameter>,
+) -> Result<Converted, Refusal> {
+    super::validate_profile(&profile)
+        .map_err(|error| Refusal::refused(ImportReason::link(error)))?;
+    Ok(Converted { profile, ignored })
 }
 
 /// Protocols the pinned core can dial as an outbound.
@@ -59,92 +95,81 @@ const UNDIALABLE: &[&str] = &[
     "awg",
 ];
 
-/// Convert `text` when it is a document shape; `None` leaves it to the link
-/// pipeline.
-pub fn convert_document(text: &str) -> Option<ConvertOutcome> {
+/// Convert `text` when it is a document shape into `batch`; `false` leaves
+/// it to the link pipeline.
+pub fn convert_document(text: &str, batch: &mut ImportBatch) -> bool {
     let trimmed = text.trim_start();
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
         && let Ok(value) = serde_json::from_str::<Value>(text)
     {
         if value.get("outbounds").and_then(Value::as_array).is_some() {
-            return Some(convert_json_document(&value));
+            convert_json_document(&value, batch);
+            return true;
         }
         if value.get("servers").and_then(Value::as_array).is_some() {
-            return Some(convert_sip008(&value));
+            convert_sip008(&value, batch);
+            return true;
         }
     }
     if let Ok(value) = serde_saphyr::from_str::<Value>(text) {
         if value.get("proxies").and_then(Value::as_array).is_some() {
-            return Some(convert_clash(&value));
+            convert_clash(&value, batch);
+            return true;
         }
         if value.get("inbounds").is_none()
             && value.get("outbounds").is_none()
             && value.get("server").is_some()
         {
-            return Some(convert_hysteria2(&value));
+            convert_hysteria2(&value, batch);
+            return true;
         }
     }
     if trimmed.contains("[Interface]") || trimmed.contains("[Peer]") {
-        return Some(convert_wireguard_conf(text));
+        convert_wireguard_conf(text, batch);
+        return true;
     }
-    None
+    false
+}
+
+/// A refusal whose message is the grammar's keyed diagnostic.
+fn malformed_reason(diag: Diag) -> ImportReason {
+    ImportReason::link(super::malformed(diag))
 }
 
 // ---------- Clash ----------
 
-fn convert_clash(document: &Value) -> ConvertOutcome {
-    let mut outcome = ConvertOutcome::default();
+fn convert_clash(document: &Value, batch: &mut ImportBatch) {
     for section in ["rules", "proxy-groups", "dns"] {
         if document.get(section).is_some() {
-            outcome.ignored.push(IgnoredSection::section(section));
+            let ordinal = batch.begin_item();
+            batch.push_ignored_section(ordinal, section);
         }
     }
     let Some(proxies) = document.get("proxies").and_then(Value::as_array) else {
-        return outcome;
+        return;
     };
     for proxy in proxies {
+        let ordinal = batch.begin_item();
         let raw = bound(proxy);
         match clash_entry(proxy) {
             Ok(mut entry) => {
                 for parameter in &mut entry.ignored {
                     parameter.raw.clone_from(&raw);
                 }
-                outcome.entries.push(entry);
+                batch.push_accepted(ordinal, entry.profile, raw, entry.ignored);
             }
-            Err(Refusal { error, ignored }) if error.is_empty() => {
-                // Non-server entry (a selector, a group reference).
-                outcome.ignored.push(IgnoredSection::section(ignored));
-            }
-            Err(Refusal { error, .. }) => outcome.refused.push(BodyRefusal { raw, error }),
-        }
-    }
-    outcome
-}
-
-struct Refusal {
-    error: String,
-    ignored: String,
-}
-
-impl Refusal {
-    fn refused(error: impl Into<String>) -> Self {
-        Self {
-            error: error.into(),
-            ignored: String::new(),
-        }
-    }
-    fn ignored(name: impl Into<String>) -> Self {
-        Self {
-            error: String::new(),
-            ignored: name.into(),
+            Err(Refusal::Ignored(name)) => batch.push_ignored_section(ordinal, name),
+            Err(Refusal::Refused(reason)) => batch.push_refused(ordinal, "", reason, raw),
         }
     }
 }
 
-fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
+fn clash_entry(proxy: &Value) -> Result<Converted, Refusal> {
     let ty = field(proxy, "type").to_ascii_lowercase();
     if UNDIALABLE.contains(&ty.as_str()) {
-        return Err(Refusal::refused(format!("unsupported protocol {ty}")));
+        return Err(Refusal::refused(malformed_reason(
+            Diag::new(Key::LinkEntryUnsupportedProtocol).arg(&ty),
+        )));
     }
     if !DIALABLE.contains(&ty.as_str()) {
         let name = field(proxy, "name");
@@ -164,17 +189,23 @@ fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
         "wireguard" => Protocol::Wireguard,
         "hysteria2" | "hy2" => Protocol::Hysteria,
         "hysteria" => {
-            return Err(Refusal::refused(
-                "Hysteria 1 is not dialable; use Hysteria 2".to_owned(),
-            ));
+            return Err(Refusal::refused(malformed_reason(Diag::new(
+                Key::LinkUnsupportedHysteria1,
+            ))));
         }
         "masque" => Protocol::Masque,
-        other => return Err(Refusal::refused(format!("unsupported protocol {other}"))),
+        other => {
+            return Err(Refusal::refused(malformed_reason(
+                Diag::new(Key::LinkEntryUnsupportedProtocol).arg(other),
+            )));
+        }
     };
     let server = field(proxy, "server").trim();
     let port = number(proxy, "port").unwrap_or_default();
     if server.is_empty() || port == 0 {
-        return Err(Refusal::refused("missing server or port"));
+        return Err(Refusal::refused(malformed_reason(Diag::new(
+            Key::LinkEntryMissingEndpoint,
+        ))));
     }
     let name = field(proxy, "name").trim().to_owned();
     let name = if name.is_empty() {
@@ -191,6 +222,7 @@ fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
             port,
             id: field(proxy, "uuid").into(),
             flow: field(proxy, "flow").into(),
+            encryption: "none".into(),
             ..Default::default()
         }),
         Protocol::Vmess => ProtocolSettings::Vmess(VmessSettings {
@@ -238,7 +270,11 @@ fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
             port,
             ..Default::default()
         }),
-        _ => return Err(Refusal::refused("unsupported protocol")),
+        _ => {
+            return Err(Refusal::refused(malformed_reason(
+                Diag::new(Key::LinkEntryUnsupportedProtocol).arg(protocol.as_str()),
+            )));
+        }
     };
     outbound.stream = clash_stream(proxy, protocol, &mut ignored);
     if bool_field(proxy, "udp") {
@@ -305,11 +341,7 @@ fn clash_entry(proxy: &Value) -> Result<BodyEntry, Refusal> {
         }
     }
     let profile = ServerProfile::new(name, outbound);
-    Ok(BodyEntry {
-        profile,
-        raw: String::new(),
-        ignored,
-    })
+    converted(profile, ignored)
 }
 
 fn clash_wireguard(proxy: &Value, ignored: &mut Vec<CompatibilityParameter>) -> WireguardSettings {
@@ -464,17 +496,18 @@ fn clash_stream(
 
 // ---------- sing-box / Xray JSON ----------
 
-fn convert_json_document(document: &Value) -> ConvertOutcome {
-    let mut outcome = ConvertOutcome::default();
+fn convert_json_document(document: &Value, batch: &mut ImportBatch) {
     for section in ["inbounds", "routing", "route", "dns", "log"] {
         if document.get(section).is_some() {
-            outcome.ignored.push(IgnoredSection::section(section));
+            let ordinal = batch.begin_item();
+            batch.push_ignored_section(ordinal, section);
         }
     }
     let Some(outbounds) = document.get("outbounds").and_then(Value::as_array) else {
-        return outcome;
+        return;
     };
     for outbound in outbounds {
+        let ordinal = batch.begin_item();
         let raw = bound(outbound);
         if let Some(protocol) = outbound.get("protocol").and_then(Value::as_str) {
             // Xray outbound object: the persisted model is the same shape.
@@ -484,37 +517,49 @@ fn convert_json_document(document: &Value) -> ConvertOutcome {
                     .get("tag")
                     .and_then(Value::as_str)
                     .unwrap_or(&protocol);
-                outcome.ignored.push(IgnoredSection::section(name));
+                batch.push_ignored_section(ordinal, name);
                 continue;
             }
             if UNDIALABLE.contains(&protocol.as_str()) {
-                outcome.refused.push(BodyRefusal {
+                batch.push_refused(
+                    ordinal,
+                    "",
+                    malformed_reason(Diag::new(Key::LinkEntryUnsupportedProtocol).arg(&protocol)),
                     raw,
-                    error: format!("unsupported protocol {protocol}"),
-                });
+                );
                 continue;
             }
             match serde_json::from_value::<OutboundModel>(outbound.clone()) {
-                Ok(model) => {
+                Ok(mut model) => {
+                    // The document grammar has no `encryption` key: the wire
+                    // default `none` is the model value the link grammar
+                    // writes, so a stored profile validates and exports.
+                    if let ProtocolSettings::Vless(settings) = &mut model.settings
+                        && settings.encryption.is_empty()
+                    {
+                        settings.encryption = "none".into();
+                    }
                     let name = profile_name(outbound, &model);
-                    outcome.entries.push(BodyEntry {
-                        profile: ServerProfile::new(name, model),
-                        raw,
-                        ignored: Vec::new(),
-                    });
+                    let profile = ServerProfile::new(name, model);
+                    match super::validate_profile(&profile) {
+                        Ok(()) => batch.push_accepted(ordinal, profile, raw, Vec::new()),
+                        Err(error) => {
+                            batch.push_refused(ordinal, "", ImportReason::link(error), raw);
+                        }
+                    }
                 }
-                Err(error) => outcome.refused.push(BodyRefusal {
+                Err(error) => batch.push_refused(
+                    ordinal,
+                    "",
+                    malformed_reason(Diag::new(Key::LinkEntryJsonInvalid).arg(error.to_string())),
                     raw,
-                    error: error.to_string(),
-                }),
+                ),
             }
             continue;
         }
         let ty = field(outbound, "type").to_ascii_lowercase();
         if ty.is_empty() {
-            outcome
-                .ignored
-                .push(IgnoredSection::section(field(outbound, "tag")));
+            batch.push_ignored_section(ordinal, field(outbound, "tag"));
             continue;
         }
         match sing_box_entry(outbound) {
@@ -522,15 +567,12 @@ fn convert_json_document(document: &Value) -> ConvertOutcome {
                 for parameter in &mut entry.ignored {
                     parameter.raw.clone_from(&raw);
                 }
-                outcome.entries.push(entry);
+                batch.push_accepted(ordinal, entry.profile, raw, entry.ignored);
             }
-            Err(Refusal { error, ignored }) if error.is_empty() => {
-                outcome.ignored.push(IgnoredSection::section(ignored));
-            }
-            Err(Refusal { error, .. }) => outcome.refused.push(BodyRefusal { raw, error }),
+            Err(Refusal::Ignored(name)) => batch.push_ignored_section(ordinal, name),
+            Err(Refusal::Refused(reason)) => batch.push_refused(ordinal, "", reason, raw),
         }
     }
-    outcome
 }
 
 fn profile_name(outbound: &Value, model: &OutboundModel) -> String {
@@ -544,10 +586,12 @@ fn profile_name(outbound: &Value, model: &OutboundModel) -> String {
         .unwrap_or_else(|| "server".into())
 }
 
-fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
+fn sing_box_entry(outbound: &Value) -> Result<Converted, Refusal> {
     let ty = field(outbound, "type").to_ascii_lowercase();
     if UNDIALABLE.contains(&ty.as_str()) {
-        return Err(Refusal::refused(format!("unsupported protocol {ty}")));
+        return Err(Refusal::refused(malformed_reason(
+            Diag::new(Key::LinkEntryUnsupportedProtocol).arg(&ty),
+        )));
     }
     if !DIALABLE.contains(&ty.as_str()) {
         let name = field(outbound, "tag");
@@ -560,7 +604,9 @@ fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
     let server = field(outbound, "server").trim();
     let port = number(outbound, "server_port").unwrap_or_default();
     if server.is_empty() || port == 0 {
-        return Err(Refusal::refused("missing server or port"));
+        return Err(Refusal::refused(malformed_reason(Diag::new(
+            Key::LinkEntryMissingEndpoint,
+        ))));
     }
     let name = field(outbound, "tag").trim().to_owned();
     let name = if name.is_empty() {
@@ -579,12 +625,16 @@ fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
         "wireguard" => Protocol::Wireguard,
         "hysteria2" | "hy2" => Protocol::Hysteria,
         "hysteria" => {
-            return Err(Refusal::refused(
-                "Hysteria 1 is not dialable; use Hysteria 2".to_owned(),
-            ));
+            return Err(Refusal::refused(malformed_reason(Diag::new(
+                Key::LinkUnsupportedHysteria1,
+            ))));
         }
         "masque" => Protocol::Masque,
-        other => return Err(Refusal::refused(format!("unsupported protocol {other}"))),
+        other => {
+            return Err(Refusal::refused(malformed_reason(
+                Diag::new(Key::LinkEntryUnsupportedProtocol).arg(other),
+            )));
+        }
     };
     require_credentials(outbound, protocol, "uuid", "password")?;
     let mut outbound_model = OutboundModel::new(protocol);
@@ -594,6 +644,7 @@ fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
             port,
             id: field(outbound, "uuid").into(),
             flow: field(outbound, "flow").into(),
+            encryption: "none".into(),
             ..Default::default()
         }),
         Protocol::Vmess => ProtocolSettings::Vmess(VmessSettings {
@@ -641,7 +692,11 @@ fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
             port,
             ..Default::default()
         }),
-        _ => return Err(Refusal::refused("unsupported protocol")),
+        _ => {
+            return Err(Refusal::refused(malformed_reason(
+                Diag::new(Key::LinkEntryUnsupportedProtocol).arg(protocol.as_str()),
+            )));
+        }
     };
     const SING_BOX_KEYS: &[&str] = &[
         "type",
@@ -683,11 +738,7 @@ fn sing_box_entry(outbound: &Value) -> Result<BodyEntry, Refusal> {
         }
     }
     outbound_model.stream = sing_box_stream(outbound, protocol, &mut ignored);
-    Ok(BodyEntry {
-        profile: ServerProfile::new(name, outbound_model),
-        raw: String::new(),
-        ignored,
-    })
+    converted(ServerProfile::new(name, outbound_model), ignored)
 }
 
 fn sing_box_wireguard(outbound: &Value) -> WireguardSettings {
@@ -830,22 +881,24 @@ fn sing_box_stream(
 
 // ---------- SIP008 ----------
 
-fn convert_sip008(document: &Value) -> ConvertOutcome {
-    let mut outcome = ConvertOutcome::default();
+fn convert_sip008(document: &Value, batch: &mut ImportBatch) {
     let Some(servers) = document.get("servers").and_then(Value::as_array) else {
-        return outcome;
+        return;
     };
     for server in servers {
+        let ordinal = batch.begin_item();
         let raw = bound(server);
         let address = field(server, "server").trim().to_owned();
         let port = number(server, "server_port").unwrap_or_default();
         let method = field(server, "method").to_owned();
         let password = field(server, "password").to_owned();
         if address.is_empty() || port == 0 || method.is_empty() {
-            outcome.refused.push(BodyRefusal {
+            batch.push_refused(
+                ordinal,
+                "",
+                malformed_reason(Diag::new(Key::LinkEntrySip008Incomplete)),
                 raw,
-                error: "missing server, port or method".into(),
-            });
+            );
             continue;
         }
         let remarks = field(server, "remarks").trim();
@@ -862,19 +915,18 @@ fn convert_sip008(document: &Value) -> ConvertOutcome {
             password,
             ..Default::default()
         });
-        outcome.entries.push(BodyEntry {
-            profile: ServerProfile::new(name, outbound),
-            raw,
-            ignored: Vec::new(),
-        });
+        let profile = ServerProfile::new(name, outbound);
+        match super::validate_profile(&profile) {
+            Ok(()) => batch.push_accepted(ordinal, profile, raw, Vec::new()),
+            Err(error) => batch.push_refused(ordinal, "", ImportReason::link(error), raw),
+        }
     }
-    outcome
 }
 
 // ---------- WireGuard configuration ----------
 
-fn convert_wireguard_conf(text: &str) -> ConvertOutcome {
-    let mut outcome = ConvertOutcome::default();
+fn convert_wireguard_conf(text: &str, batch: &mut ImportBatch) {
+    let ordinal = batch.begin_item();
     let mut section = String::new();
     let mut interface: BTreeMap<String, String> = BTreeMap::new();
     let mut peer: BTreeMap<String, String> = BTreeMap::new();
@@ -903,17 +955,19 @@ fn convert_wireguard_conf(text: &str) -> ConvertOutcome {
         }
     }
     if interface.is_empty() && peer.is_empty() {
-        outcome.ignored.push(IgnoredSection::section("wireguard"));
-        return outcome;
+        batch.push_ignored_section(ordinal, "wireguard");
+        return;
     }
     let private = interface.get("privatekey").cloned().unwrap_or_default();
     let public = peer.get("publickey").cloned().unwrap_or_default();
     if private.trim().is_empty() || public.trim().is_empty() {
-        outcome.refused.push(BodyRefusal {
-            raw: text.chars().take(super::body::MAX_RAW_CHARS).collect(),
-            error: "missing required credentials".into(),
-        });
-        return outcome;
+        batch.push_refused(
+            ordinal,
+            "",
+            malformed_reason(Diag::new(Key::LinkEntryMissingCredentials)),
+            bound_text(text),
+        );
+        return;
     }
     let server = peer.get("endpoint").cloned().unwrap_or_default();
     let name = if server.is_empty() {
@@ -948,30 +1002,31 @@ fn convert_wireguard_conf(text: &str) -> ConvertOutcome {
     if let Some(table) = interface.get("table") {
         ignored.push(format!("Table {table}").into());
     }
-    let raw: String = text.chars().take(super::body::MAX_RAW_CHARS).collect();
+    let raw = bound_text(text);
     for parameter in &mut ignored {
         parameter.raw.clone_from(&raw);
     }
-    outcome.entries.push(BodyEntry {
-        profile: ServerProfile::new(name, outbound),
-        raw: String::new(),
-        ignored,
-    });
-    outcome
+    let profile = ServerProfile::new(name, outbound);
+    match super::validate_profile(&profile) {
+        Ok(()) => batch.push_accepted(ordinal, profile, raw, ignored),
+        Err(error) => batch.push_refused(ordinal, "", ImportReason::link(error), raw),
+    }
 }
 
 // ---------- Hysteria 2 YAML ----------
 
-fn convert_hysteria2(document: &Value) -> ConvertOutcome {
-    let mut outcome = ConvertOutcome::default();
+fn convert_hysteria2(document: &Value, batch: &mut ImportBatch) {
+    let ordinal = batch.begin_item();
     let server = field(document, "server").trim();
     let port = number(document, "port").unwrap_or(443);
     if server.is_empty() {
-        outcome.refused.push(BodyRefusal {
-            raw: bound(document),
-            error: "missing server".into(),
-        });
-        return outcome;
+        batch.push_refused(
+            ordinal,
+            "",
+            malformed_reason(Diag::new(Key::LinkEntryMissingServer)),
+            bound(document),
+        );
+        return;
     }
     let name = {
         let name = field(document, "name").trim();
@@ -1055,12 +1110,11 @@ fn convert_hysteria2(document: &Value) -> ConvertOutcome {
         parameter.raw.clone_from(&raw);
     }
     outbound.stream = stream;
-    outcome.entries.push(BodyEntry {
-        profile: ServerProfile::new(name, outbound),
-        raw: String::new(),
-        ignored,
-    });
-    outcome
+    let profile = ServerProfile::new(name, outbound);
+    match super::validate_profile(&profile) {
+        Ok(()) => batch.push_accepted(ordinal, profile, raw, ignored),
+        Err(error) => batch.push_refused(ordinal, "", ImportReason::link(error), raw),
+    }
 }
 
 /// Refuse an entry whose credentials are required but empty. `uuid_key` and
@@ -1089,7 +1143,9 @@ fn require_credentials(
         _ => false,
     };
     if missing {
-        Err(Refusal::refused("missing required credentials"))
+        Err(Refusal::refused(malformed_reason(Diag::new(
+            Key::LinkEntryMissingCredentials,
+        ))))
     } else {
         Ok(())
     }
@@ -1153,11 +1209,29 @@ fn bound(value: &Value) -> String {
         .collect()
 }
 
-use std::collections::BTreeMap;
+/// The bounded copy of a source document's text.
+fn bound_text(text: &str) -> String {
+    text.chars().take(super::body::MAX_RAW_CHARS).collect()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::settings::Language;
+
+    fn convert(text: &str) -> ImportBatch {
+        let mut batch = ImportBatch::default();
+        assert!(convert_document(text, &mut batch), "document was claimed");
+        batch
+    }
+
+    fn profiles(batch: &ImportBatch) -> Vec<&ServerProfile> {
+        batch
+            .entries()
+            .into_iter()
+            .map(|entry| entry.profile)
+            .collect()
+    }
 
     #[test]
     fn clash_proxies_convert_and_undialable_entries_are_refused() {
@@ -1180,15 +1254,20 @@ proxies:
 rules:
   - MATCH,DIRECT
 "#;
-        let outcome = convert_document(document).expect("clash document");
-        assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.entries[0].profile.name, "Tokyo");
-        assert_eq!(
-            outcome.entries[0].profile.outbound.stream.network,
-            Network::Ws
-        );
-        assert_eq!(outcome.refused.len(), 1);
-        assert_eq!(outcome.ignored.len(), 1);
+        let batch = convert(document);
+        let refused: Vec<String> = batch
+            .refused()
+            .filter_map(|record| record.reason())
+            .map(|reason| reason.text(Language::En))
+            .collect();
+        let profiles = profiles(&batch);
+        assert_eq!(profiles.len(), 1, "refused: {refused:?}");
+        assert_eq!(profiles[0].outbound.stream.network, Network::Ws);
+        assert_eq!(batch.refused().count(), 1);
+        assert_eq!(batch.ignored().count(), 1);
+        let refusal = batch.refused().next().expect("one refused entry");
+        let reason = refusal.reason().expect("a refused record carries a reason");
+        assert!(reason.text(Language::En).contains("tuic"));
     }
 
     #[test]
@@ -1201,10 +1280,10 @@ proxies:
     port: 443
     password: secret
 "#;
-        let outcome = convert_document(document).expect("clash");
-        let profile = &outcome.entries[0].profile;
-        assert_eq!(profile.outbound.stream.network, Network::Hysteria);
-        assert_eq!(profile.outbound.stream.security, Security::Tls);
+        let batch = convert(document);
+        let profiles = profiles(&batch);
+        assert_eq!(profiles[0].outbound.stream.network, Network::Hysteria);
+        assert_eq!(profiles[0].outbound.stream.security, Security::Tls);
     }
 
     #[test]
@@ -1216,27 +1295,27 @@ proxies:
     server: v.example.com
     port: 443
 "#;
-        let outcome = convert_document(clash).expect("clash");
-        assert_eq!(outcome.entries.len(), 0);
-        assert_eq!(outcome.refused.len(), 1);
+        let batch = convert(clash);
+        assert_eq!(batch.entries().len(), 0);
+        assert_eq!(batch.refused().count(), 1);
 
         let json = r#"{"outbounds":[{"type":"trojan","tag":"NoPass","server":"t.example.com","server_port":443}]}"#;
-        let outcome = convert_document(json).expect("json");
-        assert_eq!(outcome.entries.len(), 0);
-        assert_eq!(outcome.refused.len(), 1);
+        let batch = convert(json);
+        assert_eq!(batch.entries().len(), 0);
+        assert_eq!(batch.refused().count(), 1);
     }
 
     #[test]
     fn hysteria1_is_refused_and_hysteria2_bandwidth_maps() {
         let v1 = r#"{"outbounds":[{"type":"hysteria","tag":"H1","server":"h.example.com","server_port":443}]}"#;
-        let outcome = convert_document(v1).expect("json");
-        assert_eq!(outcome.entries.len(), 0);
-        assert_eq!(outcome.refused.len(), 1);
+        let batch = convert(v1);
+        assert_eq!(batch.entries().len(), 0);
+        assert_eq!(batch.refused().count(), 1);
 
         let v2 = "server: h.example.com\nport: 443\nauth: secret\nup: 100\ndown: 50\n";
-        let outcome = convert_document(v2).expect("hysteria2");
-        let quic = outcome.entries[0]
-            .profile
+        let batch = convert(v2);
+        let profiles = profiles(&batch);
+        let quic = profiles[0]
             .outbound
             .stream
             .finalmask
@@ -1259,28 +1338,27 @@ proxies:
     password: pw
     some-future-key: 1
 "#;
-        let outcome = convert_document(document).expect("clash");
+        let batch = convert(document);
+        let dropped: Vec<&CompatibilityParameter> = batch
+            .ignored()
+            .filter_map(|record| record.parameter())
+            .collect();
         assert!(
-            outcome.entries[0]
-                .ignored
+            dropped
                 .iter()
                 .any(|parameter| parameter.name == "some-future-key")
         );
         assert!(
-            outcome.entries[0]
-                .ignored
-                .iter()
-                .all(|parameter| !parameter.raw.is_empty()
-                    && parameter.raw.chars().count() <= crate::links::body::MAX_RAW_CHARS),
-            "a document parameter still points at its bounded source: {:?}",
-            outcome.entries[0].ignored
+            dropped.iter().all(|parameter| !parameter.raw.is_empty()
+                && parameter.raw.chars().count() <= super::super::body::MAX_RAW_CHARS),
+            "a document parameter still points at its bounded source: {dropped:?}"
         );
         let json = r#"{"outbounds":[{"type":"socks","tag":"S","server":"s.example.com","server_port":1080,"future_field":true}]}"#;
-        let outcome = convert_document(json).expect("json");
+        let batch = convert(json);
         assert!(
-            outcome.entries[0]
-                .ignored
-                .iter()
+            batch
+                .ignored()
+                .filter_map(|record| record.parameter())
                 .any(|parameter| parameter.name == "future_field")
         );
     }
@@ -1290,9 +1368,10 @@ proxies:
         let document = r#"{"version":1,"servers":[
             {"server":"ss.example.com","server_port":8388,"method":"aes-128-gcm","password":"pw","remarks":"SS"}
         ]}"#;
-        let outcome = convert_document(document).expect("sip008");
-        assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.entries[0].profile.name, "SS");
+        let batch = convert(document);
+        let profiles = profiles(&batch);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "SS");
     }
 
     #[test]
@@ -1303,18 +1382,13 @@ proxies:
              "tls":{"enabled":true,"server_name":"example.com","utls":{"fingerprint":"chrome"}},
              "transport":{"type":"ws","path":"/ws"}}
         ],"route":{"rules":[]},"inbounds":[]}"#;
-        let outcome = convert_document(document).expect("sing-box");
-        assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.entries[0].profile.name, "SB");
-        assert_eq!(
-            outcome.entries[0].profile.outbound.stream.network,
-            Network::Ws
-        );
-        assert_eq!(
-            outcome.entries[0].profile.outbound.stream.security,
-            Security::Tls
-        );
-        assert_eq!(outcome.ignored.len(), 2);
+        let batch = convert(document);
+        let profiles = profiles(&batch);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "SB");
+        assert_eq!(profiles[0].outbound.stream.network, Network::Ws);
+        assert_eq!(profiles[0].outbound.stream.security, Security::Tls);
+        assert_eq!(batch.ignored().count(), 2);
     }
 
     #[test]
@@ -1324,18 +1398,20 @@ proxies:
              "id":"11111111-2222-3333-4444-555555555555"},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"example.com"}}},
             {"protocol":"freedom","tag":"direct"}
         ]}"#;
-        let outcome = convert_document(document).expect("xray");
-        assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.entries[0].profile.name, "Xray");
-        assert_eq!(outcome.ignored.len(), 1);
+        let batch = convert(document);
+        let profiles = profiles(&batch);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Xray");
+        assert_eq!(batch.ignored().count(), 1);
     }
 
     #[test]
     fn hysteria2_yaml_converts() {
         let document = "server: hy.example.com\nport: 443\nauth: secret\nsni: example.com\nskip-cert-verify: true\n";
-        let outcome = convert_document(document).expect("hysteria2");
-        assert_eq!(outcome.entries.len(), 1);
-        let profile = &outcome.entries[0].profile;
+        let batch = convert(document);
+        let profiles = profiles(&batch);
+        assert_eq!(profiles.len(), 1);
+        let profile = profiles[0];
         assert_eq!(profile.outbound.stream.network, Network::Hysteria);
         assert_eq!(
             profile
@@ -1351,17 +1427,25 @@ proxies:
     #[test]
     fn undialable_json_protocols_are_refused_with_raw_text() {
         let document = r#"{"outbounds":[{"type":"tuic","tag":"T","server":"t.example.com","server_port":443}]}"#;
-        let outcome = convert_document(document).expect("json");
-        assert_eq!(outcome.entries.len(), 0);
-        assert_eq!(outcome.refused.len(), 1);
-        assert!(outcome.refused[0].raw.contains("tuic"));
+        let batch = convert(document);
+        assert_eq!(batch.entries().len(), 0);
+        assert_eq!(batch.refused().count(), 1);
+        assert!(
+            batch
+                .refused()
+                .next()
+                .expect("one refusal")
+                .raw()
+                .contains("tuic")
+        );
     }
 
     #[test]
     fn wireguard_configuration_converts() {
-        let document = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\nMTU = 1280\n\n[Peer]\nPublicKey = def\nEndpoint = wg.example.com:51820\nAllowedIPs = 0.0.0.0/0\n";
-        let outcome = convert_document(document).expect("wireguard");
-        assert_eq!(outcome.entries.len(), 1);
-        assert_eq!(outcome.entries[0].profile.name, "wg.example.com:51820");
+        let document = "[Interface]\nPrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=\nAddress = 10.0.0.2/32\nMTU = 1280\n\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nEndpoint = wg.example.com:51820\nAllowedIPs = 0.0.0.0/0\n";
+        let batch = convert(document);
+        let profiles = profiles(&batch);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "wg.example.com:51820");
     }
 }

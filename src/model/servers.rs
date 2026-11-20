@@ -1,8 +1,9 @@
 //! Server profiles (GUI state: %APPDATA%\broccoli\state\servers.json).
 
 use super::outbound::OutboundModel;
-use super::settings::{RefreshPath, Settings, Socks5Cfg};
+use super::settings::{Language, RefreshPath, Settings, Socks5Cfg};
 use super::{StateLoadError, load_state, save_state, skip_empty_vec, skip_false};
+use crate::i18n::{Key, t_fmt};
 use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -410,6 +411,17 @@ pub struct RefreshReport {
     pub extra: Map<String, Value>,
 }
 
+impl RefreshReport {
+    /// Append one row while the row list has room. Every producer of a row —
+    /// the refresh reconciliation and the import batch — appends here, so the
+    /// bound has one definition and no caller carries it.
+    pub fn push_row(&mut self, row: ReportRow) {
+        if self.rows.len() < REPORT_ROW_LIMIT {
+            self.rows.push(row);
+        }
+    }
+}
+
 /// One report row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -422,6 +434,106 @@ pub struct ReportRow {
     pub key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw: String,
+    /// The keyed reason a refused row carries. The stored report names the
+    /// rule, never a rendered sentence, so the row follows the active
+    /// language when it is displayed. An older report has no reason and
+    /// renders its stored `name` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ReportReason>,
+}
+
+impl ReportRow {
+    /// The refused row's sentence in `language`: the keyed reason when the
+    /// report carries one, else the stored text of an older report.
+    pub fn reason_text(&self, language: Language) -> Option<String> {
+        match &self.reason {
+            Some(reason) => Some(reason.text(language)),
+            None if !self.name.is_empty() => Some(self.name.clone()),
+            None => None,
+        }
+    }
+}
+
+/// One keyed report reason: an i18n key plus the values its placeholders
+/// need, stored by name so the report renders in whichever language is
+/// active when the user opens it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportReason {
+    /// The stable [`Key::name`] of the rule.
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<ReportArg>,
+    /// The model field the finding names, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// One placeholder value of a [`ReportReason`]: literal text, or a nested
+/// message that renders in the same language as its parent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReportArg {
+    Text(String),
+    Message(Box<ReportReason>),
+}
+
+impl ReportReason {
+    /// A reason for `key` with no placeholder values yet.
+    pub fn keyed(key: Key) -> Self {
+        Self {
+            key: key.name().to_owned(),
+            args: Vec::new(),
+            path: None,
+        }
+    }
+
+    /// Attach the next placeholder value, in template order.
+    #[must_use]
+    pub fn arg(mut self, value: impl ToString) -> Self {
+        self.args.push(ReportArg::Text(value.to_string()));
+        self
+    }
+
+    /// Attach the next placeholder value as a nested message.
+    #[must_use]
+    pub fn arg_message(mut self, message: ReportReason) -> Self {
+        self.args.push(ReportArg::Message(Box::new(message)));
+        self
+    }
+
+    /// Prefix the rendered message with the model field the finding names.
+    #[must_use]
+    pub fn at_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Render the reason in `language`. A key this build does not know (a
+    /// report written by a newer build) renders the fallback sentence that
+    /// names the stored key.
+    pub fn text(&self, language: Language) -> String {
+        let rendered: Vec<String> = self
+            .args
+            .iter()
+            .map(|arg| match arg {
+                ReportArg::Text(text) => text.clone(),
+                ReportArg::Message(message) => message.text(language),
+            })
+            .collect();
+        let refs: Vec<&dyn std::fmt::Display> = rendered
+            .iter()
+            .map(|value| value as &dyn std::fmt::Display)
+            .collect();
+        let message = match Key::from_name(&self.key) {
+            Some(key) => t_fmt(language, key, &refs),
+            None => t_fmt(language, Key::SrvReportUnknownReason, &[&self.key]),
+        };
+        match &self.path {
+            Some(path) if !path.is_empty() => format!("{path}: {message}"),
+            _ => message,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,13 +620,6 @@ pub struct SubscriptionEntry {
 
 /// How many report rows are kept; the counts stay exact.
 pub const REPORT_ROW_LIMIT: usize = 500;
-
-/// Append one report row while the row list has room.
-pub fn push_report_row(rows: &mut Vec<ReportRow>, row: ReportRow) {
-    if rows.len() < REPORT_ROW_LIMIT {
-        rows.push(row);
-    }
-}
 
 /// One `parameter=value` group of ignored report rows: the heading, how many
 /// entries it holds, and their names in report order (the expandable detail).
@@ -729,15 +834,13 @@ impl ServersFile {
                     report.unchanged += 1;
                 } else {
                     report.updated += 1;
-                    push_report_row(
-                        &mut report.rows,
-                        ReportRow {
-                            kind: ReportKind::Updated,
-                            name: profile.name.clone(),
-                            key: String::new(),
-                            raw: String::new(),
-                        },
-                    );
+                    report.push_row(ReportRow {
+                        kind: ReportKind::Updated,
+                        name: profile.name.clone(),
+                        key: String::new(),
+                        raw: String::new(),
+                        reason: None,
+                    });
                 }
             } else {
                 profile.name = self.unique_profile_name(group_id, &profile.name, None);
@@ -748,15 +851,13 @@ impl ServersFile {
                         .map(|profile: &ServerProfile| profile.name.as_str()),
                 );
                 report.added += 1;
-                push_report_row(
-                    &mut report.rows,
-                    ReportRow {
-                        kind: ReportKind::Added,
-                        name: profile.name.clone(),
-                        key: String::new(),
-                        raw: String::new(),
-                    },
-                );
+                report.push_row(ReportRow {
+                    kind: ReportKind::Added,
+                    name: profile.name.clone(),
+                    key: String::new(),
+                    raw: String::new(),
+                    reason: None,
+                });
             }
             fresh.push(profile);
         }
@@ -765,15 +866,13 @@ impl ServersFile {
                 continue;
             }
             report.removed += 1;
-            push_report_row(
-                &mut report.rows,
-                ReportRow {
-                    kind: ReportKind::Removed,
-                    name: profile.name.clone(),
-                    key: String::new(),
-                    raw: String::new(),
-                },
-            );
+            report.push_row(ReportRow {
+                kind: ReportKind::Removed,
+                name: profile.name.clone(),
+                key: String::new(),
+                raw: String::new(),
+                reason: None,
+            });
         }
         self.profiles.extend(fresh);
         if let Some(active) = active
@@ -2238,15 +2337,13 @@ mod tests {
         let mut report = RefreshReport::default();
         for index in 0..(REPORT_ROW_LIMIT + 5) {
             report.added += 1;
-            push_report_row(
-                &mut report.rows,
-                ReportRow {
-                    kind: ReportKind::Added,
-                    name: format!("server-{index}"),
-                    key: String::new(),
-                    raw: String::new(),
-                },
-            );
+            report.push_row(ReportRow {
+                kind: ReportKind::Added,
+                name: format!("server-{index}"),
+                key: String::new(),
+                raw: String::new(),
+                reason: None,
+            });
         }
         assert_eq!(report.rows.len(), REPORT_ROW_LIMIT);
         assert_eq!(report.added, REPORT_ROW_LIMIT + 5);
@@ -2526,6 +2623,40 @@ mod tests {
     }
 
     #[test]
+    fn an_older_report_row_renders_its_stored_text() {
+        let row: ReportRow =
+            serde_json::from_str(r#"{"kind":"refused","name":"bad entry","raw":"x"}"#)
+                .expect("an older row loads without a reason");
+        assert!(row.reason.is_none());
+        assert_eq!(row.reason_text(Language::En).as_deref(), Some("bad entry"));
+    }
+
+    #[test]
+    fn a_report_reason_round_trips_by_key_not_by_sentence() {
+        let reason = ReportReason::keyed(Key::LinkNestedSubscription);
+        let stored = serde_json::to_string(&reason).expect("the reason serializes");
+        assert!(
+            stored.contains("LinkNestedSubscription"),
+            "the key travels: {stored}"
+        );
+        let loaded: ReportReason = serde_json::from_str(&stored).expect("the reason loads");
+        assert_eq!(loaded, reason);
+        assert_eq!(
+            loaded.text(Language::En),
+            t_fmt(Language::En, Key::LinkNestedSubscription, &[])
+        );
+        let unknown = ReportReason {
+            key: "FutureRule".into(),
+            args: Vec::new(),
+            path: None,
+        };
+        assert!(
+            unknown.text(Language::En).contains("FutureRule"),
+            "an unknown key renders the fallback, never a foreign sentence"
+        );
+    }
+
+    #[test]
     fn ignored_rows_group_by_parameter_value() {
         let report = RefreshReport {
             ignored: 3,
@@ -2535,24 +2666,28 @@ mod tests {
                     name: "One: quicSecurity=none".into(),
                     key: "quicSecurity=none".into(),
                     raw: "vless://one?quicSecurity=none".into(),
+                    reason: None,
                 },
                 ReportRow {
                     kind: ReportKind::Added,
                     name: "Two".into(),
                     key: String::new(),
                     raw: String::new(),
+                    reason: None,
                 },
                 ReportRow {
                     kind: ReportKind::Ignored,
                     name: "Two: quicSecurity=none".into(),
                     key: "quicSecurity=none".into(),
                     raw: "vless://two?quicSecurity=none".into(),
+                    reason: None,
                 },
                 ReportRow {
                     kind: ReportKind::Ignored,
                     name: "Three: mux".into(),
                     key: "mux".into(),
                     raw: "vless://three?mux".into(),
+                    reason: None,
                 },
             ],
             ..Default::default()
@@ -2577,6 +2712,7 @@ mod tests {
             name: "Old: mux".into(),
             key: String::new(),
             raw: String::new(),
+            reason: None,
         }];
         let groups = group_ignored_rows(&rows);
         assert_eq!(groups.len(), 1);

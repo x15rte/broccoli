@@ -266,6 +266,23 @@ macro_rules! keys {
                     $( Key::$variant => key_level!($spec), )*
                 }
             }
+
+            /// The key's stable name, for the persisted report reason: a
+            /// stored report names the rule, not any rendered sentence.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $( Key::$variant => stringify!($variant), )*
+                }
+            }
+
+            /// Resolve a persisted reason's key name. An unknown name (a
+            /// report written by a newer build) renders the fallback text.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $( stringify!($variant) => Some(Key::$variant), )*
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -2294,6 +2311,17 @@ keys! {
     LinkLossyXhttpSerialize 2,
     LinkLossyXhttpEncode 2,
     LinkLossyFinalmaskEncode 2,
+    LinkEntryNotText 0,
+    LinkNestedSubscription 0,
+    LinkUnsupportedDocument 0,
+    LinkEntryUnsupportedProtocol 1,
+    LinkEntryMissingEndpoint 0,
+    LinkEntryMissingCredentials 0,
+    LinkEntryMissingServer 0,
+    LinkEntrySip008Incomplete 0,
+    LinkEntryJsonInvalid 1,
+    SrvReportCoreRejected 1,
+    SrvReportUnknownReason 1,
     GenRawOverride 1,
     GenApiListenerPortZero 0,
     GenProbePortZero 0,
@@ -3279,6 +3307,14 @@ pub fn validation_issue_message(issue: &ValidationIssue, lang: Language) -> Stri
         Some(path) if !path.is_empty() => format!("{path}: {message}"),
         _ => message,
     }
+}
+
+/// Resolve one validation rule to its keyed reason: the rule's key and the
+/// placeholder values its template interpolates. A report persists the key
+/// and values, never the rendered sentence.
+pub fn validation_reason_parts(code: &ValidationCode, lang: Language) -> (Key, Vec<String>) {
+    let (key, args) = validation_text(code, lang);
+    (key, args.iter().map(ToString::to_string).collect())
 }
 
 /// Message template for one safety hazard; private, because a payload-carrying
@@ -6476,6 +6512,21 @@ mod en {
             }
             Key::LinkLossyXhttpEncode => "The app cannot encode the XHTTP extra JSON in {}: {}.",
             Key::LinkLossyFinalmaskEncode => "The app cannot encode the finalmask JSON in {}: {}.",
+            Key::LinkEntryNotText => "The entry is not Base64 text.",
+            Key::LinkNestedSubscription => "The entry is a nested subscription URL.",
+            Key::LinkUnsupportedDocument => {
+                "The entry is a document. Paste the document on its own."
+            }
+            Key::LinkEntryUnsupportedProtocol => {
+                "The app cannot dial the {} protocol, so it cannot import this entry."
+            }
+            Key::LinkEntryMissingEndpoint => "The entry has no server or port.",
+            Key::LinkEntryMissingCredentials => "The entry is missing required credentials.",
+            Key::LinkEntryMissingServer => "The entry has no server.",
+            Key::LinkEntrySip008Incomplete => "The entry has no server, port or method.",
+            Key::LinkEntryJsonInvalid => "The entry is not a valid outbound: {}",
+            Key::SrvReportCoreRejected => "Xray rejected the profile: {}",
+            Key::SrvReportUnknownReason => "The report names a reason this build does not know: {}",
             Key::GenRawOverride => "The raw override is not valid JSON: {}",
             Key::GenApiListenerPortZero => "The API listener needs a non-zero port.",
             Key::GenProbePortZero => "The latency probe API listener needs a non-zero port.",
