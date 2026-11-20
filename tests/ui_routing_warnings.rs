@@ -357,17 +357,18 @@ fn port_field_grammar_errors_block_commit_and_valid_list_passes() {
     );
 }
 
-/// The routing rule editor hides the inbound-user email list — the
-/// GUI can set no inbound emails for it to match. The i18n keys were removed
-/// with the widget, so the expected label is a literal.
+/// The routing rule editor offers the inbound-user list. The `user` condition
+/// is a wire matcher the core builds for any list (a blank entry or a bad
+/// `regexp:` entry is dropped from the matcher, never refused), so the rule's
+/// own row edits it like the domain/source lists.
 #[test]
-fn rule_editor_hides_users_email_list() {
+fn rule_editor_offers_users_email_list() {
     let (_lock, _tmp, mut h) = boot_routing(&settings_with_rules(vec![rule_with("r-1")]), None);
     open_rule_editor(&mut h);
 
     assert!(
-        h.query_by_label("Users").is_none(),
-        "the rule editor must not offer the inbound-user email list"
+        h.query_by_label(t(Language::En, Key::Users)).is_some(),
+        "the rule editor must offer the inbound-user email list"
     );
 }
 

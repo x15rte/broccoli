@@ -20,6 +20,7 @@
 //! mod corpus;
 //! ```
 
+use broccoli::model::routing::ConditionField;
 use broccoli::model::stream::Network;
 use broccoli::model::validation::ValidationCode;
 
@@ -237,6 +238,8 @@ pub(crate) fn all_codes() -> Vec<ValidationCode> {
         RoutingRuleOutboundMissing(1, "proxy-9".into()),
         RoutingRuleBalancerMissing(2, "balancer-9".into()),
         RoutingRuleInboundMissing(3, "socks-in".into()),
+        RoutingRulePortListInvalid(2, ConditionField::SourcePort, "70000".into()),
+        RoutingRuleIpRuleInvalid(2, ConditionField::Ip, "example.com".into()),
         DnsServerAddressMissing(1),
         DnsBootstrapNotResolvable,
         LuaScriptPathRequired,
@@ -515,6 +518,7 @@ validation_codes! {
         DokodemoUnixSocketRequired, DokodemoUnixSocketConflict, DokodemoPortZero,
         ListenerConflict, RoutingRuleTarget, RoutingRuleNoMatchers,
         RoutingRuleOutboundMissing, RoutingRuleBalancerMissing, RoutingRuleInboundMissing,
+        RoutingRulePortListInvalid, RoutingRuleIpRuleInvalid,
         DnsServerAddressMissing,
         DnsScriptServerConflict,
         FakeDnsPoolCidrInvalid, FakeDnsPoolSizeInvalid, FakeDnsPoolCapacityExceeded,

@@ -13,6 +13,7 @@ use crate::model::inbound::{
     API_INBOUND_TAG, BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DokodemoNetwork, LocalInboundCfg,
     LocalInboundProtocol, leak_entry_is_valid, listen_endpoints_conflict,
 };
+use crate::model::routing::rule_condition_findings;
 use crate::model::{Group, ServerProfile, ServersFile, Settings, TunCfg, emit};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1206,8 +1207,10 @@ impl<'a> SettingsWalk<'a> {
     /// Routing rules: a configured script first (the core refuses it beside
     /// any rule or a non-default strategy, and the app never drops the rules),
     /// then an unresolved target short-circuits (the reference checks below
-    /// would name it), then the outbound, balancer and inbound references each
-    /// resolve against the set their emitter produced.
+    /// would name it), then the rule's own condition grammar — every value the
+    /// core refuses at load (`crate::model::routing::grammar`) — and then the
+    /// outbound, balancer and inbound references each resolve against the set
+    /// their emitter produced.
     fn routing_rules(&mut self) {
         for code in routing_script_issues(
             self.settings.routing.script.as_deref(),
@@ -1239,6 +1242,9 @@ impl<'a> SettingsWalk<'a> {
                     ValidationCode::RoutingRuleNoMatchers(index + 1),
                     None,
                 ));
+            }
+            for finding in rule_condition_findings(rule, index + 1) {
+                self.issues.push(issue(finding.code, None));
             }
             if !rule.outbound_tag.is_empty() && !self.outbound_tags.contains(&rule.outbound_tag) {
                 self.issues.push(issue(
@@ -2040,6 +2046,54 @@ mod tests {
             !found
                 .iter()
                 .any(|code| matches!(code, ValidationCode::RoutingRuleNoMatchers(_))),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn a_persisted_rule_with_a_refused_port_list_blocks_apply() {
+        use crate::model::routing::{ConditionField, Rule};
+
+        // `"99999"` is a bare entry the core reads as a JSON `uint32` and then
+        // refuses (`infra/conf/common.go:247-283`), so the whole document
+        // fails to load: the gate names the rule and the field.
+        let mut settings = Settings::default();
+        settings.routing.rules.push(Rule {
+            outbound_tag: DIRECT_OUTBOUND_TAG.into(),
+            port: "99999".into(),
+            ..Default::default()
+        });
+        let verdict = validate_settings(&settings, &ServersFile::default(), 10853);
+        let finding = finding(
+            &verdict,
+            &ValidationCode::RoutingRulePortListInvalid(1, ConditionField::Port, "99999".into()),
+        )
+        .expect("a refused PortList must gate the apply");
+        assert_eq!(finding.severity, Severity::Error);
+        assert_eq!(finding.path, None, "the message names the rule itself");
+
+        // The reversed range and the blank entry stay legal: the pinned core
+        // loads both, so the model must not refuse them.
+        settings.routing.rules[0].port = "0-65535, 53,443-448, 1-0, 80,".into();
+        settings.routing.rules[0].ip = vec!["example.com".into()];
+        let found = codes(&validate_settings(
+            &settings,
+            &ServersFile::default(),
+            10853,
+        ));
+        assert!(
+            !found
+                .iter()
+                .any(|code| matches!(code, ValidationCode::RoutingRulePortListInvalid(..))),
+            "the core loads this list: {found:#?}"
+        );
+        // The IP grammar is the other half of the same pass.
+        assert!(
+            found.contains(&ValidationCode::RoutingRuleIpRuleInvalid(
+                1,
+                ConditionField::Ip,
+                "example.com".into()
+            )),
             "{found:#?}"
         );
     }

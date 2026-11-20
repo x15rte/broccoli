@@ -45,6 +45,7 @@
 //! the one path a caller imports.
 
 use crate::excerpt::{excerpt, excerpt_debug};
+use crate::model::routing::ConditionField;
 use crate::model::stream::Network;
 use serde_json::{Map, Value};
 
@@ -711,6 +712,19 @@ pub enum ValidationCode {
     RoutingRuleBalancerMissing(usize, String),
     /// A routing rule references a missing inbound (index, tag).
     RoutingRuleInboundMissing(usize, String),
+    /// A routing rule's `port`/`sourcePort`/`localPort`/`vlessRoute` value the
+    /// pinned core refuses at load: `PortList.UnmarshalJSON`
+    /// (`infra/conf/common.go:247-283`) rejects a bare entry that is not a
+    /// JSON integer of at most 65535 and a range endpoint that is not a
+    /// decimal `uint32` of at most 65535. The payload is the 1-based rule
+    /// index, the field, and the excerpt of the first refused entry.
+    RoutingRulePortListInvalid(usize, ConditionField, String),
+    /// A routing rule's `ip`/`source`/`localIP` entry that
+    /// `geodata.ParseIPRules` refuses ("illegal ip rule",
+    /// `common/geodata/rule_parser.go:15-40`): the whole document fails to
+    /// load. The payload is the 1-based rule index, the field, and the excerpt
+    /// of the first refused entry.
+    RoutingRuleIpRuleInvalid(usize, ConditionField, String),
     /// A configured DNS server without an address (1-based index).
     DnsServerAddressMissing(usize),
     /// The GUI bootstrap override is an endpoint the generator cannot turn

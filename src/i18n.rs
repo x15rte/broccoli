@@ -794,6 +794,8 @@ keys! {
     ProcessesHint 0,
     LocalOs 0,
     LocalOsHint 0,
+    Users 0,
+    UsersHint 0,
     VlessRoute 0,
     VlessRouteHint 0,
     Attrs 0,
@@ -946,6 +948,7 @@ keys! {
     RuleSummaryPort 1,
     RuleSummaryProto 1,
     RuleSummaryIn 1,
+    RuleSummaryUser 1,
     RuleSummaryProc 1,
     RuleSummaryMatchAll 0,
     RuleSummaryNoConditions 0,
@@ -2033,6 +2036,12 @@ keys! {
     SettingsRoutingRuleOutboundMissing 2,
     SettingsRoutingRuleBalancerMissing 2,
     SettingsRoutingRuleInboundMissing 2,
+    /// A routing rule's PortList field carrying an entry the core refuses (the
+    /// 1-based rule index, the field label, the entry).
+    SettingsRoutingRulePortListInvalid 3,
+    /// A routing rule's IP-rule field carrying an entry the core refuses (the
+    /// 1-based rule index, the field label, the entry).
+    SettingsRoutingRuleIpRuleInvalid 3,
     SettingsDnsServerAddressMissing 1,
     SettingsDnsBootstrapNotResolvable 0,
     SettingsLuaScriptPathRequired 0,
@@ -3186,6 +3195,14 @@ fn validation_text<'a>(code: &'a ValidationCode, lang: Language) -> (Key, Vec<Va
             Key::SettingsRoutingRuleInboundMissing,
             vec![Count(*index), Quoted(tag)],
         ),
+        RoutingRulePortListInvalid(index, field, entry) => (
+            Key::SettingsRoutingRulePortListInvalid,
+            vec![Count(*index), Text(t(lang, field.label())), Quoted(entry)],
+        ),
+        RoutingRuleIpRuleInvalid(index, field, entry) => (
+            Key::SettingsRoutingRuleIpRuleInvalid,
+            vec![Count(*index), Text(t(lang, field.label())), Quoted(entry)],
+        ),
         DnsServerAddressMissing(index) => {
             (Key::SettingsDnsServerAddressMissing, vec![Count(*index)])
         }
@@ -4025,6 +4042,8 @@ mod en {
             Key::LocalOsHint => {
                 "windows, darwin, linux — matches the machine's OS, case-insensitive"
             }
+            Key::Users => "Users",
+            Key::UsersHint => "alice@example.com — the inbound account email, or regexp:^team-",
             Key::VlessRoute => "VLESS route",
             Key::VlessRouteHint => "PortList — VLESS routing marker",
             Key::Attrs => "Attrs (HTTP sniff header regexps)",
@@ -4221,6 +4240,7 @@ mod en {
             Key::RuleSummaryPort => "port: {}",
             Key::RuleSummaryProto => "proto: {}",
             Key::RuleSummaryIn => "in: {}",
+            Key::RuleSummaryUser => "user: {}",
             Key::RuleSummaryProc => "proc: {}",
             Key::RuleSummaryMatchAll => "match all",
             Key::RuleSummaryNoConditions => "no match conditions (the core refuses this rule)",
@@ -5979,6 +5999,14 @@ mod en {
             }
             Key::SettingsRoutingRuleInboundMissing => {
                 "routing rule {} references missing inbound {}"
+            }
+            Key::SettingsRoutingRulePortListInvalid => {
+                "routing rule {}: the {} field carries {}, which is not a port list the core \
+                 accepts"
+            }
+            Key::SettingsRoutingRuleIpRuleInvalid => {
+                "routing rule {}: the {} field carries {}, which is not an IP rule the core \
+                 accepts"
             }
             Key::SettingsDnsServerAddressMissing => "DNS server {} has no address",
             Key::SettingsLuaScriptPathRequired => {

@@ -16,6 +16,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+mod grammar;
+pub use grammar::{ConditionField, ConditionFinding, port_list_error, rule_condition_findings};
+
 /// One routing rule (router.go:121-151). Every field gets a GUI editor row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

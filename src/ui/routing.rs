@@ -7,10 +7,13 @@ use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, safety_message, t, t_fmt};
 use crate::model::emit;
 use crate::model::inbound::DIRECT_OUTBOUND_TAG;
-use crate::model::routing::{RouteTestRequest, RoutingIntegrityError};
+use crate::model::routing::{
+    ConditionField, RouteTestRequest, RoutingIntegrityError, port_list_error,
+    rule_condition_findings,
+};
 use crate::model::safety::SafetyVerdicts;
 use crate::model::settings::Language;
-use crate::model::validation::{ip_rule_valid, routing_script_issues};
+use crate::model::validation::routing_script_issues;
 use crate::model::{
     Balancer, DurationMs, LeastLoadSettings, Rule, ServersFile, Settings, StrategyCost, Webhook,
 };
@@ -1767,7 +1770,7 @@ impl RoutingScreen {
                             );
                         }
                         if self.edit_rule == Some(i) {
-                            *changed |= self.rule_editor(ui, lang, rule);
+                            *changed |= self.rule_editor(ui, lang, rule, i + 1);
                         }
                     });
                 }
@@ -1803,13 +1806,34 @@ impl RoutingScreen {
     }
 
     /// Inline editor covering every `Rule` model field. Returns true on change.
-    fn rule_editor(&mut self, ui: &mut Ui, lang: Language, rule: &mut Rule) -> bool {
+    ///
+    /// The condition grammar is the model's (`crate::model::routing::grammar`):
+    /// the red text under a field and the gate that writes it read the same
+    /// call. PortList fields have one rule the editor alone answers — a
+    /// half-typed list lives in a commit-gated buffer, never in the model — so
+    /// their check runs on the buffer instead of the rule, and only a list the
+    /// grammar accepts is committed.
+    fn rule_editor(&mut self, ui: &mut Ui, lang: Language, rule: &mut Rule, number: usize) -> bool {
         let mut changed = false;
+        // The rule's own findings, computed once per frame: the IP rows have no
+        // buffer, so their value is the model's and the finding is the gate's
+        // own verdict. `number` is the rule's 1-based row position, which every
+        // settings-scope finding about a rule names.
+        let findings = rule_condition_findings(rule, number);
+        let condition_error = |field: ConditionField| {
+            findings
+                .iter()
+                .find(|finding| finding.field == field)
+                .map(|finding| finding.diag.text(lang))
+        };
+        // The PortList grammar, read by the field's red text and by the commit
+        // gate below.
+        let port_error = |value: &str| port_list_error(value).map(|diag| diag.text(lang));
 
         // PortList fields are edited through commit-gated buffers: an
-        // invalid list (bad token, out-of-range port, empty token) renders
-        // an inline error and never writes the model, so it cannot reach a
-        // saved or applied config. Buffers are keyed by rule
+        // invalid list (a bad entry, out-of-range port, empty range endpoint)
+        // renders an inline error and never writes the model, so it cannot
+        // reach a saved or applied config. Buffers are keyed by rule
         // tag, like the attrs buffer. The tag is read off the model at
         // each id/buffer site (never cloned into a local for the frame),
         // and only a freshly seeded buffer owns a copy.
@@ -1824,9 +1848,6 @@ impl RoutingScreen {
                 },
             ));
         }
-        let port_error = |s: &str| {
-            (!valid_port_list(s)).then(|| t(lang, Key::RoutingPortListInvalid).to_string())
-        };
 
         egui::Grid::new(("rule-edit", rule.rule_tag.as_str()))
             .num_columns(2)
@@ -1880,7 +1901,7 @@ impl RoutingScreen {
                     self.geodata_diagnostic(ui, lang, GeodataPickerKind::Geoip);
                     changed |=
                         widgets::string_list(ui, lang, "", &mut rule.ip, t(lang, Key::IpsHint));
-                    if let Some(message) = ip_list_error(lang, &rule.ip) {
+                    if let Some(message) = condition_error(ConditionField::Ip) {
                         ui.horizontal(|ui| {
                             ui.add_space(ui.spacing().indent);
                             ui.colored_label(
@@ -1899,7 +1920,7 @@ impl RoutingScreen {
                         &mut buf.port,
                         t(lang, Key::PortHint),
                         port_error,
-                    ) && valid_port_list(&buf.port)
+                    ) && port_error(&buf.port).is_none()
                     {
                         rule.port = buf.port.clone();
                         changed = true;
@@ -1910,7 +1931,7 @@ impl RoutingScreen {
                         &mut buf.source_port,
                         t(lang, Key::SourcePortHint),
                         port_error,
-                    ) && valid_port_list(&buf.source_port)
+                    ) && port_error(&buf.source_port).is_none()
                     {
                         rule.source_port = buf.source_port.clone();
                         changed = true;
@@ -1926,7 +1947,7 @@ impl RoutingScreen {
                         t(lang, Key::LocalPortHint),
                         port_error,
                     )
-                    && valid_port_list(&buf.local_port)
+                    && port_error(&buf.local_port).is_none()
                 {
                     rule.local_port = buf.local_port.clone();
                     changed = true;
@@ -1953,7 +1974,7 @@ impl RoutingScreen {
                     &mut rule.source,
                     t(lang, Key::SourceIpsHint),
                 );
-                if let Some(message) = ip_list_error(lang, &rule.source) {
+                if let Some(message) = condition_error(ConditionField::Source) {
                     ui.horizontal(|ui| {
                         ui.add_space(ui.spacing().indent);
                         ui.colored_label(status_colors_of(ui).err, RichText::new(message).small());
@@ -1966,7 +1987,7 @@ impl RoutingScreen {
                     &mut rule.local_ip,
                     t(lang, Key::LocalIpsHint),
                 );
-                if let Some(message) = ip_list_error(lang, &rule.local_ip) {
+                if let Some(message) = condition_error(ConditionField::LocalIp) {
                     ui.horizontal(|ui| {
                         ui.add_space(ui.spacing().indent);
                         ui.colored_label(status_colors_of(ui).err, RichText::new(message).small());
@@ -1986,6 +2007,15 @@ impl RoutingScreen {
                 changed |= widgets::string_list(
                     ui,
                     lang,
+                    t(lang, Key::Users),
+                    &mut rule.user,
+                    t(lang, Key::UsersHint),
+                );
+                ui.end_row();
+
+                changed |= widgets::string_list(
+                    ui,
+                    lang,
                     t(lang, Key::Processes),
                     &mut rule.process,
                     t(lang, Key::ProcessesHint),
@@ -1998,7 +2028,7 @@ impl RoutingScreen {
                         t(lang, Key::VlessRouteHint),
                         port_error,
                     )
-                    && valid_port_list(&buf.vless_route)
+                    && port_error(&buf.vless_route).is_none()
                 {
                     rule.vless_route = buf.vless_route.clone();
                     changed = true;
@@ -4816,7 +4846,7 @@ mod view_cache_tests {
 /// warnings follow [`assess`] through the view cache.
 #[cfg(test)]
 mod routing_grammar_tests {
-    use super::{Language, RoutingScreen, ip_rule_valid, valid_port_list};
+    use super::{Language, RoutingScreen};
     use crate::i18n::{Key, t};
     use crate::model::{
         Balancer, OutboundModel, ServerProfile, ServersFile, Settings, StrategyCfg,
@@ -4898,80 +4928,6 @@ mod routing_grammar_tests {
         );
     }
 
-    #[test]
-    fn port_list_grammar_matches_the_wire_parser() {
-        for valid in [
-            "",
-            "80",
-            "80,443,1000-2000",
-            "0",
-            "65535",
-            "1-65535",
-            "80, 443",
-            "1000-2000,53",
-            "80-80",
-        ] {
-            assert!(
-                valid_port_list(valid),
-                "{valid:?} must be a valid port list"
-            );
-        }
-        for invalid in [
-            "abc", "70,abc", "99999", "1-", "-1", "80,", ",80", "80--90", "1.5", "0x50", "80,1-",
-            "65536", "90-80",
-        ] {
-            assert!(!valid_port_list(invalid), "{invalid:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn ip_rule_grammar_matches_the_wire_parser() {
-        for valid in [
-            "1.2.3.4",
-            " 1.2.3.4 ",
-            "[::1]",
-            "::1",
-            "2001:db8::68",
-            "10.0.0.0/8",
-            "2001:db8::/32",
-            "1.2.3.0/24",
-            "0.0.0.0/0",
-            "::/0",
-            "1.2.3.4/32",
-            "1.2.3.4/",
-            "::1/128",
-            "geoip:cn",
-            "geoip:private",
-            "geoip:!private",
-            "ext:geoip.dat:cn",
-            "ext-ip:geoip.dat:cn",
-            "!1.2.3.4",
-            "!!geoip:cn",
-        ] {
-            assert!(ip_rule_valid(valid), "{valid:?} must be a valid IP rule");
-        }
-        for invalid in [
-            "abc",
-            "example.com",
-            "1.2.3.4/33",
-            "::1/129",
-            "1.2.3.4/abc",
-            "1.2.3.4/ 24",
-            "1.2.3.4/24/8",
-            "/24",
-            "geoip:",
-            "ext:",
-            "ext:geoip.dat",
-            "ext::cn",
-            "ext:geoip.dat:",
-            "999.1.2.3",
-            "10.0.0.0/-1",
-            "10.0.0.0/8 ",
-        ] {
-            assert!(!ip_rule_valid(invalid), "{invalid:?} must be rejected");
-        }
-    }
-
     /// The cached warning vector follows the hazard projection: a selector
     /// matching no outbound tag warns, and the warning clears once a profile
     /// tag matches.
@@ -5003,6 +4959,138 @@ mod routing_grammar_tests {
         assert!(
             screen.view_cache.as_ref().unwrap().balancer_warnings[0].is_none(),
             "a selector matching a seeded profile must not warn"
+        );
+    }
+}
+
+/// The rule editor and the rule row read the model's condition grammar: the
+/// open rule renders per-field findings, a draft PortList the grammar refuses
+/// never reaches the model, and a `user`-only rule names its user instead of
+/// claiming a match-all.
+#[cfg(test)]
+mod routing_condition_grammar_tests {
+    use super::{Key, Language, RoutingScreen, Rule, rule_summary, t};
+    use crate::ui::test_rig::{UiTestRig, screen_harness_at};
+    use egui::accesskit::Role;
+    use egui::{Key as EguiKey, Modifiers};
+    use egui_kittest::kittest::Queryable as _;
+
+    /// A screen with the first rule's editor open over one seeded rule.
+    fn harness_with_rule(rule: Rule) -> ScreenHarness {
+        let mut rig = UiTestRig::default();
+        rig.settings.routing.rules = vec![rule];
+        let screen = RoutingScreen {
+            edit_rule: Some(0),
+            ..RoutingScreen::default()
+        };
+        let mut harness = screen_harness_at(
+            egui::vec2(900.0, 1600.0),
+            rig,
+            screen.with_settled_geodata(),
+        );
+        harness.run();
+        harness
+    }
+
+    type ScreenHarness = egui_kittest::Harness<'static, (RoutingScreen, UiTestRig)>;
+
+    /// Replace the text of the only text field holding `from` (click, select
+    /// all, type) — the smoke-test editing flow.
+    fn replace_text(harness: &mut ScreenHarness, from: &str, to: &str) {
+        harness
+            .get_all_by_role(Role::TextInput)
+            .find(|node| node.value().as_deref() == Some(from))
+            .expect("the field holding the current value")
+            .click();
+        harness.run();
+        harness.key_combination_modifiers(Modifiers::COMMAND, &[EguiKey::A]);
+        harness.run();
+        harness
+            .get_all_by_role(Role::TextInput)
+            .find(|node| node.value().as_deref() == Some(from))
+            .expect("the field keeps the typed value")
+            .type_text(to);
+        harness.run_steps(4);
+    }
+
+    #[test]
+    fn an_invalid_port_draft_shows_the_grammar_and_never_reaches_the_model() {
+        let mut harness = harness_with_rule(Rule {
+            rule_tag: "port-rule".into(),
+            outbound_tag: "direct".into(),
+            port: "80".into(),
+            ..Rule::default()
+        });
+
+        let message = t(Language::En, Key::RoutingPortListInvalid);
+        assert!(
+            harness.query_by_label(message).is_none(),
+            "the committed list is one the core accepts"
+        );
+
+        // A range endpoint the core cannot read: the grammar's sentence
+        // renders under the field and the draft stays out of the model.
+        replace_text(&mut harness, "80", "1-");
+        assert!(
+            harness.query_by_label(message).is_some(),
+            "the grammar sentence must render for the edited rule"
+        );
+        assert_eq!(
+            harness.state().1.settings.routing.rules[0].port,
+            "80",
+            "a draft the grammar refuses never reaches the model"
+        );
+
+        replace_text(&mut harness, "1-", "80,443");
+        assert!(
+            harness.query_by_label(message).is_none(),
+            "a list the core accepts clears the sentence"
+        );
+        assert_eq!(
+            harness.state().1.settings.routing.rules[0].port,
+            "80,443",
+            "a list the core accepts commits"
+        );
+    }
+
+    #[test]
+    fn the_open_rule_renders_the_finding_of_each_refused_field() {
+        let harness = harness_with_rule(Rule {
+            rule_tag: "ip-rule".into(),
+            outbound_tag: "direct".into(),
+            ip: vec!["example.com".into()],
+            port: "80".into(),
+            ..Rule::default()
+        });
+
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::RoutingIpListInvalid))
+                .is_some(),
+            "the rule's own finding renders under the ip field"
+        );
+        assert!(
+            harness
+                .query_by_label(t(Language::En, Key::RoutingPortListInvalid))
+                .is_none(),
+            "the valid port field renders no sentence"
+        );
+    }
+
+    #[test]
+    fn a_user_only_rule_names_the_user_instead_of_matching_all() {
+        let rule = Rule {
+            user: vec!["alice@example.com".into()],
+            ..Rule::default()
+        };
+        assert_eq!(
+            rule_summary(Language::En, &rule),
+            "user: alice@example.com",
+            "a rule whose only condition is `user` must name it"
+        );
+        assert_ne!(
+            rule_summary(Language::En, &rule),
+            t(Language::En, Key::RuleSummaryMatchAll)
         );
     }
 }
@@ -5330,6 +5418,9 @@ fn rule_summary(lang: Language, r: &Rule) -> String {
             &[&one_plus(&r.inbound_tag)],
         ));
     }
+    if !r.user.is_empty() {
+        parts.push(t_fmt(lang, Key::RuleSummaryUser, &[&one_plus(&r.user)]));
+    }
     if !r.process.is_empty() {
         parts.push(t_fmt(lang, Key::RuleSummaryProc, &[&one_plus(&r.process)]));
     }
@@ -5374,47 +5465,6 @@ fn map_from_kv(kv: &[(String, String)]) -> Map<String, Value> {
     widgets::kv_rows_trimmed(kv)
         .map(|(k, v)| (k, Value::String(v)))
         .collect()
-}
-/// Xray routing PortList grammar (`infra/conf/common.go`): a
-/// comma-separated list of port numbers or from-to ranges, every endpoint
-/// 0-65535, from ≤ to (Xray's `PortRange.UnmarshalJSON` rejects reversed
-/// ranges), no empty tokens. The empty string is the absent condition
-/// (matches everything).
-fn valid_port_list(s: &str) -> bool {
-    if s.trim().is_empty() {
-        return true;
-    }
-    s.split(',').all(|token| valid_port_token(token.trim()))
-}
-
-fn valid_port_token(token: &str) -> bool {
-    match token.split_once('-') {
-        Some((from, to)) => match (valid_port_number(from), valid_port_number(to)) {
-            (Some(from), Some(to)) => from <= to,
-            _ => false,
-        },
-        None => valid_port_number(token).is_some(),
-    }
-}
-
-fn valid_port_number(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let port = s.parse::<u32>().ok()?;
-    (port <= u16::MAX as u32).then_some(port)
-}
-
-/// Inline red-tier error for a rule IP list (`ip`, `source`, `local_ip`):
-/// Xray's `ParseIPRules` hard-rejects a malformed token at config load
-/// ("illegal ip rule"), so the editor flags those tokens before the config
-/// is ever generated. The predicate is the model's shared `ParseIPRules`
-/// mirror, the same one the inbound `filter` mask gates on.
-fn ip_list_error(lang: Language, items: &[String]) -> Option<String> {
-    items
-        .iter()
-        .any(|item| !ip_rule_valid(item))
-        .then(|| t(lang, Key::RoutingIpListInvalid).to_string())
 }
 
 #[cfg(test)]
