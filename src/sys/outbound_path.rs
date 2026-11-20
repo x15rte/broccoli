@@ -124,14 +124,6 @@ impl<'a> OutboundPath<'a> {
         }
     }
 
-    /// The effective refresh path a fetch prefers for `subscription`: its
-    /// override pair when the group has one, the global pair otherwise,
-    /// degraded by the render gate. The transport additionally checks the live
-    /// capture; the two agree whenever the tunnel is live.
-    pub fn refresh_path(&self, subscription: Option<&Subscription>) -> RefreshPath {
-        effective_refresh_path(self.refresh_pair(subscription).0, self.gate())
-    }
-
     /// Resolve the effective refresh path into the fetch client's transport.
     /// The path and its SOCKS5 block are selected as one pair from the group's
     /// override, so a caller cannot dial the override's path through the

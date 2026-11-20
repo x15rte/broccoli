@@ -1149,11 +1149,6 @@ mod tests {
                                 None => (stored, &settings.subscription_socks5),
                             };
                             let effective = effective_refresh_path(stored_in_force, gate);
-                            assert_eq!(
-                                resolved.refresh_path(subscription_ref),
-                                effective,
-                                "{why}: the displayed path is the render-gated one"
-                            );
 
                             let note = match effective {
                                 RefreshPath::BindNic => Key::SettingsPathNoteBindNic,
