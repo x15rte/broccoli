@@ -8,10 +8,10 @@
 //! lists and the per-row facts are derived with them, so a drag frame and a
 //! painted row read a computed fact instead of re-deriving it.
 //!
-//! The facts are display facts only (ADR-0078): whether the row is the active
-//! route, is emitted only for the chain, is locked or can move. A command
-//! that changes the model still changes the model, and the next generation
-//! rebuilds these rows from it.
+//! The facts are display facts only: whether the row is the active route, is
+//! emitted only for the chain, is locked or can move. The model owns every
+//! verdict and emits the order; a command that changes the model still changes
+//! the model, and the next generation rebuilds these rows from it.
 
 use std::collections::HashMap;
 use std::rc::Rc;
