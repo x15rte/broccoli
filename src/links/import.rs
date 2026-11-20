@@ -64,18 +64,6 @@ impl ImportReason {
         }
     }
 
-    /// The reason as a [`LinkError`], for the bulk-parse adapter's public
-    /// face. A core verdict has no grammar equivalent, so it reports the
-    /// profile it refused.
-    pub fn to_link_error(&self) -> LinkError {
-        match self {
-            Self::Link(error) => error.as_ref().clone(),
-            Self::Core(output) => {
-                LinkError::Malformed(Diag::new(Key::SrvReportCoreRejected).arg(output))
-            }
-        }
-    }
-
     /// The reason's persisted shape. Placeholder values that name another
     /// rule's sentence render in `language`; the reason's own template
     /// renders in whichever language is active when the report opens.
@@ -813,6 +801,54 @@ mod tests {
         for record in batch.records() {
             assert_eq!(record.raw().chars().count(), MAX_RAW_CHARS);
         }
+    }
+
+    #[test]
+    fn an_oversized_body_is_one_refused_record() {
+        let text = "x".repeat(crate::links::MAX_BULK_LEN + 1);
+        let batch = parse_body(&text);
+        assert_eq!(batch.records().len(), 1, "one wholesale refusal");
+        let record = &batch.records()[0];
+        assert_eq!(record.kind(), ImportKind::Refused);
+        match record.reason() {
+            Some(ImportReason::Link(error)) => match error.as_ref() {
+                LinkError::Malformed(diag) => {
+                    assert_eq!(diag.key(), Key::LinkSubscriptionTooLarge);
+                }
+                other => panic!("expected the bulk cap, got {other:?}"),
+            },
+            other => panic!("expected a grammar refusal, got {other:?}"),
+        }
+        assert_eq!(record.raw().chars().count(), MAX_RAW_CHARS);
+    }
+
+    #[test]
+    fn an_overlong_line_is_refused_and_its_neighbours_survive() {
+        let long = format!("vless://{}:443", "b".repeat(crate::links::MAX_LINK_LEN));
+        let text = format!(
+            "vless://{UUID}@ok.local:443?encryption=none#Ok\n\
+             {long}\n\
+             vless://{UUID}@ok2.local:443?encryption=none#Ok2\n"
+        );
+        let batch = parse_body(&text);
+        let kinds: Vec<ImportKind> = batch.records().iter().map(|r| r.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ImportKind::Accepted,
+                ImportKind::Refused,
+                ImportKind::Accepted
+            ]
+        );
+        let refused = batch.refused().next().expect("the long line is refused");
+        match refused.reason() {
+            Some(ImportReason::Link(error)) => match error.as_ref() {
+                LinkError::Malformed(diag) => assert_eq!(diag.key(), Key::LinkTooLong),
+                other => panic!("expected the line cap, got {other:?}"),
+            },
+            other => panic!("expected a grammar refusal, got {other:?}"),
+        }
+        assert_eq!(refused.ordinal(), 1, "the refusal keeps its line");
     }
 
     #[test]

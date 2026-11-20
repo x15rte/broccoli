@@ -107,7 +107,6 @@ use std::error::Error;
 use std::fmt;
 use std::hash::Hasher;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::diag::Diag;
 use crate::excerpt::{excerpt, excerpt_debug};
@@ -4633,62 +4632,6 @@ pub fn parse_link(s: &str) -> Result<ParsedLink, LinkError> {
     Ok(ParsedLink { profile, ignored })
 }
 
-/// Parse a paste/subscription blob: one link per line; blank lines and
-/// `#comment` lines are skipped. The whole blob is bounded by
-/// [`MAX_BULK_LEN`]; an oversized blob yields one `Malformed` error entry.
-///
-/// An adapter over [`import::parse_body_cancellable`], so the bulk cap, the
-/// line walk and the skip rule have one implementation. Compatibility
-/// parameters travel with the profile they belong to.
-pub fn parse_bulk(text: &str) -> Vec<Result<ParsedLink, LinkError>> {
-    static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
-    parse_bulk_cancellable(text, &NEVER_CANCELLED)
-        .expect("a cancellation flag private to this function is never set")
-}
-
-/// Cancellable bulk parse for worker threads: `cancel` is polled between
-/// lines, so a UI cancel stops parsing promptly on large pastes. Partial
-/// results are discarded (`None`) once cancelled. The [`MAX_BULK_LEN`]
-/// aggregate and [`MAX_LINK_LEN`] per-line caps are enforced exactly as in
-/// [`parse_bulk`].
-pub fn parse_bulk_cancellable(
-    text: &str,
-    cancel: &AtomicBool,
-) -> Option<Vec<Result<ParsedLink, LinkError>>> {
-    let batch = import::parse_body_cancellable(text, cancel);
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-    let mut parsed = Vec::new();
-    let mut pending = Vec::new();
-    for record in batch.records() {
-        match record.kind() {
-            ImportKind::Accepted => {
-                let profile = record
-                    .profile()
-                    .expect("an accepted record carries its profile");
-                parsed.push(Ok(ParsedLink {
-                    profile: profile.clone(),
-                    ignored: pending.drain(..).cloned().collect(),
-                }));
-            }
-            ImportKind::Refused => {
-                pending.clear();
-                if let Some(reason) = record.reason() {
-                    parsed.push(Err(reason.to_link_error()));
-                }
-            }
-            ImportKind::IgnoredParameter => {
-                if let Some(parameter) = record.parameter() {
-                    pending.push(parameter);
-                }
-            }
-            ImportKind::IgnoredSection => pending.clear(),
-        }
-    }
-    Some(parsed)
-}
-
 /// Export a profile to its share link. `Unsupported` for the non-shareable
 /// protocols (socks/http/wireguard/freedom/blackhole/dns/loopback/hysteria).
 pub fn to_link(profile: &ServerProfile) -> Result<String, LinkError> {
@@ -8035,15 +7978,23 @@ mod tests {
 
     #[test]
     fn bulk_skips_blanks_and_comments() {
+        use crate::links::import::{ImportKind, parse_body};
+
         let ui = URL_SAFE_NO_PAD.encode("aes-128-gcm:pw");
         let text = format!(
             "# subscription comment\n\n   \nvless://{UUID}@a.local:443?encryption=none#A\nss://{ui}@b.example.com:8388#B\nnot a link\n"
         );
-        let res = parse_bulk(&text);
-        assert_eq!(res.len(), 3);
-        assert!(res[0].is_ok());
-        assert!(res[1].is_ok());
-        assert!(matches!(res[2], Err(LinkError::Malformed(_))));
+        let batch = parse_body(&text);
+        let kinds: Vec<ImportKind> = batch.records().iter().map(|r| r.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ImportKind::Accepted,
+                ImportKind::Accepted,
+                ImportKind::Refused
+            ],
+            "comments and blank lines never become records"
+        );
     }
 
     // ----- qr -----
@@ -8157,114 +8108,6 @@ mod tests {
             }
             other => panic!("expected too-long rejection, got {}", outcome_shape(&other)),
         }
-    }
-
-    #[test]
-    fn parse_bulk_rejects_overlong_single_line_but_keeps_valid_lines() {
-        let long = format!("vless://{}:443", "b".repeat(MAX_LINK_LEN));
-        let text = format!(
-            "vless://{UUID}@ok.local:443?encryption=none#Ok\n\
-             {long}\n\
-             vless://{UUID}@ok2.local:443?encryption=none#Ok2\n"
-        );
-        let parsed = parse_bulk(&text);
-        assert_eq!(parsed.len(), 3, "all three lines must yield a result");
-        assert!(parsed[0].is_ok(), "short line before the long one");
-        match &parsed[1] {
-            Err(LinkError::Malformed(message)) => {
-                let message = message.text(Language::En);
-                assert!(
-                    message.contains("link is too long"),
-                    "message must name the cap: {message:?}"
-                );
-                assert!(!message.contains(&long), "error must not echo the line");
-            }
-            other => panic!("expected too-long rejection, got {}", outcome_shape(other)),
-        }
-        assert!(parsed[2].is_ok(), "short line after the long one");
-    }
-
-    #[test]
-    fn parse_bulk_rejects_oversized_blob_wholesale() {
-        let text = "x".repeat(MAX_BULK_LEN + 1);
-        let parsed = parse_bulk(&text);
-        assert_eq!(parsed.len(), 1, "one wholesale error entry");
-        match &parsed[0] {
-            Err(LinkError::Malformed(message)) => {
-                let message = message.text(Language::En);
-                assert!(
-                    message.contains("text is too large"),
-                    "message must name the cap: {message:?}"
-                );
-                assert!(!message.contains(&text), "error must not echo the blob");
-            }
-            other => panic!("expected too-large rejection, got {}", outcome_shape(other)),
-        }
-    }
-
-    #[test]
-    fn parse_bulk_cancellable_worker_delivers_via_channel() {
-        let text = format!(
-            "vless://{UUID}@a.local:443?encryption=none#A\n\
-             # comment line\n\
-             \n\
-             vless://{UUID}@b.local:443?encryption=none#B\n"
-        );
-        let cancel = AtomicBool::new(false);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let parsed = parse_bulk_cancellable(&text, &cancel);
-            let _ = tx.send(parsed);
-        });
-        let parsed = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("worker result must arrive via the channel");
-        handle.join().expect("worker thread must join");
-        let parsed = parsed.expect("cancel flag was never set");
-        assert_eq!(parsed.len(), 2, "comments and blank lines are skipped");
-        assert!(parsed.iter().all(|result| result.is_ok()));
-    }
-
-    #[test]
-    fn parse_bulk_cancellable_returns_none_when_cancel_is_preset() {
-        let cancel = AtomicBool::new(true);
-        assert!(
-            parse_bulk_cancellable("vless://anything.local:443", &cancel).is_none(),
-            "preset cancel must discard the parse"
-        );
-    }
-
-    #[test]
-    fn parse_bulk_cancellable_stops_when_cancelled_mid_run() {
-        // Enough lines that the worker cannot finish before the flag is set:
-        // the cooperative check between lines must return `None`.
-        let line = "vless://{UUID}@c.local:443?encryption=none#C\n";
-        let mut text = String::new();
-        for _ in 0..50_000 {
-            text.push_str(line);
-        }
-        assert!(
-            text.len() <= MAX_BULK_LEN,
-            "fixture must stay under the bulk cap"
-        );
-        let cancel = AtomicBool::new(false);
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let parsed = parse_bulk_cancellable(&text, &cancel);
-                let _ = tx.send(parsed);
-            });
-            // Set the flag from the test thread while the worker is
-            // mid-parse: the per-line cooperative check must return `None`.
-            cancel.store(true, Ordering::Relaxed);
-        });
-        let parsed = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("worker result must arrive via the channel");
-        assert!(
-            parsed.is_none(),
-            "cancelled parse must discard partial results"
-        );
     }
 
     #[test]
