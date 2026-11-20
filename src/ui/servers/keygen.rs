@@ -1,8 +1,8 @@
 //! Xray keygen/tool helpers of the servers screen: bounded, secret-redacting
 //! `xray.exe` invocations off the UI thread (uuid / vless encryption /
 //! wireguard secret / x25519 derive / ML-DSA-65 / tls hash & ping) and
-//! stdout payload extraction. Private to the screen; the tool-apply path in
-//! the parent module is the only caller.
+//! stdout payload extraction. Private to the screen; the tool session's parse
+//! and run stages are the only callers.
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1129,9 +1129,7 @@ keys! {
     SrvTlsPinMalformed 0,
     SrvTlsPinNoHash 0,
     SrvTlsPinComputedLeaf 1,
-    SrvTlsPinComputed 0,
     SrvTlsPinTargetFieldNotFound 0,
-    SrvTlsHandshakeSucceeded 0,
     SrvTlsProbeNoHandshake 1,
     SrvRealityPubKeyDerived 0,
     SrvRealityTargetFieldNotFound 0,
@@ -4544,9 +4542,7 @@ mod en {
             Key::SrvTlsPinMalformed => "xray tls hash returned a malformed leaf hash",
             Key::SrvTlsPinNoHash => "xray tls hash returned no leaf certificate hash",
             Key::SrvTlsPinComputedLeaf => "Computed leaf SHA-256 pin: {}",
-            Key::SrvTlsPinComputed => "Certificate pin computed.",
             Key::SrvTlsPinTargetFieldNotFound => "TLS pin target field not found",
-            Key::SrvTlsHandshakeSucceeded => "TLS handshake succeeded.",
             Key::SrvTlsProbeNoHandshake => {
                 "TLS probe completed without a successful handshake:\n{}"
             }

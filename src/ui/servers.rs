@@ -5,15 +5,14 @@
 //! Covers all 12 protocols, all 7 transports, TLS/REALITY, mux, and the
 //! advanced envelope (sendThrough / targetStrategy / finalmask / sockopt).
 
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crate::i18n::{Key, t, t_fmt, validation_message};
 use crate::links;
 use crate::model::go_std_base64_decodes;
 use crate::model::outbound::{
-    BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, GeneratedSecret, MuxModel, Noise,
-    VlessReverse, WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
+    BlackholeResponse, DnsOutRule, Fragment, FreedomFinalRule, MuxModel, Noise, VlessReverse,
+    WireguardPeer, blackhole_response_is_custom, blackhole_response_type_supported,
 };
 use crate::model::settings::{ColumnWidths, Language, SortColumn, ViewSort};
 use crate::model::stream::{
@@ -30,8 +29,8 @@ use crate::model::validation::{
     dns_out_action_supported, freedom_final_rule_block_only_supported,
     freedom_final_rule_block_only_violated, freedom_final_rule_log_level_supported,
     freedom_final_rule_supported, masque_warp_address_list_verdict, mux_conflicts_with_vision_flow,
-    pinned_peer_cert_sha256_valid, reality_mldsa65_verify_valid, reality_public_key_valid,
-    send_through_supported, server_name_implausible, validate_outbound_with_blocks,
+    pinned_peer_cert_sha256_valid, send_through_supported, server_name_implausible,
+    validate_outbound_with_blocks,
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
@@ -43,7 +42,6 @@ use crate::rt::{
     CoreCmd, LatencyProbeResult, ProfileValidationOrigin, ProfileValidationReply,
     ProfileValidationRequest, ToolTarget,
 };
-use crate::tls_ping::{ca_pins_from_probe_output, leaf_pin_from_probe_output};
 use crate::ui::findings::{render_bulleted, render_finding_tier, render_findings};
 use crate::ui::gate::{Rung, verdict};
 use crate::ui::inbounds::sniffing_editor;
@@ -62,6 +60,7 @@ mod keygen;
 mod raw_editor;
 mod selection;
 mod tls_editor;
+mod tool_session;
 mod validators;
 mod xmux;
 mod xray_tool;
@@ -70,14 +69,14 @@ use finalmask_editors::{
     finalmask_move_buttons, finalmask_quic_editor, finalmask_tcp_settings_editor,
     finalmask_udp_settings_editor,
 };
-use keygen::{PRIV_PREFIXES, PUB_PREFIXES, gen_short_id, keygen_value};
+use keygen::gen_short_id;
 use raw_editor::{FieldKey, RawField, SeededBuffers};
 use selection::{Selection, VisibleRows};
+use tool_session::{Applied, ToolOutcome, ToolSession};
 use validators::{
     v_masque_remote_dns_entry, v_masque_warp_address_entry, v_masque_warp_private_key,
-    v_masque_warp_public_key, v_optional_wg_key, v_required, v_uuid, v_uuid_required,
-    v_vless_encryption, v_vless_encryption_required, v_wg_public_key, v_wg_remote_dns_entry,
-    v_wg_secret_key,
+    v_masque_warp_public_key, v_optional_wg_key, v_required, v_uuid_required,
+    v_vless_encryption_required, v_wg_public_key, v_wg_remote_dns_entry, v_wg_secret_key,
 };
 use xmux::xmux_section;
 use xray_tool::XrayToolKind;
@@ -1465,12 +1464,6 @@ struct EditorValidationCache {
     changed_from_source: bool,
 }
 
-struct XrayToolJob {
-    target: ToolTarget,
-    kind: XrayToolKind,
-    request: Request<Result<String, String>>,
-}
-
 /// The facts every draft control reads, built by [`ProfileDraft::gate`] where the
 /// draft's findings are. The two memoized facts — whether the draft differs
 /// from its baseline, and whether an error-severity finding blocks it — come
@@ -1610,6 +1603,14 @@ impl DraftSlot {
     /// The draft this slot holds, mutably, if any.
     fn draft_mut(&mut self) -> Option<&mut ProfileDraft> {
         self.draft.as_mut()
+    }
+
+    /// Whether this slot still holds `target`'s draft at the generation the
+    /// request was staged from: the one currency rule a delivered tool or
+    /// validation result passes before it is applied.
+    fn holds(&self, target: &ToolTarget) -> bool {
+        self.draft()
+            .is_some_and(|draft| target.matches(draft.draft_target()))
     }
 
     /// Take the draft out for the frame that renders it; [`Self::hold`] puts it
@@ -2745,7 +2746,9 @@ pub struct ServersScreen {
     /// When the current status toast was set; the toast auto-clears once
     /// [`STATUS_TOAST_AUTO_CLEAR`] has elapsed (see `show_status_toast`).
     status_set_at: Option<Instant>,
-    tool_job: Option<XrayToolJob>,
+    /// The one helper-tool session: the in-flight `xray.exe`/QUIC run and the
+    /// parse/apply stages that turn its output into a profile edit.
+    tool_session: ToolSession,
     /// The seeded text buffers the raw-JSON and PEM editors render from,
     /// keyed by the field's egui `Id` (per-field buffer identity, stable
     /// across frames, no per-frame key allocation); evicted with their owning
@@ -3614,40 +3617,6 @@ impl ServersScreen {
             }
         }
     }
-    fn queue_xray_tool(
-        &mut self,
-        lang: Language,
-        repaint: egui::Context,
-        target: ToolTarget,
-        kind: XrayToolKind,
-        args: Vec<String>,
-    ) -> Result<(), String> {
-        if self.tool_job.is_some() {
-            return Err(t(lang, Key::SrvAnotherToolRunning).into());
-        }
-        // The cooperative stop flag ends a cancelled run: the verb's adapter
-        // abandons its work on the same flag, and a verdict for a cancelled
-        // request is dropped here instead of delivered, so the screen's
-        // stale-target check never sees it.
-        let request = Request::worker("broccoli-xray-tool", &repaint, move |stop| {
-            if stop.load(Ordering::Acquire) {
-                return None;
-            }
-            let result = xray_tool::run(kind, lang, &args, stop);
-            if stop.load(Ordering::Acquire) {
-                return None;
-            }
-            Some(result)
-        })
-        .map_err(|error| t_fmt(lang, Key::SrvSpawnToolFailed, &[&error]))?;
-        self.tool_job = Some(XrayToolJob {
-            target,
-            kind,
-            request,
-        });
-        Ok(())
-    }
-
     /// The editor slot `kind` names.
     fn slot(&self, kind: DraftKind) -> &DraftSlot {
         match kind {
@@ -3709,8 +3678,12 @@ impl ServersScreen {
     /// generation: a tool or validation verdict for a draft that has been
     /// edited, replaced or closed since the request went out is dropped here.
     fn current_draft(&self, target: &ToolTarget) -> Option<&ProfileDraft> {
-        self.draft(target.draft_kind())
-            .filter(|draft| target.matches(draft.draft_target()))
+        let slot = self.slot(target.draft_kind());
+        if slot.holds(target) {
+            slot.draft()
+        } else {
+            None
+        }
     }
 
     /// The gate of the open draft in `kind`'s slot as this frame sees it;
@@ -3762,14 +3735,84 @@ impl ServersScreen {
         }
     }
 
-    /// Report a tool's failure where its own control renders: the probe's panel
-    /// for the TLS probe kinds, the derive dialog for the REALITY key, and the
-    /// status line otherwise.
-    fn report_tool_error(&mut self, target: &ToolTarget, kind: XrayToolKind, error: String) {
-        match kind {
-            XrayToolKind::TlsPin => {
-                self.slot_mut(target.draft_kind()).probe.error = Some(error);
+    /// Poll the session and present one delivered run. The session drops a
+    /// result whose target is no longer open; everything below therefore
+    /// describes the live draft's own run. Parse answers the value (or the
+    /// keyed refusal), apply writes it, and the caller routes the outcome to
+    /// the surface it belongs to: the status line for a field write, the probe
+    /// panel for a probe verdict or pin, the derive dialog's close for the
+    /// REALITY key.
+    fn poll_xray_tool(&mut self, lang: Language) {
+        let existing = &self.existing;
+        let add = &self.add;
+        let Some(run) = self
+            .tool_session
+            .take_terminal(|target| match target.draft_kind() {
+                DraftKind::Existing => existing.holds(target),
+                DraftKind::Add => add.holds(target),
+            })
+        else {
+            return;
+        };
+        match run.outcome {
+            ToolOutcome::Answered(Ok(output)) => {
+                match tool_session::parse(run.kind, &output, lang) {
+                    Ok(prepared) => {
+                        let applied = tool_session::apply(
+                            prepared,
+                            self.profile_for_target_mut(&run.target),
+                            lang,
+                        );
+                        match applied {
+                            Ok(Applied::Field(notice)) => {
+                                self.advance_target_generation(&run.target);
+                                self.set_status(StatusLine::ok(notice));
+                            }
+                            Ok(Applied::LeafPin { output }) => {
+                                let probe = &mut self.slot_mut(run.target.draft_kind()).probe;
+                                probe.output = Some(output);
+                                probe.error = None;
+                                self.advance_target_generation(&run.target);
+                            }
+                            Ok(Applied::Probe(report)) => {
+                                let probe = &mut self.slot_mut(run.target.draft_kind()).probe;
+                                probe.leaf_pin = report.leaf_pin;
+                                probe.ca_pins = report.ca_pins;
+                                probe.profile = Some(run.target.profile_id().to_owned());
+                                probe.handshake_ok = true;
+                                probe.output = Some(report.output);
+                                probe.error = None;
+                            }
+                            Ok(Applied::RealityPublicKey(notice)) => {
+                                self.advance_target_generation(&run.target);
+                                self.derive_dialog = None;
+                                self.set_status(StatusLine::ok(notice));
+                            }
+                            Err(diag) => {
+                                self.present_tool_failure(&run.target, run.kind, diag.text(lang));
+                            }
+                        }
+                    }
+                    Err(diag) => self.present_tool_failure(&run.target, run.kind, diag.text(lang)),
+                }
             }
+            ToolOutcome::Answered(Err(error)) => {
+                self.present_tool_failure(&run.target, run.kind, error);
+            }
+            ToolOutcome::Exited => self.present_tool_failure(
+                &run.target,
+                run.kind,
+                t(lang, Key::SrvToolStoppedWithoutResult).into(),
+            ),
+        }
+    }
+
+    /// Report a helper run's failure where its own control renders: the probe
+    /// panel for the TLS probe kinds, the derive dialog for the REALITY key,
+    /// and the status line otherwise.
+    fn present_tool_failure(&mut self, target: &ToolTarget, kind: XrayToolKind, error: String) {
+        match kind {
+            XrayToolKind::TlsPin => self.slot_mut(target.draft_kind()).probe.error = Some(error),
             XrayToolKind::TlsPing | XrayToolKind::TlsPingQuic => {
                 let probe = &mut self.slot_mut(target.draft_kind()).probe;
                 probe.error = Some(error);
@@ -3784,198 +3827,6 @@ impl ServersScreen {
                 }
             }
             _ => self.set_status(StatusLine::err(error)),
-        }
-    }
-
-    fn apply_tool_output(
-        &mut self,
-        lang: Language,
-        target: &ToolTarget,
-        kind: XrayToolKind,
-        output: String,
-    ) {
-        let mut applied = false;
-        let result = match kind {
-            XrayToolKind::Uuid => {
-                let value = output.trim();
-                if v_uuid(lang, value).is_some() {
-                    Err(t(lang, Key::SrvUuidInvalid).to_string())
-                } else if let Some(profile) = self.profile_for_target_mut(target) {
-                    if profile
-                        .outbound
-                        .settings
-                        .write_generated_secret(GeneratedSecret::Id, value)
-                        .is_ok()
-                    {
-                        applied = true;
-                        Ok(t(lang, Key::SrvUuidGenerated).to_string())
-                    } else {
-                        Err(t(lang, Key::SrvUuidTargetNoId).into())
-                    }
-                } else {
-                    Err(t(lang, Key::SrvToolTargetFieldNotFound).to_string())
-                }
-            }
-            XrayToolKind::VlessEncryption => match keygen_value(&output, &["\"encryption\":"]) {
-                Some(value) => {
-                    let value = value.trim_matches('"').to_string();
-                    if v_vless_encryption(lang, &value).is_some() {
-                        Err(t(lang, Key::SrvVlessencInvalid).into())
-                    } else if let Some(profile) = self.profile_for_target_mut(target) {
-                        if profile
-                            .outbound
-                            .settings
-                            .write_generated_secret(GeneratedSecret::VlessEncryption, &value)
-                            .is_ok()
-                        {
-                            applied = true;
-                            Ok(t(lang, Key::SrvClientEncryptionGenerated).to_string())
-                        } else {
-                            Err(t(lang, Key::SrvVlessencTargetFieldNotFound).into())
-                        }
-                    } else {
-                        Err(t(lang, Key::SrvToolTargetFieldNotFound).into())
-                    }
-                }
-                None => Err(t(lang, Key::SrvVlessencNoValue).into()),
-            },
-            XrayToolKind::WireguardSecret => match keygen_value(&output, PRIV_PREFIXES) {
-                Some(value) if v_wg_secret_key(lang, &value).is_none() => {
-                    if let Some(profile) = self.profile_for_target_mut(target) {
-                        if profile
-                            .outbound
-                            .settings
-                            .write_generated_secret(GeneratedSecret::WireguardSecretKey, &value)
-                            .is_ok()
-                        {
-                            applied = true;
-                            Ok(t(lang, Key::SrvWgSecretGenerated).to_string())
-                        } else {
-                            Err(t(lang, Key::SrvWgTargetFieldNotFound).into())
-                        }
-                    } else {
-                        Err(t(lang, Key::SrvToolTargetFieldNotFound).into())
-                    }
-                }
-                Some(_) => Err(t(lang, Key::SrvWgInvalidPrivateKey).into()),
-                None => Err(t(lang, Key::SrvWgCouldNotParse).into()),
-            },
-            XrayToolKind::Mldsa65Verify => match keygen_value(&output, &["Verify:", "verify:"]) {
-                Some(value) if reality_mldsa65_verify_valid(&value) => {
-                    if let Some(profile) = self.profile_for_target_mut(target) {
-                        if let Some(reality) = profile.outbound.stream.reality_settings.as_mut() {
-                            reality.mldsa65_verify = value;
-                            applied = true;
-                            Ok(t(lang, Key::SrvMldsa65Generated).to_string())
-                        } else {
-                            Err(t(lang, Key::SrvMldsa65TargetFieldNotFound).into())
-                        }
-                    } else {
-                        Err(t(lang, Key::SrvToolTargetFieldNotFound).into())
-                    }
-                }
-                Some(_) => Err(t(lang, Key::SrvMldsa65InvalidKey).into()),
-                None => Err(t(lang, Key::SrvMldsa65CouldNotParse).into()),
-            },
-            XrayToolKind::TlsPin => match keygen_value(&output, &["Leaf SHA256:"]) {
-                Some(value) if pinned_peer_cert_sha256_valid(&value) => {
-                    if let Some(profile) = self.profile_for_target_mut(target) {
-                        if let Some(tls) = profile.outbound.stream.tls_settings.as_mut() {
-                            tls.pinned_peer_cert_sha256 = value.clone();
-                            let probe = &mut self.slot_mut(target.draft_kind()).probe;
-                            probe.output = Some(t_fmt(lang, Key::SrvTlsPinComputedLeaf, &[&value]));
-                            probe.error = None;
-                            applied = true;
-                            Ok(t(lang, Key::SrvTlsPinComputed).to_string())
-                        } else {
-                            Err(t(lang, Key::SrvTlsPinTargetFieldNotFound).into())
-                        }
-                    } else {
-                        Err(t(lang, Key::SrvToolTargetFieldNotFound).into())
-                    }
-                }
-                Some(_) => Err(t(lang, Key::SrvTlsPinMalformed).into()),
-                None => Err(t(lang, Key::SrvTlsPinNoHash).into()),
-            },
-            XrayToolKind::TlsPing | XrayToolKind::TlsPingQuic => {
-                if output.contains("Handshake succeeded") {
-                    let probe = &mut self.slot_mut(target.draft_kind()).probe;
-                    probe.leaf_pin = leaf_pin_from_probe_output(&output);
-                    probe.ca_pins = ca_pins_from_probe_output(&output);
-                    probe.profile = Some(target.profile_id().to_owned());
-                    probe.handshake_ok = true;
-                    probe.output = Some(output);
-                    probe.error = None;
-                    Ok(t(lang, Key::SrvTlsHandshakeSucceeded).to_string())
-                } else {
-                    self.slot_mut(target.draft_kind()).probe.handshake_ok = false;
-                    Err(t_fmt(lang, Key::SrvTlsProbeNoHandshake, &[&output.trim()]))
-                }
-            }
-            XrayToolKind::RealityPublicKey => match keygen_value(&output, PUB_PREFIXES) {
-                Some(value) if reality_public_key_valid(&value) => {
-                    if let Some(profile) = self.profile_for_target_mut(target) {
-                        if let Some(reality) = profile.outbound.stream.reality_settings.as_mut() {
-                            reality.password = value;
-                            applied = true;
-                            if let Some(dialog) = &mut self.derive_dialog {
-                                dialog.pending = false;
-                            }
-                            Ok(t(lang, Key::SrvRealityPubKeyDerived).to_string())
-                        } else {
-                            Err(t(lang, Key::SrvRealityTargetFieldNotFound).into())
-                        }
-                    } else {
-                        Err(t(lang, Key::SrvToolTargetFieldNotFound).into())
-                    }
-                }
-                Some(_) => Err(t(lang, Key::SrvX25519InvalidPublicKey).into()),
-                None => Err(t(lang, Key::SrvX25519CouldNotParse).into()),
-            },
-        };
-        match result {
-            Ok(message) => {
-                if applied {
-                    self.advance_target_generation(target);
-                }
-                if kind == XrayToolKind::RealityPublicKey {
-                    self.derive_dialog = None;
-                }
-                if !matches!(
-                    kind,
-                    XrayToolKind::TlsPin | XrayToolKind::TlsPing | XrayToolKind::TlsPingQuic
-                ) {
-                    self.set_status(StatusLine::ok(message));
-                }
-            }
-            Err(error) => self.report_tool_error(target, kind, error),
-        }
-    }
-
-    fn poll_xray_tool(&mut self, lang: Language) {
-        let terminal = match self.tool_job.as_mut() {
-            Some(job) => job.request.poll(),
-            None => return,
-        };
-        let Some(terminal) = terminal else {
-            return;
-        };
-        let Some(job) = self.tool_job.take() else {
-            return;
-        };
-        if self.current_draft(&job.target).is_none() {
-            return;
-        }
-        match terminal {
-            Terminal::Answered(Ok(output)) => {
-                self.apply_tool_output(lang, &job.target, job.kind, output)
-            }
-            Terminal::Answered(Err(error)) => self.report_tool_error(&job.target, job.kind, error),
-            Terminal::Exited => self.report_tool_error(
-                &job.target,
-                job.kind,
-                t(lang, Key::SrvToolStoppedWithoutResult).into(),
-            ),
         }
     }
 
@@ -8908,7 +8759,9 @@ impl ServersScreen {
             self.set_status(StatusLine::err(t(lang, Key::SrvKeygenDraftOnly)));
             return;
         };
-        if let Err(error) = self.queue_xray_tool(lang, ui.ctx().clone(), target.owned(), kind, args)
+        if let Err(error) =
+            self.tool_session
+                .request(kind, target.owned(), args, ui.ctx().clone(), lang)
         {
             self.set_status(StatusLine::err(error));
         }
@@ -10239,7 +10092,7 @@ impl ServersScreen {
                     .then(|| validation_message(&ValidationCode::MasqueAlpnPrefersHttp3, lang));
                 let had_settings = st.tls_settings.is_some();
                 let mut s = st.tls_settings.take().unwrap_or_default();
-                let tool_working = self.tool_job.is_some();
+                let tool_working = self.tool_session.is_running();
                 changed |= tls_editor::tls_fields_editor(
                     ui,
                     lang,
@@ -10521,7 +10374,7 @@ impl ServersScreen {
                 // (`RealityPublicKeyInvalid` / `RealityShortIdInvalid` /
                 // `RealitySpiderXInvalid` / `RealityMldsa65Invalid`) and
                 // render in the issue list through the shared i18n seam.
-                // The tool-output guards in `apply_tool_output` still vet
+                // The tool-output guards in `tool_session::parse` still vet
                 // generated values with the same model predicates.
                 let (c, g) = keygen_field(
                     ui,
@@ -12292,7 +12145,7 @@ impl ServersScreen {
                     ui.horizontal(|ui| {
                         if ui
                             .add_enabled(
-                                !dialog.pending && self.tool_job.is_none(),
+                                !dialog.pending && !self.tool_session.is_running(),
                                 egui::Button::new(t(lang, Key::SrvDerive)),
                             )
                             .clicked()
@@ -12315,12 +12168,12 @@ impl ServersScreen {
                 let private_key = dialog.private_key.trim().to_string();
                 if private_key.is_empty() {
                     dialog.error = Some(t(lang, Key::SrvPrivateKeyRequired).into());
-                } else if let Err(error) = self.queue_xray_tool(
-                    lang,
-                    ctx.clone(),
-                    dialog.target.clone(),
+                } else if let Err(error) = self.tool_session.request(
                     XrayToolKind::RealityPublicKey,
+                    dialog.target.clone(),
                     vec!["x25519".into(), "-i".into(), private_key],
+                    ctx.clone(),
+                    lang,
                 ) {
                     dialog.error = Some(error);
                 } else {
