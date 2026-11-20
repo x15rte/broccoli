@@ -3,7 +3,7 @@
 use super::outbound::OutboundModel;
 use super::settings::{Language, RefreshPath, Settings, Socks5Cfg};
 use super::{StateLoadError, load_state, save_state, skip_empty_vec, skip_false};
-use crate::i18n::{Key, t_fmt};
+use crate::i18n::{Key, fill_placeholders, t, t_fmt};
 use crate::model::inbound::{BLOCK_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -498,13 +498,6 @@ impl ReportReason {
         self
     }
 
-    /// Prefix the rendered message with the model field the finding names.
-    #[must_use]
-    pub fn at_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
     /// Render the reason in `language`. A key this build does not know (a
     /// report written by a newer build) renders the fallback sentence that
     /// names the stored key.
@@ -521,8 +514,12 @@ impl ReportReason {
             .iter()
             .map(|value| value as &dyn std::fmt::Display)
             .collect();
+        // A stored reason can outlive the template it was written for (a newer
+        // build, a hand-edited state file), so a mismatched argument count is
+        // not a programming error here: the tolerant filler leaves what it
+        // cannot answer literal instead of tripping `t_fmt`'s check.
         let message = match Key::from_name(&self.key) {
-            Some(key) => t_fmt(language, key, &refs),
+            Some(key) => fill_placeholders(t(language, key), &refs),
             None => t_fmt(language, Key::SrvReportUnknownReason, &[&self.key]),
         };
         match &self.path {

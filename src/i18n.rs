@@ -2732,7 +2732,12 @@ pub fn t_fmt(language: Language, key: Key, args: &[&dyn std::fmt::Display]) -> S
 /// argument, in order. Placeholders without a matching argument stay literal;
 /// extra arguments are ignored. Callers must pre-format arguments (e.g. Debug
 /// via `format!("{:?}", x)`); the placeholder inner text is never used.
-fn fill_placeholders(template: &str, args: &[&dyn std::fmt::Display]) -> String {
+///
+/// A caller filling a template that did not come from its own code — a stored
+/// report reason, say — uses this directly: the tolerant walk degrades a
+/// mismatched argument count instead of [`t_fmt`]'s debug check, because a
+/// hand-edited or newer state file is input, not a programming error.
+pub(crate) fn fill_placeholders(template: &str, args: &[&dyn std::fmt::Display]) -> String {
     fill_placeholders_with(template, args)
 }
 

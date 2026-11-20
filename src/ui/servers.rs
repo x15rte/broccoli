@@ -11394,7 +11394,11 @@ impl ServersScreen {
                                     egui::CollapsingHeader::new(label).id_salt(index).show(
                                         ui,
                                         |ui| {
-                                            if !row.name.is_empty() {
+                                            // An older report keeps its
+                                            // error text in `name` and has
+                                            // no reason: the fallback below
+                                            // renders it once.
+                                            if !row.name.is_empty() && row.reason.is_some() {
                                                 ui.label(&row.name);
                                             }
                                             if let Some(reason) = row.reason_text(lang) {
