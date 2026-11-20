@@ -13,10 +13,8 @@ use super::FrameHooks;
 use super::widgets;
 use crate::i18n::{Key, t};
 use crate::model::Settings;
-use crate::model::settings::{Language, ProbePath, RefreshPath};
-use crate::sys::outbound_path::{
-    BindNicGate, bind_nic_gate, effective_probe_path, effective_refresh_path,
-};
+use crate::model::settings::{BindNicGate, Language, ProbePath, RefreshPath};
+use crate::sys::outbound_path::{effective_probe_path, effective_refresh_path};
 
 /// The shared latency-test and subscription settings surface.
 ///
@@ -50,15 +48,9 @@ impl OutboundSettingsSection {
     /// subscription section (global User-Agent, outbound path, global SOCKS5
     /// fields). Every edit marks the settings dirty through `hooks`, so the
     /// shell's existing save/apply pipeline persists it.
-    pub fn show(
-        &mut self,
-        ui: &mut Ui,
-        settings: &mut Settings,
-        hooks: &mut FrameHooks<'_>,
-        tun_enabled: bool,
-    ) {
+    pub fn show(&mut self, ui: &mut Ui, settings: &mut Settings, hooks: &mut FrameHooks<'_>) {
         let lang = settings.language;
-        let gate = bind_nic_gate(tun_enabled, settings.leak_block_blocks_bind_nic());
+        let gate = settings.bind_nic_gate();
 
         widgets::section(ui, t(lang, Key::SettingsLatencyTest), |ui| {
             if widgets::noted(ui, t(lang, Key::SettingsLatencyTestNote), |ui| {
@@ -84,15 +76,7 @@ impl OutboundSettingsSection {
                 hooks.mark_dirty();
             }
             ui.label(RichText::new(t(lang, Key::SettingsSubscriptionUserAgentHint)).weak());
-            self.subscription_path_control(ui, &mut *settings, gate, &mut *hooks);
-            if effective_refresh_path(settings.subscription_path, gate) == RefreshPath::Socks5 {
-                self.socks5_fields(ui, &mut *settings, &mut *hooks);
-            } else {
-                // The block is not in force, so its transient reveal and
-                // empty-field editing states must not survive a path switch.
-                self.revealed_password = false;
-                self.socks5_password_editing = false;
-            }
+            self.subscription_path_editor(ui, &mut *settings, gate, &mut *hooks);
         });
     }
 
@@ -131,44 +115,18 @@ impl OutboundSettingsSection {
         );
     }
 
-    /// The subscription refresh's outbound path: Bind NIC, Native, and SOCKS5.
-    /// The rule matches the latency control: Native is shown, Bind NIC is
-    /// disabled, and the stored preference is kept until the user replaces it.
-    fn subscription_path_control(
+    /// The subscription refresh's outbound path and its SOCKS5 carrier. The
+    /// shared editor owns the three-segment control, the disabled hint, the
+    /// note, the carrier's visibility, and the transient reveal reset. The
+    /// credentials are drafts: a blank draft is the absent value, and only a
+    /// real edit commits it to the model.
+    fn subscription_path_editor(
         &mut self,
         ui: &mut Ui,
         settings: &mut Settings,
         gate: BindNicGate,
         hooks: &mut FrameHooks<'_>,
     ) {
-        let lang = settings.language;
-        let stored = settings.subscription_path;
-        let effective = effective_refresh_path(stored, gate);
-        let disabled = gate.blocks().then_some(bind_nic_hint(gate));
-        let options = [
-            (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
-            (RefreshPath::Native, Key::SettingsPathNative, None),
-            (RefreshPath::Socks5, Key::SettingsPathSocks5, None),
-        ];
-        if let Some(path) = path_control(ui, lang, effective, &options)
-            && path != stored
-        {
-            settings.subscription_path = path;
-            hooks.mark_dirty();
-        }
-        ui.label(
-            RichText::new(refresh_path_note(lang, effective, stored, gate))
-                .small()
-                .weak(),
-        );
-    }
-
-    /// The global SOCKS5 carrier the refresh's SOCKS5 path dials through.
-    /// Address and port are required while the path is SOCKS5; the credentials
-    /// are optional and travel together. An empty password is editable, a
-    /// stored or newly typed one masks until revealed, and the reveal state
-    /// dies with the visit.
-    fn socks5_fields(&mut self, ui: &mut Ui, settings: &mut Settings, hooks: &mut FrameHooks<'_>) {
         let lang = settings.language;
         let username = self.socks5_username_buf.begin(|| {
             settings
@@ -204,18 +162,21 @@ impl OutboundSettingsSection {
         {
             password.clear();
         }
-        if socks5_editor(
+        let edit = refresh_path_editor(
             ui,
             lang,
-            &mut settings.subscription_socks5.host,
-            &mut settings.subscription_socks5.port,
-            username,
-            Socks5Password {
-                value: password,
+            gate,
+            &mut settings.subscription_path,
+            Socks5Fields {
+                host: &mut settings.subscription_socks5.host,
+                port: &mut settings.subscription_socks5.port,
+                username: &mut *username,
+                password: &mut *password,
                 revealed: &mut self.revealed_password,
                 editing: &mut self.socks5_password_editing,
             },
-        ) {
+        );
+        if edit.changed {
             settings.subscription_socks5.username = optional_field(username);
             settings.subscription_socks5.password = optional_field(password);
             hooks.mark_dirty();
@@ -240,7 +201,7 @@ fn password_reveal(ui: &mut Ui, lang: Language, revealed: &mut bool) {
 /// The hover hint a disabled Bind NIC segment carries. `Available` has no
 /// disabled segment; it names the segment's own note so the mapping stays
 /// total.
-pub(crate) fn bind_nic_hint(gate: BindNicGate) -> Key {
+fn bind_nic_hint(gate: BindNicGate) -> Key {
     match gate {
         BindNicGate::TunOff => Key::SettingsPathBindNicDisabledHint,
         BindNicGate::LeakBlock => Key::SettingsPathBindNicLeakBlockHint,
@@ -262,7 +223,7 @@ fn bind_nic_note(gate: BindNicGate) -> Key {
 /// One segment of an outbound-path control. A disabled segment stays visible
 /// and keeps its selected state painted; the persistent note below the control
 /// says why it cannot be picked, so the disabled state never relies on colour.
-pub(crate) fn path_segment(
+fn path_segment(
     ui: &mut Ui,
     selected: bool,
     enabled: bool,
@@ -283,7 +244,7 @@ pub(crate) fn path_segment(
 /// options are the only per-vocabulary input; the selected state, the disabled
 /// segment (TUN off or the leak block), and the pick result stay one
 /// implementation.
-pub(crate) fn path_control<T: Copy + PartialEq>(
+fn path_control<T: Copy + PartialEq>(
     ui: &mut Ui,
     lang: Language,
     effective: T,
@@ -312,7 +273,7 @@ pub(crate) fn path_control<T: Copy + PartialEq>(
 /// The password buffer and its two transient states, bundled so the shared
 /// editor keeps one slot for the value and one for what the user is doing with
 /// it.
-pub(crate) struct Socks5Password<'a> {
+struct Socks5Password<'a> {
     pub value: &'a mut String,
     pub revealed: &'a mut bool,
     pub editing: &'a mut bool,
@@ -321,7 +282,7 @@ pub(crate) struct Socks5Password<'a> {
 /// The shared SOCKS5 editor for the global subscription settings and the
 /// per-subscription dialog. The caller supplies its own field buffers and the
 /// password's state; the labels, masking, and note live here once.
-pub(crate) fn socks5_editor(
+fn socks5_editor(
     ui: &mut Ui,
     lang: Language,
     host: &mut String,
@@ -381,6 +342,78 @@ pub(crate) fn socks5_editor(
     changed
 }
 
+/// What one frame of the refresh-path editor settled: whether an edit landed,
+/// and the effective path the control showed (a stored Bind NIC reads as
+/// Native while the gate blocks).
+pub(crate) struct RefreshPathEdit {
+    pub changed: bool,
+    pub effective: RefreshPath,
+}
+
+/// The SOCKS5 field holders one refresh-path editor edits: the caller owns the
+/// buffers and the transient password state, so the same editor serves the
+/// global subscription settings and the per-subscription dialog.
+pub(crate) struct Socks5Fields<'a> {
+    pub host: &'a mut String,
+    pub port: &'a mut u16,
+    pub username: &'a mut String,
+    pub password: &'a mut String,
+    pub revealed: &'a mut bool,
+    pub editing: &'a mut bool,
+}
+
+/// The refresh-path editor: the `Bind NIC | Native | SOCKS5` control, its
+/// disabled hint, its persistent note, and the SOCKS5 carrier exactly while
+/// the effective path is SOCKS5. A path switch away from SOCKS5 drops the
+/// transient reveal and empty-field editing state, so neither survives the
+/// block it belonged to. Returns whether an edit landed and the effective path
+/// the frame showed.
+pub(crate) fn refresh_path_editor(
+    ui: &mut Ui,
+    lang: Language,
+    gate: BindNicGate,
+    stored: &mut RefreshPath,
+    fields: Socks5Fields<'_>,
+) -> RefreshPathEdit {
+    let effective = effective_refresh_path(*stored, gate);
+    let disabled = gate.blocks().then_some(bind_nic_hint(gate));
+    let options = [
+        (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
+        (RefreshPath::Native, Key::SettingsPathNative, None),
+        (RefreshPath::Socks5, Key::SettingsPathSocks5, None),
+    ];
+    let mut changed = false;
+    if let Some(path) = path_control(ui, lang, effective, &options)
+        && path != *stored
+    {
+        *stored = path;
+        changed = true;
+    }
+    ui.label(
+        RichText::new(refresh_path_note(lang, effective, *stored, gate))
+            .small()
+            .weak(),
+    );
+    if effective == RefreshPath::Socks5 {
+        changed |= socks5_editor(
+            ui,
+            lang,
+            fields.host,
+            fields.port,
+            fields.username,
+            Socks5Password {
+                value: fields.password,
+                revealed: fields.revealed,
+                editing: fields.editing,
+            },
+        );
+    } else {
+        *fields.revealed = false;
+        *fields.editing = false;
+    }
+    RefreshPathEdit { changed, effective }
+}
+
 /// The persistent note for the effective probe path. A stored Bind NIC
 /// preference that the gate hides reads as Native and says why.
 fn probe_path_note(
@@ -399,7 +432,7 @@ fn probe_path_note(
 }
 
 /// The persistent note for the effective refresh path.
-pub(crate) fn refresh_path_note(
+fn refresh_path_note(
     lang: Language,
     effective: RefreshPath,
     stored: RefreshPath,
@@ -442,10 +475,7 @@ mod tests {
             |ui, state: &mut (OutboundSettingsSection, UiTestRig)| {
                 let mut uictx = state.1.ctx();
                 let mut ctx = uictx.settings();
-                let tun_active = ctx.settings.mode == Mode::Tun;
-                state
-                    .0
-                    .show(ui, &mut *ctx.settings, &mut ctx.hooks, tun_active);
+                state.0.show(ui, &mut *ctx.settings, &mut ctx.hooks);
             },
             (section, rig),
         )
@@ -1038,5 +1068,148 @@ mod tests {
             first_segment(&harness, socks5).is_focused(),
             "the SOCKS5 segment must take keyboard focus"
         );
+    }
+
+    /// The gate, the displayed effective path, its note, and the fetch
+    /// transport are one resolution: no combination of mode, live TUN, leak
+    /// scope, stored path, and group override may disagree. No core or TUN
+    /// session is involved — the settings tree and an adapter view are the only
+    /// inputs.
+    #[test]
+    fn the_gate_path_note_and_transport_agree_over_the_matrix() {
+        use crate::model::Settings;
+        use crate::model::servers::Subscription;
+        use crate::model::settings::{BindNicGate, Socks5Cfg};
+        use crate::sys::netif::test_iface;
+        use crate::sys::outbound_path::{OutboundPath, effective_refresh_path};
+        use crate::sys::subscription::FetchTransport;
+
+        let global_socks5 = Socks5Cfg {
+            host: "global.example".into(),
+            port: 1080,
+            username: None,
+            password: None,
+        };
+        let override_socks5 = Socks5Cfg {
+            host: "override.example".into(),
+            port: 9050,
+            username: None,
+            password: None,
+        };
+        let interfaces = [
+            test_iface("broccoli0", 9, false, true, &["10.255.0.1"]),
+            test_iface("Ethernet", 2, false, true, &["10.0.0.7"]),
+        ];
+        let leaks: [&[&str]; 3] = [&[], &["allexceptlan"], &["tcp/853"]];
+        let stored_paths = [
+            RefreshPath::BindNic,
+            RefreshPath::Native,
+            RefreshPath::Socks5,
+        ];
+        let overrides = [
+            None,
+            Some(RefreshPath::BindNic),
+            Some(RefreshPath::Native),
+            Some(RefreshPath::Socks5),
+        ];
+
+        for mode in [Mode::Off, Mode::Tun] {
+            for live in [false, true] {
+                for leak in leaks {
+                    for stored in stored_paths {
+                        for override_path in overrides {
+                            let mut settings = Settings {
+                                mode,
+                                ..Settings::default()
+                            };
+                            settings.tun.auto_outbounds_interface = "Ethernet".into();
+                            settings.tun.auto_system_wfp_block_leak =
+                                leak.iter().map(|entry| (*entry).to_owned()).collect();
+                            settings.subscription_path = stored;
+                            settings.subscription_socks5 = global_socks5.clone();
+                            let subscription = override_path.map(|path| Subscription {
+                                outbound_custom: true,
+                                outbound_path: path,
+                                socks5: override_socks5.clone(),
+                                ..Subscription::default()
+                            });
+                            let subscription_ref = subscription.as_ref();
+                            let resolved = OutboundPath::resolve(&settings, live);
+                            let gate = settings.bind_nic_gate();
+                            let why = format!(
+                                "mode={mode:?} live={live} leak={leak:?} stored={stored:?} \
+                                 override={override_path:?}"
+                            );
+
+                            assert_eq!(resolved.gate(), gate, "{why}");
+
+                            let (stored_in_force, socks5_in_force) = match subscription_ref {
+                                Some(subscription) => subscription
+                                    .effective_outbound(stored, &settings.subscription_socks5),
+                                None => (stored, &settings.subscription_socks5),
+                            };
+                            let effective = effective_refresh_path(stored_in_force, gate);
+                            assert_eq!(
+                                resolved.refresh_path(subscription_ref),
+                                effective,
+                                "{why}: the displayed path is the render-gated one"
+                            );
+
+                            let note = match effective {
+                                RefreshPath::BindNic => Key::SettingsPathNoteBindNic,
+                                RefreshPath::Socks5 => Key::SettingsSubscriptionPathNoteSocks5,
+                                RefreshPath::Native
+                                    if stored_in_force == RefreshPath::BindNic && gate.blocks() =>
+                                {
+                                    match gate {
+                                        BindNicGate::TunOff => Key::SettingsPathNoteBindNicTunOff,
+                                        BindNicGate::LeakBlock => {
+                                            Key::SettingsPathNoteBindNicLeakBlock
+                                        }
+                                        BindNicGate::Available => {
+                                            unreachable!("a blocking gate cannot be Available")
+                                        }
+                                    }
+                                }
+                                RefreshPath::Native => Key::SettingsPathNoteNative,
+                            };
+                            assert_eq!(
+                                super::refresh_path_note(
+                                    Language::En,
+                                    effective,
+                                    stored_in_force,
+                                    gate,
+                                ),
+                                t(Language::En, note),
+                                "{why}: the note states the same gate and path"
+                            );
+
+                            let live_effective = if live {
+                                effective
+                            } else {
+                                effective_refresh_path(stored_in_force, BindNicGate::TunOff)
+                            };
+                            let expected_transport = match live_effective {
+                                RefreshPath::Native => Ok(FetchTransport::Native),
+                                RefreshPath::Socks5 => Ok(FetchTransport::Socks5 {
+                                    host: socks5_in_force.host.clone(),
+                                    port: socks5_in_force.port,
+                                    username: None,
+                                    password: None,
+                                }),
+                                RefreshPath::BindNic => {
+                                    Ok(FetchTransport::Bind("10.0.0.7".parse().expect("ipv4")))
+                                }
+                            };
+                            assert_eq!(
+                                resolved.refresh_transport(subscription_ref, &interfaces),
+                                expected_transport,
+                                "{why}: the transport follows the live capture"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

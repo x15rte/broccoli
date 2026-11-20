@@ -542,19 +542,12 @@ impl<'a> ServersCtx<'a> {
     fn send_latency_probe(&mut self, profiles: Vec<ServerProfile>) -> Result<(), String> {
         let probe_url = self.settings.ping_test_probe_url().to_owned();
         let lang = self.settings.language;
-        // The probe carries the TUN adapter's own name so its resolution can
-        // exclude that adapter, and — while Bind NIC is usable (TUN mode on and
-        // no leak block) — the TUN screen's outbound interface. The probe
-        // runtime still checks the live capture: a Bind NIC path chosen before
-        // the tunnel connects is the same OS path as Native.
-        let tun_enabled = self.settings.mode == crate::model::Mode::Tun;
-        let gate = sys::outbound_path::bind_nic_gate(
-            tun_enabled,
-            self.settings.leak_block_blocks_bind_nic(),
-        );
-        let path = sys::outbound_path::effective_probe_path(self.settings.latency_test_path, gate);
-        let tun_outbound_interface =
-            sys::outbound_path::probe_interface_setting(path, &self.settings.tun);
+        // One resolution answers the probe's interface from the settings tree:
+        // the render gate decides whether Bind NIC is in force, and the probe
+        // runtime re-checks the live capture before binding. A stale bind is
+        // therefore the same OS path as Native, never a polluted measurement.
+        let outbound = sys::outbound_path::OutboundPath::resolve(&*self.settings, self.tun_live);
+        let tun_outbound_interface = outbound.probe_interface();
         let tun_adapter_name = Some(self.settings.tun.effective_name().to_owned());
         let sent = self.hooks.send(CoreCmd::ProbeLatency {
             profiles,

@@ -35,7 +35,7 @@ use crate::model::validation::{
 };
 use crate::model::{
     CustomSockopt, FinalmaskTcpMask, FinalmaskUdpMask, HappyEyeballs, HttpCamouflageRequest,
-    HttpCamouflageResponse, Int32Range, Mode, Network, OutboundModel, ProbeOutcome, ProbeSource,
+    HttpCamouflageResponse, Int32Range, Network, OutboundModel, ProbeOutcome, ProbeSource,
     ProbeVerdict, Protocol, ProtocolSettings, RawHeader, RefreshPath, Security, ServerProfile,
     ServersFile, Settings, Sniffing, SockoptModel, Socks5Cfg, StreamModel, WsSettings,
 };
@@ -2959,25 +2959,13 @@ impl ServersScreen {
         };
         let url = subscription.url.clone();
         let user_agent = subscription.effective_user_agent(&uictx.settings.subscription_user_agent);
-        // The override replaces the path and the SOCKS5 block as one unit; the
-        // global values are the fallback when the group has none. The
-        // effective path reads TUN mode, while the transport resolution also
-        // receives the live ownership: with no live capture Bind NIC and
-        // Native are the same OS path.
-        let path = subscription.effective_refresh_path(uictx.settings.subscription_path);
-        let socks5 = subscription.effective_socks5(&uictx.settings.subscription_socks5);
-        let tun_enabled = uictx.settings.mode == Mode::Tun;
-        let tun_live = tun_enabled && uictx.tun_live;
+        // One resolution selects the group's override pair as a unit and checks
+        // the live capture: with no live TUN, Bind NIC and Native are the same
+        // OS path, so the fetch follows the stack.
+        let outbound =
+            crate::sys::outbound_path::OutboundPath::resolve(&*uictx.settings, uictx.tun_live);
         let interfaces = crate::sys::netif::list_all();
-        let transport = match crate::sys::outbound_path::refresh_transport(
-            path,
-            socks5,
-            &uictx.settings.tun,
-            tun_enabled,
-            tun_live,
-            uictx.settings.leak_block_blocks_bind_nic(),
-            &interfaces,
-        ) {
+        let transport = match outbound.refresh_transport(Some(subscription), &interfaces) {
             Ok(transport) => transport,
             Err(error) => {
                 self.set_status(StatusLine::err(refresh_path_error(lang, error)));
@@ -4068,16 +4056,11 @@ impl ServersScreen {
                     // scrolls here. TUN mode, not the live connection, enables
                     // the Bind NIC choice: the path is a preference, and with
                     // no live capture it behaves as Native.
-                    let tun_enabled = ctx.settings.mode == Mode::Tun;
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            self.outbound_settings.show(
-                                ui,
-                                &mut *ctx.settings,
-                                &mut ctx.hooks,
-                                tun_enabled,
-                            );
+                            self.outbound_settings
+                                .show(ui, &mut *ctx.settings, &mut ctx.hooks);
                         });
                 }
             }
@@ -11915,66 +11898,31 @@ impl ServersScreen {
                             &mut draft.outbound_custom,
                             t(lang, Key::SrvOutboundOverride),
                         );
-                        let tun_on = uictx.settings.mode == Mode::Tun;
-                        let gate = crate::sys::outbound_path::bind_nic_gate(
-                            tun_on,
-                            uictx.settings.leak_block_blocks_bind_nic(),
-                        );
-                        let global_path = uictx.settings.subscription_path;
+                        let gate = uictx.settings.bind_nic_gate();
                         let effective = if draft.outbound_custom {
-                            crate::sys::outbound_path::effective_refresh_path(
-                                draft.outbound_path,
+                            crate::ui::outbound_settings::refresh_path_editor(
+                                ui,
+                                lang,
                                 gate,
+                                &mut draft.outbound_path,
+                                crate::ui::outbound_settings::Socks5Fields {
+                                    host: &mut draft.socks5_host,
+                                    port: &mut draft.socks5_port,
+                                    username: &mut draft.socks5_username,
+                                    password: &mut draft.socks5_password,
+                                    revealed: &mut draft.reveal_password,
+                                    editing: &mut draft.password_editing,
+                                },
                             )
-                        } else {
-                            crate::sys::outbound_path::effective_refresh_path(global_path, gate)
-                        };
-                        if draft.outbound_custom {
-                            let disabled = gate
-                                .blocks()
-                                .then_some(crate::ui::outbound_settings::bind_nic_hint(gate));
-                            let options = [
-                                (RefreshPath::BindNic, Key::SettingsPathBindNic, disabled),
-                                (RefreshPath::Native, Key::SettingsPathNative, None),
-                                (RefreshPath::Socks5, Key::SettingsPathSocks5, None),
-                            ];
-                            if let Some(path) = crate::ui::outbound_settings::path_control(
-                                ui, lang, effective, &options,
-                            ) && path != draft.outbound_path
-                            {
-                                draft.outbound_path = path;
-                            }
-                            ui.label(
-                                RichText::new(crate::ui::outbound_settings::refresh_path_note(
-                                    lang,
-                                    effective,
-                                    draft.outbound_path,
-                                    gate,
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                            if effective == RefreshPath::Socks5 {
-                                crate::ui::outbound_settings::socks5_editor(
-                                    ui,
-                                    lang,
-                                    &mut draft.socks5_host,
-                                    &mut draft.socks5_port,
-                                    &mut draft.socks5_username,
-                                    crate::ui::outbound_settings::Socks5Password {
-                                        value: &mut draft.socks5_password,
-                                        revealed: &mut draft.reveal_password,
-                                        editing: &mut draft.password_editing,
-                                    },
-                                );
-                            } else {
-                                draft.reveal_password = false;
-                                draft.password_editing = false;
-                            }
+                            .effective
                         } else {
                             draft.reveal_password = false;
                             draft.password_editing = false;
-                        }
+                            crate::sys::outbound_path::effective_refresh_path(
+                                uictx.settings.subscription_path,
+                                gate,
+                            )
+                        };
                         let path_label = refresh_path_label(effective, lang);
                         let effective_line = if draft.outbound_custom {
                             t_fmt(lang, Key::SrvOutboundCustom, &[&path_label])

@@ -150,25 +150,21 @@ impl Subscription {
             global.to_owned()
         }
     }
-    /// The refresh outbound path this group's fetch uses: the custom path when
-    /// the group enabled its override, the global path otherwise. The caller
-    /// then applies the TUN mode gate, exactly as it does for the global value;
-    /// the live capture is checked separately when the fetch resolves.
-    pub fn effective_refresh_path(&self, global: RefreshPath) -> RefreshPath {
+    /// The refresh path and SOCKS5 block this group's fetch uses, chosen
+    /// together: the override's pair when the group enabled it, the global
+    /// pair otherwise. The override replaces the path and its carrier as one
+    /// block, so no caller can pair its path with the global fields. The path
+    /// resolution then applies the Bind NIC gate and the live capture; this
+    /// accessor answers only which pair is in force.
+    pub fn effective_outbound<'a>(
+        &'a self,
+        global_path: RefreshPath,
+        global_socks5: &'a Socks5Cfg,
+    ) -> (RefreshPath, &'a Socks5Cfg) {
         if self.outbound_custom {
-            self.outbound_path
+            (self.outbound_path, &self.socks5)
         } else {
-            global
-        }
-    }
-    /// The SOCKS5 fields this group's fetch uses: the custom block when the
-    /// group enabled its override, the global block otherwise. They travel
-    /// with the path, never mixed field by field.
-    pub fn effective_socks5<'a>(&'a self, global: &'a Socks5Cfg) -> &'a Socks5Cfg {
-        if self.outbound_custom {
-            &self.socks5
-        } else {
-            global
+            (global_path, global_socks5)
         }
     }
     /// Store the decoded body of a successful fetch: the previous snapshot is
@@ -2849,14 +2845,9 @@ mod tests {
             password: Some("global-secret".into()),
         };
         assert_eq!(
-            subscription.effective_refresh_path(global_path),
-            global_path,
-            "without an override the global path is in force"
-        );
-        assert_eq!(
-            subscription.effective_socks5(&global),
-            &global,
-            "without an override the global SOCKS5 fields are in force"
+            subscription.effective_outbound(global_path, &global),
+            (global_path, &global),
+            "without an override the global path and SOCKS5 fields are in force"
         );
     }
 
@@ -2880,22 +2871,17 @@ mod tests {
             ..Subscription::default()
         };
         assert_eq!(
-            subscription.effective_refresh_path(RefreshPath::BindNic),
-            RefreshPath::Socks5
-        );
-        assert_eq!(
-            subscription.effective_socks5(&global),
-            &subscription.socks5,
+            subscription.effective_outbound(RefreshPath::BindNic, &global),
+            (RefreshPath::Socks5, &subscription.socks5),
             "the whole custom block replaces the global one"
         );
 
         // The flag alone decides; the custom values never leak while it is off.
         subscription.outbound_custom = false;
         assert_eq!(
-            subscription.effective_refresh_path(RefreshPath::Native),
-            RefreshPath::Native
+            subscription.effective_outbound(RefreshPath::Native, &global),
+            (RefreshPath::Native, &global)
         );
-        assert_eq!(subscription.effective_socks5(&global), &global);
     }
 
     #[test]

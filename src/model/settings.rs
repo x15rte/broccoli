@@ -21,6 +21,29 @@ pub enum Mode {
     Tun,
 }
 
+/// The one rule for whether Bind NIC can bind. TUN mode supplies the capture
+/// to bypass; while it is on, an emitted catch-all leak scope (`all` or
+/// `allexceptlan`) blocks every destination outside the tunnel
+/// (`blockLeaks`, proxy/tun/tun_windows_wfp.go). `TunOff` wins over
+/// `LeakBlock` because it is the broader rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindNicGate {
+    /// TUN mode is on and the emitted leak scope leaves a bypass.
+    Available,
+    /// TUN mode is off, so there is no capture to bypass.
+    TunOff,
+    /// The emitted leak scope blocks every destination outside the tunnel.
+    LeakBlock,
+}
+
+impl BindNicGate {
+    /// Whether the gate hides Bind NIC: the segment cannot be picked and a
+    /// stored preference reads as Native.
+    pub fn blocks(self) -> bool {
+        self != Self::Available
+    }
+}
+
 /// The latency probe's outbound path. `BindNic` binds the TUN screen's
 /// outbound interface (the same selection and resolver the tunnel uses), so
 /// the probe's dials bypass the capture; `Native` follows the OS stack, so the
@@ -625,6 +648,21 @@ impl Settings {
     /// name possible.
     pub fn leak_block_blocks_bind_nic(&self) -> bool {
         crate::model::emit::dns_inbound_emitted(self) && self.tun.leak_scope_blocks_direct_dials()
+    }
+
+    /// The one Bind NIC gate. See [`BindNicGate`]: TUN mode supplies the
+    /// capture to bypass, and a catch-all leak scope blocks every destination
+    /// outside the tunnel while it is on. TUN off wins because it is the
+    /// broader rule. Every screen and every path resolution reads this value
+    /// instead of rebuilding the pair.
+    pub fn bind_nic_gate(&self) -> BindNicGate {
+        if self.mode != Mode::Tun {
+            BindNicGate::TunOff
+        } else if self.leak_block_blocks_bind_nic() {
+            BindNicGate::LeakBlock
+        } else {
+            BindNicGate::Available
+        }
     }
 
     /// Rewrite every exact outbound-tag reference named in `renames`
