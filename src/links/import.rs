@@ -593,24 +593,13 @@ pub fn parse_body(text: &str) -> ImportBatch {
 }
 
 /// Parse one fetched or pasted body. A cancelled parse returns the records
-/// collected so far; the caller drops them. An oversized body yields one
-/// refused record and never walks the text.
+/// collected so far; the caller drops them.
+///
+/// The body size is the caller's bound: the import dialog refuses a paste
+/// over [`MAX_BULK_LEN`](super::MAX_BULK_LEN) before a worker starts, and a
+/// fetched subscription is already bounded by the fetch's own body cap. A
+/// cap here would refuse a body the fetch accepted.
 pub fn parse_body_cancellable(text: &str, stop: &AtomicBool) -> ImportBatch {
-    if text.len() > super::MAX_BULK_LEN {
-        let mut batch = ImportBatch::default();
-        let ordinal = batch.begin_item();
-        batch.push_refused(
-            ordinal,
-            "",
-            ImportReason::link(super::malformed(
-                Diag::new(Key::LinkSubscriptionTooLarge)
-                    .arg(text.len())
-                    .arg(super::MAX_BULK_LEN),
-            )),
-            bound_raw(text),
-        );
-        return batch;
-    }
     let decoded = decode_whole_body(text);
     let mut batch = ImportBatch::with_comments(leading_comments(&decoded));
     if super::convert::convert_document(&decoded, &mut batch) {
@@ -801,25 +790,6 @@ mod tests {
         for record in batch.records() {
             assert_eq!(record.raw().chars().count(), MAX_RAW_CHARS);
         }
-    }
-
-    #[test]
-    fn an_oversized_body_is_one_refused_record() {
-        let text = "x".repeat(crate::links::MAX_BULK_LEN + 1);
-        let batch = parse_body(&text);
-        assert_eq!(batch.records().len(), 1, "one wholesale refusal");
-        let record = &batch.records()[0];
-        assert_eq!(record.kind(), ImportKind::Refused);
-        match record.reason() {
-            Some(ImportReason::Link(error)) => match error.as_ref() {
-                LinkError::Malformed(diag) => {
-                    assert_eq!(diag.key(), Key::LinkSubscriptionTooLarge);
-                }
-                other => panic!("expected the bulk cap, got {other:?}"),
-            },
-            other => panic!("expected a grammar refusal, got {other:?}"),
-        }
-        assert_eq!(record.raw().chars().count(), MAX_RAW_CHARS);
     }
 
     #[test]

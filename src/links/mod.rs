@@ -419,9 +419,9 @@ const MAX_B64_INPUT_LEN: usize = 1 << 20; // 1 MiB
 /// per-component decode buffer is allocated.
 pub const MAX_LINK_LEN: usize = 1 << 20; // 1 MiB
 
-/// Aggregate cap for one bulk paste/subscription blob. The import dialog
-/// refuses larger pastes before the worker thread sees them; `parse_bulk`
-/// enforces the same bound as defense in depth.
+/// Aggregate cap for one pasted blob. The import dialog refuses a larger
+/// paste before the worker thread sees it; a fetched subscription body is
+/// bounded by the fetch's own body cap instead, so this never refuses one.
 pub const MAX_BULK_LEN: usize = 4 * MAX_LINK_LEN; // 4 MiB
 
 /// Maximum bytes of a decoded profile name derived from a `#fragment`.

@@ -2230,7 +2230,6 @@ keys! {
     LinkTooLong 2,
     LinkNoScheme 1,
     LinkBadScheme 1,
-    LinkSubscriptionTooLarge 2,
     LinkFinalmaskInvalid 1,
     LinkUnsupportedTypeHttp 0,
     LinkUnsupportedTypeQuic 0,
@@ -6325,9 +6324,6 @@ mod en {
             Key::LinkTooLong => "The share link is too long: {} bytes. The limit is {} bytes.",
             Key::LinkNoScheme => "The share link has no scheme prefix: {}.",
             Key::LinkBadScheme => "The share link has an invalid scheme: {}.",
-            Key::LinkSubscriptionTooLarge => {
-                "The pasted text is too large: {} bytes. The limit is {} bytes."
-            }
             Key::LinkFinalmaskInvalid => "The finalmask settings are invalid: {}",
             Key::LinkUnsupportedTypeHttp => {
                 "Xray core removed the type=http/h2/h3 transport. Use xhttp."
