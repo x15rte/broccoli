@@ -24,6 +24,15 @@
 //!   [`ip_rule_valid`] is that grammar, shared with the `filter` mask gate, so
 //!   this module only adds the per-field finding on top of it.
 //!
+//! A third family has no arm here, and the reason is the engine: a
+//! `domain` entry carrying `regexp:` is compiled by the core at load
+//! (`NewDomainMatcher` -> `regexp.Compile`, `app/router/condition.go:51`),
+//! and a pattern that does not parse refuses the document; an `attrs` value
+//! is compiled the same way (`app/router/config.go:75`). Judging either
+//! needs Go's RE2 dialect, which this crate does not carry: a stricter or
+//! looser engine would refuse a configuration the core accepts, or accept
+//! one it refuses. Both stay with the core's own test.
+//!
 //! Every other condition accepts whatever the model stores, which is why this
 //! module has no arm for them:
 //!
