@@ -1779,9 +1779,9 @@ pub use outbound::{
 };
 pub(crate) use settings::normalize_windows_socket_path;
 pub use settings::{
-    dns_script_issues, file_path_remote, lua_script_path_issue, noise_script_issues,
-    routing_script_issues, tun_ipv4_gateway, tun_ipv6_gateway, validate_listen_address,
-    validate_profiles, validate_settings,
+    blocking_profile_numbers, dns_script_issues, file_path_remote, lua_script_path_issue,
+    noise_script_issues, routing_script_issues, tun_ipv4_gateway, tun_ipv6_gateway,
+    validate_listen_address, validate_profiles, validate_settings,
 };
 pub(crate) use stream::is_canonical_uuid;
 pub use stream::{

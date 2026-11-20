@@ -470,6 +470,93 @@ pub fn validate_profiles(
     profile_set_verdict(profiles, active_id, require_nonempty, &outbound_tags, None)
 }
 
+/// The 1-based profile numbers the profile-set pass's blocking findings name,
+/// read off the one pass [`validate_profiles`] runs rather than a second
+/// predicate over the profiles: the outbound findings carry the profile's
+/// display name as their path, the identity codes carry the number outright,
+/// and a chain finding names a generated tag, which is mapped back to every
+/// profile that generates it. A finding about the set itself — a missing or
+/// ambiguous active profile — names no profile and contributes nothing.
+///
+/// The consumer is the validation worker's stand-in set
+/// (`rt::profiles::PreparedSet`): every row this answers for would otherwise
+/// veto an unrelated candidate's save.
+pub fn blocking_profile_numbers(
+    profiles: &[ServerProfile],
+    active_id: Option<&str>,
+) -> BTreeSet<usize> {
+    let verdict = validate_profiles(profiles, active_id, false);
+    profile_numbers_named_by(verdict.blocking(), profiles)
+}
+
+/// The 1-based profile numbers `findings` name, keyed by the finding shape
+/// [`profile_set_verdict`] emits: the identity codes carry the numbers, the
+/// chain codes carry a tag, and every outbound finding carries the profile's
+/// display name as its path (the only code family that sets one). Deduplicated
+/// and in ascending order, so the caller iterates rows rather than findings.
+fn profile_numbers_named_by<'a>(
+    findings: impl Iterator<Item = &'a ValidationIssue>,
+    profiles: &[ServerProfile],
+) -> BTreeSet<usize> {
+    let mut numbers = BTreeSet::new();
+    for finding in findings {
+        match &finding.code {
+            ValidationCode::ProfileIdEmpty(number)
+            | ValidationCode::ProfileNameEmpty(number, _) => {
+                numbers.insert(*number);
+            }
+            // A duplicate names both rows: either can be the one that moves.
+            ValidationCode::ProfileIdDuplicated(first, second, _)
+            | ValidationCode::ProfileTagDuplicated(first, _, second, _, _) => {
+                numbers.insert(*first);
+                numbers.insert(*second);
+            }
+            ValidationCode::OutboundChainMissing(source, _) => {
+                numbers.extend(profile_numbers_for_tag(profiles, source));
+            }
+            ValidationCode::OutboundChainCycle(cycle) => {
+                for tag in cycle.split(" -> ") {
+                    numbers.extend(profile_numbers_for_tag(profiles, tag));
+                }
+            }
+            _ => {
+                let Some(path) = finding.path.as_deref() else {
+                    continue;
+                };
+                for (index, profile) in profiles.iter().enumerate() {
+                    if profile_display_name(profile) == path {
+                        numbers.insert(index + 1);
+                    }
+                }
+            }
+        }
+    }
+    numbers
+}
+
+/// The 1-based profile numbers whose generated tag `tag` names. A chain
+/// finding stores the tag through [`excerpt`], so a bounded payload matches by
+/// prefix: two rows still sharing the kept prefix both answer, and naming one
+/// row too many only neutralizes a stand-in that had no finding of its own.
+fn profile_numbers_for_tag(profiles: &[ServerProfile], tag: &str) -> Vec<usize> {
+    let truncated =
+        tag.chars().count() == crate::excerpt::MAX_ERROR_EXCERPT_CHARS + 1 && tag.ends_with('…');
+    let kept = tag.strip_suffix('…').unwrap_or(tag);
+    profiles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, profile)| {
+            let generated = profile.tag();
+            let named = if truncated {
+                generated.starts_with(kept)
+            } else {
+                generated == tag
+            };
+            named.then_some(index + 1)
+        })
+        .collect()
+}
+
 /// [`validate_profiles`]'s body: the profile-level findings, judged against
 /// the outbound tags the given configuration carries (`outbound_tags`, so
 /// every target check below reads the emission universe rather than a copy of
@@ -2481,6 +2568,70 @@ mod tests {
         assert!(
             persisted["outbound"].get("proxySettings").is_none(),
             "{persisted}"
+        );
+    }
+
+    #[test]
+    fn blocking_profile_numbers_names_every_row_a_blocking_finding_names() {
+        // The validation worker's stand-in set reads this projection of the
+        // profile-set pass, so every rule that can veto a candidate must map
+        // back to the rows it blames: the identity codes carry the number
+        // outright, an outbound finding carries the profile's display name as
+        // its path, a chain finding names a tag (resolved to the row that
+        // generates it), and a finding about the set itself names no row.
+        let empty_name = named_profile("id-one", "", OutboundModel::new(Protocol::Freedom));
+        let duplicate_id_first =
+            named_profile("dup-id", "two", OutboundModel::new(Protocol::Freedom));
+        let duplicate_id_second =
+            named_profile("dup-id", "three", OutboundModel::new(Protocol::Freedom));
+        let duplicate_tag_first =
+            named_profile("id-four", "same", OutboundModel::new(Protocol::Freedom));
+        let duplicate_tag_second =
+            named_profile("id-five", "same", OutboundModel::new(Protocol::Freedom));
+        let mut marked = named_profile("id-six", "marked", OutboundModel::new(Protocol::Freedom));
+        marked.outbound.retired_proxy_settings = Some(json!({"tag": "direct"}));
+        let mut dangling =
+            named_profile("id-seven", "seven", OutboundModel::new(Protocol::Freedom));
+        dangling.outbound.chain_via("no-such-outbound");
+        let profiles = vec![
+            empty_name,
+            duplicate_id_first,
+            duplicate_id_second,
+            duplicate_tag_first,
+            duplicate_tag_second,
+            marked,
+            dangling,
+        ];
+
+        let numbers = blocking_profile_numbers(&profiles, Some("no-such-active"));
+        let expected: BTreeSet<usize> = (1..=7).collect();
+        assert_eq!(
+            numbers, expected,
+            "every named row, and only the rows the findings name"
+        );
+
+        // The same list with a resolvable active id: the set-level finding is
+        // gone, and the per-row numbers are unchanged.
+        assert_eq!(
+            blocking_profile_numbers(&profiles, Some("id-one")),
+            expected,
+            "the active choice must not add or drop a named row"
+        );
+
+        // A clean row beside a missing active id: the finding that blocks is
+        // about the set, so no profile is named and no stand-in is owed.
+        let clean = named_profile("id-eight", "clean", OutboundModel::new(Protocol::Freedom));
+        assert!(
+            validate_profiles(std::slice::from_ref(&clean), Some("no-such-active"), false)
+                .blocking()
+                .next()
+                .is_some(),
+            "the fixture must produce the set-level finding"
+        );
+        assert!(
+            blocking_profile_numbers(std::slice::from_ref(&clean), Some("no-such-active"))
+                .is_empty(),
+            "a finding about the set itself names no profile"
         );
     }
 

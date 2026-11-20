@@ -9,12 +9,11 @@
 //! place (restoring the file when the candidate is rejected), generates a
 //! config, writes that config to a scratch file in the config
 //! directory and runs the file through `xray run -test`
-//! ([`super::apply::validate`]). Siblings whose outbound carries an `Error`
-//! finding are stood in for while a candidate is tested
-//! ([`prepared_snapshot`]), so an unresolved row cannot veto another row's
-//! save. The accepted/rejected verdict travels back on
-//! the request's own reply channel; nothing is ever persisted, and a rejected
-//! profile never reaches the caller's model.
+//! ([`super::apply::validate`]). Siblings the model's profile-set pass blocks
+//! on are stood in for while a candidate is tested ([`PreparedSet`]), so an
+//! unresolved row cannot veto another row's save. The accepted/rejected
+//! verdict travels back on the request's own reply channel; nothing is ever
+//! persisted, and a rejected profile never reaches the caller's model.
 //!
 //! The scratch config holds the full generated profile — UUIDs, passwords,
 //! private keys — so the worker owns its lifetime through
@@ -28,6 +27,7 @@
 //! ([`sweep_stale_scratch_configs`], the shell's single entry point) removes
 //! stale ones by age under the exact same naming contract.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ use crate::diag::{Diag, DiagError};
 use crate::i18n::{Key, t, t_fmt, validation_issue_message};
 use crate::links;
 use crate::model::settings::Language;
-use crate::model::validation::validate_outbound;
+use crate::model::validation::blocking_profile_numbers;
 use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
 
 use super::apply;
@@ -78,8 +78,8 @@ pub struct ProfileValidationRequest {
     /// can discard a verdict whose paste has changed.
     pub import_source: Option<String>,
     /// Servers-file snapshot the staged profile is generated into. The
-    /// worker generates against a clone of it with gated siblings stood in
-    /// for ([`prepared_snapshot`]); this value is never mutated.
+    /// worker moves it into a [`PreparedSet`], which stands in for the rows
+    /// the model blocks on; the caller never sees a mutation.
     pub servers: ServersFile,
     /// Scratch settings for the generated config: the caller's settings with
     /// `raw_override` cleared, so the staged profile is exercised instead of
@@ -112,37 +112,144 @@ pub(crate) fn validation_cancelled() -> DiagError {
     DiagError::from(Diag::new(Key::SeatValidationCancelled))
 }
 
-/// The working snapshot the worker stages candidates into: a clone of the
-/// request's own servers file with every profile whose outbound carries an
-/// `Error` finding replaced by a stand-in that keeps the row's identity —
-/// same `id` (its generated tag and any chain, routing, or balancer
-/// reference still resolve), same `name` (labels keep naming the row the user
-/// sees), same position, and the file's `active` choice — but carries a
-/// default `freedom` outbound. Generation refuses while *any* profile in the
-/// set has an `Error` finding, so one unresolved sibling (a stored
-/// `proxySettings` mark, a hand-edited invalid value) would otherwise veto
-/// every other row's candidate before that candidate's own test ran, leaving
-/// the user unable to save the row they just fixed. The candidate itself is
-/// staged per iteration from the request's own `profiles`, so a candidate
-/// carrying its own gate is still real and is rejected with its own message.
-/// The request's snapshot is never mutated; this clone is the only working
-/// copy.
-fn prepared_snapshot(servers: &ServersFile) -> ServersFile {
-    let mut snapshot = servers.clone();
-    for profile in &mut snapshot.profiles {
-        if validate_outbound(&profile.outbound).has_blocking() {
-            *profile = ServerProfile {
-                id: profile.id.clone(),
-                name: profile.name.clone(),
-                group: profile.group.clone(),
-                enabled: profile.enabled,
-                outbound: OutboundModel::new(Protocol::Freedom),
-                group_title: profile.group_title.clone(),
-                ..ServerProfile::default()
-            };
+/// The working file one request validates against: the caller's
+/// [`ServersFile`] moved in, every row the model's profile-set pass blocks on
+/// replaced by a stand-in, then candidates staged one at a time.
+///
+/// [`Self::build`] reads the stand-in set from the model's own verdict
+/// ([`blocking_profile_numbers`]) rather than a second predicate over the
+/// profiles, so every rule the generator refuses on is covered: an outbound
+/// mark, an empty name, a duplicate id or tag, and the dial graph's dangling
+/// hop. A row that is still gated would veto every unrelated candidate before
+/// that candidate's own test ran, leaving the user unable to save the row
+/// they just fixed.
+///
+/// A stand-in keeps the row's identity so chain, routing, and balancer
+/// references still resolve: same `id`, same `name`, same group, same
+/// position, the file's `active` choice untouched, and a default `freedom`
+/// outbound. Two rows can name the same generated tag or id, and no stand-in
+/// can fix such a duplicate by changing only its outbound, so a stand-in gives
+/// up what it cannot hold exclusively: an unnamed row's name, a tag another
+/// row already claims — it takes a name no other row claims instead — and an
+/// empty or already-claimed id. The tag a chain aims at survives on the row
+/// that keeps it (a real row first, else the first stand-in in list order).
+///
+/// Candidates are staged from the request's own `profiles`, never stood in
+/// for, so a candidate carrying its own gate is still real and is rejected
+/// with its own message. The first [`Self::stage`] has the sole owner, so no
+/// candidate pays a whole-file copy.
+pub(crate) struct PreparedSet {
+    /// The one working copy. The `Arc` exists only so a candidate's blocking
+    /// leg can keep the file alive while it generates, without copying it;
+    /// staging replaces or mutates elements of the sole owner in place.
+    servers: Arc<ServersFile>,
+}
+
+impl PreparedSet {
+    /// Build the request's working file: move the caller's file in, stand in
+    /// for every row the model's profile-set pass blocks on that is not one of
+    /// `candidates`, and assert the result. The assertion costs one extra
+    /// model pass for the whole request — never one per candidate — and is
+    /// the contract this type exists for.
+    fn build(mut servers: ServersFile, candidates: &[ServerProfile]) -> Self {
+        let blocked = blocking_profile_numbers(&servers.profiles, servers.active.as_deref());
+        let candidate_numbers: BTreeSet<usize> = servers
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.id == profile.id)
+            })
+            .map(|(index, _)| index + 1)
+            .collect();
+        let neutralized: BTreeSet<usize> =
+            blocked.difference(&candidate_numbers).copied().collect();
+        // Rows that stay real keep their generated tags and ids first, so a
+        // stand-in never takes a tag or id a live row still answers to.
+        let mut claimed_tags = BTreeSet::new();
+        let mut claimed_ids = BTreeSet::new();
+        for (index, profile) in servers.profiles.iter().enumerate() {
+            if neutralized.contains(&(index + 1)) {
+                continue;
+            }
+            claimed_tags.insert(profile.tag());
+            claimed_ids.insert(profile.id.clone());
+        }
+        for number in &neutralized {
+            let original = &servers.profiles[number - 1];
+            let mut stand_in = stand_in(original);
+            if original.name.trim().is_empty() || claimed_tags.contains(&stand_in.tag()) {
+                stand_in.name = unique_stand_in_name(original, &claimed_tags);
+            }
+            if original.id.trim().is_empty() || claimed_ids.contains(&stand_in.id) {
+                stand_in.id = uuid::Uuid::new_v4().simple().to_string();
+            }
+            claimed_tags.insert(stand_in.tag());
+            claimed_ids.insert(stand_in.id.clone());
+            servers.profiles[number - 1] = stand_in;
+        }
+        debug_assert!(
+            blocking_profile_numbers(&servers.profiles, servers.active.as_deref())
+                .iter()
+                .all(|number| candidate_numbers.contains(number)),
+            "PreparedSet::build must leave no blocking finding on a profile it did not stand in \
+             for: a stand-in lost its identity or an unnamed row's tag is still referenced"
+        );
+        Self {
+            servers: Arc::new(servers),
         }
     }
-    snapshot
+
+    /// Stage `profile` into the working file in place — replace the entry with
+    /// the same id, else append ([`stage_profile`]) — and hand back the undo
+    /// record a rejection applies.
+    fn stage(&mut self, profile: &ServerProfile) -> StagingUndo {
+        stage_profile(Arc::make_mut(&mut self.servers), profile)
+    }
+
+    /// Revert a rejected candidate's staging, restoring the file the
+    /// accepted candidates left behind.
+    fn revert(&mut self, staging: StagingUndo) {
+        staging.revert(Arc::make_mut(&mut self.servers));
+    }
+}
+
+/// The stand-in for a gated row: the row's identity (id, name, group,
+/// position, `enabled`) with a default `freedom` outbound. The caller adjusts
+/// the name or id when the row cannot hold them exclusively.
+fn stand_in(profile: &ServerProfile) -> ServerProfile {
+    ServerProfile {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        group: profile.group.clone(),
+        enabled: profile.enabled,
+        outbound: OutboundModel::new(Protocol::Freedom),
+        group_title: profile.group_title.clone(),
+        ..ServerProfile::default()
+    }
+}
+
+/// The name a stand-in takes when it must give up its row's generated tag —
+/// an unnamed row, or a tag another row already claims. Derived from the
+/// original name so the scratch document reads as a stand-in, advanced until
+/// no claimed tag matches: a duplicate-tag row cannot be made legal by
+/// changing only its outbound.
+fn unique_stand_in_name(profile: &ServerProfile, claimed_tags: &BTreeSet<String>) -> String {
+    let stem = if profile.name.trim().is_empty() {
+        "stand-in"
+    } else {
+        profile.name.as_str()
+    };
+    let mut stand_in = stand_in(profile);
+    for suffix in 1.. {
+        stand_in.name = format!("{stem} (stand-in {suffix})");
+        if !claimed_tags.contains(&stand_in.tag()) {
+            return stand_in.name;
+        }
+    }
+    unreachable!("the numeric suffix always escapes a finite claimed-tag set")
 }
 
 /// Run one accepted request to its terminal: per profile, stage it, generate
@@ -171,11 +278,11 @@ pub(crate) async fn validate(
     } = request;
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
-    // One owned snapshot for the whole request, shared with the blocking
-    // writer by pointer: staging mutates the sole owner in place
-    // (`Arc::make_mut`), so no candidate ever pays a whole-file copy. The
-    // settings travel the same way.
-    let mut staged_servers = Arc::new(prepared_snapshot(&servers));
+    // One owned working file for the whole request: the caller's file is
+    // moved into it, and the blocking leg shares it by pointer while staging
+    // mutates the sole owner in place (`Arc::make_mut`), so no candidate ever
+    // pays a whole-file copy. The settings travel the same way.
+    let mut prepared = PreparedSet::build(servers, &profiles);
     let settings = Arc::new(settings);
     // The scratch directory is created by the write leg, after generation:
     // a candidate whose generation fails reports that error, never a
@@ -234,7 +341,7 @@ pub(crate) async fn validate(
             continue;
         }
 
-        match stage_and_validate(&mut staged_servers, &profile, &settings, &directory, lang).await {
+        match stage_and_validate(&mut prepared, &profile, &settings, &directory, lang).await {
             Ok(Ok(())) => accepted.push(profile),
             Ok(Err(message)) => rejected.push((label, message)),
             // The filesystem worker itself failed: terminal for the request,
@@ -261,18 +368,17 @@ pub(crate) async fn validate(
 /// replaced deep-copied every other profile once per candidate, so an import
 /// batch of N profiles cost O(N²) copies.)
 async fn stage_and_validate(
-    staged: &mut Arc<ServersFile>,
+    prepared: &mut PreparedSet,
     profile: &ServerProfile,
     settings: &Arc<Settings>,
     directory: &Path,
     lang: Language,
 ) -> Result<Result<(), String>, DiagError> {
-    // `make_mut` mutates the sole owner in place: the blocking leg below
-    // holds a pointer clone only while it runs, and it has finished by the
-    // time the next candidate stages.
-    let staging = stage_profile(Arc::make_mut(staged), profile);
+    let staging = prepared.stage(profile);
+    // The blocking leg holds a pointer clone only while it runs; it has
+    // finished by the time the next candidate stages.
     match generate_and_validate(
-        Arc::clone(staged),
+        Arc::clone(&prepared.servers),
         Arc::clone(settings),
         directory.to_path_buf(),
         lang,
@@ -281,7 +387,7 @@ async fn stage_and_validate(
     {
         Ok(()) => Ok(Ok(())),
         Err(message) => {
-            staging.revert(Arc::make_mut(staged));
+            prepared.revert(staging);
             Ok(Err(message))
         }
     }
@@ -537,13 +643,15 @@ pub fn sweep_stale_scratch_configs() -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProfileValidationOrigin, ProfileValidationRequest, SCRATCH_CONFIG_MAX_AGE,
+        PreparedSet, ProfileValidationOrigin, ProfileValidationRequest, SCRATCH_CONFIG_MAX_AGE,
         ScratchConfigGuard, cleanup_old_scratch_configs, is_scratch_config_file_name,
-        prepared_snapshot, scratch_config_file_name, stage_and_validate, stage_profile, validate,
+        scratch_config_file_name, stage_and_validate, stage_profile, validate,
     };
     use crate::i18n::{Key, t};
     use crate::model::settings::Language;
-    use crate::model::validation::{Severity, validate_outbound, validate_profiles};
+    use crate::model::validation::{
+        Severity, blocking_profile_numbers, validate_outbound, validate_profiles,
+    };
     use crate::model::{OutboundModel, Protocol, ServerProfile, ServersFile, Settings};
     use crate::rt::cancel::Cancel;
     use crate::sys::appdata::{APPDATA_ENV_LOCK, AppDataRedirect};
@@ -898,34 +1006,40 @@ mod tests {
         // as it was, so later candidates are staged against accepted state
         // only. An unparsable raw override fails generation up front.
         let existing = import_profile("existing", "0123456789abcdef");
-        let mut staged = Arc::new(ServersFile {
+        let servers = ServersFile {
             profiles: vec![existing.clone()],
             active: Some(existing.id.clone()),
             ..ServersFile::default()
-        });
+        };
         let settings = Arc::new(Settings {
             raw_override: Some("not json".to_string()),
             ..Settings::default()
         });
         let directory = crate::sys::paths::config_dir();
         let candidate = import_profile("candidate", "fedcba9876543210");
-        let error =
-            stage_and_validate(&mut staged, &candidate, &settings, &directory, Language::En)
-                .await
-                .expect("the filesystem worker itself must not fail")
-                .expect_err("an unparsable raw override must reject the candidate");
+        let mut prepared = PreparedSet::build(servers, std::slice::from_ref(&candidate));
+        let error = stage_and_validate(
+            &mut prepared,
+            &candidate,
+            &settings,
+            &directory,
+            Language::En,
+        )
+        .await
+        .expect("the filesystem worker itself must not fail")
+        .expect_err("an unparsable raw override must reject the candidate");
         let prefix = t(Language::En, Key::GenRawOverride)
             .split_once("{}")
             .expect("the raw-override sentence carries one placeholder")
             .0;
         assert!(error.starts_with(prefix), "{error}");
         assert_eq!(
-            staged.profiles.len(),
+            prepared.servers.profiles.len(),
             1,
             "the rejected candidate must be gone"
         );
-        assert_eq!(staged.profiles[0].id, "0123456789abcdef");
-        assert_eq!(staged.active.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(prepared.servers.profiles[0].id, "0123456789abcdef");
+        assert_eq!(prepared.servers.active.as_deref(), Some("0123456789abcdef"));
     }
 
     // ---------- sibling gates ----------
@@ -940,24 +1054,23 @@ mod tests {
 
     #[test]
     fn a_marked_sibling_does_not_veto_an_unrelated_candidate() {
-        // `gen` refuses to generate while *any* profile in the set carries an
-        // `Error` finding, so one unresolved row (a stored `proxySettings`
-        // mark) would veto every other row's draft save with the sibling's
-        // message. The worker therefore prepares a snapshot with such
-        // siblings stood in for; this drives the same stage-then-generate
-        // sequence the worker runs.
+        // `gen` refuses to generate while the model's profile-set pass blocks
+        // on *any* profile in the set, so one unresolved row (a stored
+        // `proxySettings` mark) would veto every other row's draft save with
+        // the sibling's message. `PreparedSet` stands such siblings in; this
+        // drives the same stage-then-generate sequence the worker runs.
         let sibling = marked_profile("stale-sibling", "0123456789abcdef");
+        let candidate = import_profile("candidate", "fedcba9876543210");
         let servers = ServersFile {
             profiles: vec![sibling.clone()],
             active: Some(sibling.id.clone()),
             ..ServersFile::default()
         };
-        let candidate = import_profile("candidate", "fedcba9876543210");
 
-        let mut snapshot = prepared_snapshot(&servers);
-        stage_profile(&mut snapshot, &candidate);
+        let mut prepared = PreparedSet::build(servers, std::slice::from_ref(&candidate));
+        prepared.stage(&candidate);
 
-        match crate::r#gen::generate(&snapshot, &Settings::default()) {
+        match crate::r#gen::generate(&prepared.servers, &Settings::default()) {
             Ok(_) => {}
             Err(error) => panic!(
                 "a sibling's mark must not veto an unrelated candidate's generation: {}",
@@ -968,8 +1081,8 @@ mod tests {
         // The stand-in sits in the sibling's own slot and keeps its identity,
         // so its generated tag still resolves for chain, routing, and
         // balancer references, while carrying no gate of its own.
-        assert_eq!(snapshot.profiles.len(), 2);
-        let stand_in = &snapshot.profiles[0];
+        assert_eq!(prepared.servers.profiles.len(), 2);
+        let stand_in = &prepared.servers.profiles[0];
         assert_eq!(stand_in.id, sibling.id);
         assert_eq!(stand_in.name, sibling.name);
         assert_eq!(stand_in.tag(), sibling.tag());
@@ -978,19 +1091,18 @@ mod tests {
             "the stand-in must carry no gate"
         );
         assert_eq!(
-            snapshot.active.as_deref(),
+            prepared.servers.active.as_deref(),
             Some(sibling.id.as_str()),
             "the file's active choice must survive the stand-in"
         );
 
-        // The request's own snapshot keeps the real marked sibling: the
-        // worker must never mutate the caller's data.
-        assert_eq!(servers.profiles.len(), 1);
-        assert_eq!(servers.profiles[0].id, sibling.id);
+        // The request's row keeps the mark it was staged with: building
+        // stands a row in inside the working copy it owns, and the caller's
+        // data (here the profile captured before the move) is untouched.
         assert_eq!(
-            servers.profiles[0].outbound.retired_proxy_settings,
+            sibling.outbound.retired_proxy_settings,
             Some(serde_json::json!({"tag": "direct"})),
-            "the request's snapshot must stay untouched"
+            "the request's row must keep its stored mark"
         );
     }
 
@@ -1010,9 +1122,9 @@ mod tests {
             ..ServersFile::default()
         };
 
-        let mut snapshot = prepared_snapshot(&servers);
-        stage_profile(&mut snapshot, &candidate);
-        let config = crate::r#gen::generate(&snapshot, &Settings::default())
+        let mut prepared = PreparedSet::build(servers, std::slice::from_ref(&candidate));
+        prepared.stage(&candidate);
+        let config = crate::r#gen::generate(&prepared.servers, &Settings::default())
             .expect("a chain to a stood-in sibling must still generate");
         let text = serde_json::to_string(&config).expect("the config serializes");
         assert!(
@@ -1025,6 +1137,99 @@ mod tests {
                 .iter()
                 .any(|finding| finding.severity == Severity::Error),
             "the real set must keep the sibling's blocking finding for apply"
+        );
+    }
+
+    /// One sibling that the model's profile-set pass blocks on, beside a
+    /// healthy candidate the request validates. The worker must be able to
+    /// generate the candidate's document, which means the sibling cannot
+    /// reach the generator still gated.
+    fn sibling_does_not_veto(siblings: Vec<ServerProfile>) {
+        let candidate = import_profile("candidate", "fedcba9876543210");
+        let active = siblings
+            .first()
+            .map(|sibling| sibling.id.clone())
+            .unwrap_or_default();
+        let servers = ServersFile {
+            profiles: siblings,
+            active: Some(active),
+            ..ServersFile::default()
+        };
+        let mut prepared = PreparedSet::build(servers, std::slice::from_ref(&candidate));
+        prepared.stage(&candidate);
+        crate::r#gen::generate(&prepared.servers, &Settings::default()).unwrap_or_else(|error| {
+            panic!(
+                "a profile-set gate on a sibling must not veto an unrelated candidate: {}",
+                error.text(Language::En)
+            )
+        });
+    }
+
+    #[test]
+    fn an_unnamed_sibling_does_not_veto_an_unrelated_candidate() {
+        // An empty name is the profile-set pass's own gate (`ProfileNameEmpty`)
+        // and generates the `[Manual] ` tag: the stand-in carries a name no
+        // other row claims, so its tag is legal without naming the user's row.
+        sibling_does_not_veto(vec![import_profile("", "0123456789abcdef")]);
+    }
+
+    #[test]
+    fn a_duplicate_tag_sibling_does_not_veto_an_unrelated_candidate() {
+        // Two rows generating one tag block (`ProfileTagDuplicated`), and
+        // changing only their outbounds would leave the duplicate in place:
+        // the first stand-in keeps the tag, the second takes a name no other
+        // row claims.
+        sibling_does_not_veto(vec![
+            import_profile("duplicate", "0123456789abcdef"),
+            import_profile("duplicate", "fedcba9876543210"),
+        ]);
+    }
+
+    #[test]
+    fn a_dangling_chain_sibling_does_not_veto_an_unrelated_candidate() {
+        // The dial graph's dangling hop (`OutboundChainMissing`) names only
+        // the source tag, so the stand-in set is read from the finding rather
+        // than from a per-profile outbound predicate.
+        let mut sibling = import_profile("dangling", "0123456789abcdef");
+        sibling.outbound.chain_via("no-such-outbound");
+        sibling_does_not_veto(vec![sibling]);
+    }
+
+    #[test]
+    fn building_leaves_no_blocking_finding_on_a_profile_it_did_not_stage() {
+        // `PreparedSet::build`'s contract, stated as observable behaviour:
+        // the built file's own profile-set verdict blocks only on rows the
+        // request validates. Everything else is stood in for, and the
+        // candidate's own mark survives — it is staged real so its own
+        // findings reject it with its own message.
+        let candidate = marked_profile("candidate", "fedcba9876543210");
+        let profiles = vec![
+            candidate.clone(),
+            import_profile("", "1111111111111111"),
+            import_profile("duplicate", "2222222222222222"),
+            import_profile("duplicate", "3333333333333333"),
+            {
+                let mut dangling = import_profile("dangling", "4444444444444444");
+                dangling.outbound.chain_via("no-such-outbound");
+                dangling
+            },
+        ];
+        let servers = ServersFile {
+            profiles,
+            active: Some("1111111111111111".to_string()),
+            ..ServersFile::default()
+        };
+
+        let prepared = PreparedSet::build(servers, std::slice::from_ref(&candidate));
+        let blocking = blocking_profile_numbers(
+            &prepared.servers.profiles,
+            prepared.servers.active.as_deref(),
+        );
+        assert_eq!(
+            blocking,
+            std::collections::BTreeSet::from([1]),
+            "only the candidate's own row may still block: {:?}",
+            prepared.servers.profiles
         );
     }
 
