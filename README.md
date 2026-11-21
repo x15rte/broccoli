@@ -14,3 +14,18 @@ portable, all user data lives under `%APPDATA%\broccoli`
 <img width="1516" height="989" alt="image" src="https://github.com/user-attachments/assets/1c735e21-7ec8-4a18-a392-3f59e43ae94f" />
 
 https://github.com/XTLS/Xray-core
+
+## TODO
+
+1. Persist trial rules across core restarts behind a switch, instead of
+   losing them with the core session.
+2. Add backup and restore for the state files (`servers.json` and
+   `settings.json`).
+3. Add an IP info screen with IP, DNS, and WebRTC leak tests, modeled on
+   browserleaks.com/ip.
+4. Block outbound traffic during the Apply-triggered core restart.
+5. Make the editor window's action row collapsible.
+6. Preview unapplied changes against the applied configuration and let the
+   user discard them.
+7. Trim the test tree: drop temporary test code and deduplicate fixtures.
+8. Continue building out share-link and subscription-group support.
